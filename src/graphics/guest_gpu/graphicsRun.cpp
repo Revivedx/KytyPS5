@@ -1927,6 +1927,13 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	// KYTY_DEFER_GLOBAL_BARRIER (live): inside a render pass, recorded when it ends
+	// (CommandBuffer::DeferGlobalBarrier) instead of ending it here.
+	static auto& defer = Common::LiveSwitches::Get("KYTY_DEFER_GLOBAL_BARRIER", 0);
+	if (defer.load(std::memory_order_relaxed) != 0 && CurrentBuffer().IsRendering()) {
+		CurrentBuffer().DeferGlobalBarrier();
+		return;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;

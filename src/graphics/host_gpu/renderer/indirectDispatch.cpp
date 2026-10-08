@@ -191,10 +191,17 @@ MeshIndirectDraw::~MeshIndirectDraw() {
 
 MeshIndirectDraw::Result MeshIndirectDraw::Convert(const CommandRecorder& command,
                                                    const Params&          params) {
-	const auto entry  = m_next;
-	m_next            = (m_next + 1u) % Entries;
-	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
+	Result result;
+	ConvertBatch(command, std::span {&params, 1}, std::span {&result, 1});
+	return result;
+}
 
+void MeshIndirectDraw::ConvertBatch(const CommandRecorder& command, std::span<const Params> params,
+                                    std::span<Result> results) {
+	EXIT_IF(params.size() != results.size() || params.size() > MaxBatch);
+	if (params.empty()) {
+		return;
+	}
 	// The arguments come from earlier shader or transfer writes; the entry's previous reads
 	// (indirect counts, mesh-shader parameter loads) must finish before it is rewritten.
 	vk::MemoryBarrier args_ready {};
@@ -210,13 +217,36 @@ MeshIndirectDraw::Result MeshIndirectDraw::Convert(const CommandRecorder& comman
 	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &args_ready, 0,
 	                        nullptr, 0, nullptr);
 
-	const auto& limits = m_graphics.mesh_shader_properties;
 	const vk::DescriptorBufferInfo info {m_entries.Handle(), 0, VK_WHOLE_SIZE};
 	vk::WriteDescriptorSet         write {};
 	write.dstBinding      = 0;
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eStorageBuffer;
 	write.pBufferInfo     = &info;
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1, &write);
+	for (size_t i = 0; i < params.size(); i++) {
+		results[i] = RecordOne(command, params[i]);
+	}
+
+	vk::MemoryBarrier entry_ready {};
+	entry_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	entry_ready.dstAccessMask =
+	    vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eShaderRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                        vk::PipelineStageFlagBits::eDrawIndirect |
+	                            vk::PipelineStageFlagBits::eAllGraphics,
+	                        {}, 1, &entry_ready, 0, nullptr, 0, nullptr);
+}
+
+MeshIndirectDraw::Result MeshIndirectDraw::RecordOne(const CommandRecorder& command,
+                                                     const Params&          params) {
+	const auto entry  = m_next;
+	m_next            = (m_next + 1u) % Entries;
+	m_count++;
+	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
+
+	const auto& limits = m_graphics.mesh_shader_properties;
 	const MeshPushConstants push {
 	    static_cast<uint32_t>(params.args),
 	    static_cast<uint32_t>(params.args >> 32u),
@@ -235,20 +265,9 @@ MeshIndirectDraw::Result MeshIndirectDraw::Convert(const CommandRecorder& comman
 	    MeshGroupSplitStride,
 	    entry * EntryDwords,
 	    params.fast_launch ? 1u : 0u};
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, 1, &write);
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch(1, 1, 1);
-
-	vk::MemoryBarrier entry_ready {};
-	entry_ready.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
-	entry_ready.dstAccessMask =
-	    vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eShaderRead;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                        vk::PipelineStageFlagBits::eDrawIndirect |
-	                            vk::PipelineStageFlagBits::eAllGraphics,
-	                        {}, 1, &entry_ready, 0, nullptr, 0, nullptr);
 	return {m_entries.Handle(), offset,
 	        m_entries.BufferDeviceAddress() + offset + 4u * sizeof(uint32_t)};
 }

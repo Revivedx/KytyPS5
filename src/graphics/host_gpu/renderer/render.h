@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -156,6 +157,16 @@ public:
 	};
 	[[nodiscard]] DynamicState& GetDynamicState() const noexcept { return m_dynamic_state; }
 	void                        InvalidateDynamicState() const noexcept { m_dynamic_state = {}; }
+	[[nodiscard]] bool          IsRendering() const noexcept { return m_rendering; }
+	// Unique per render pass begun (any command buffer); 0 before the first.
+	[[nodiscard]] uint64_t      RenderSerial() const noexcept { return m_render_serial; }
+	// KYTY_DEFER_GLOBAL_BARRIER: a guest global barrier met inside a render pass is recorded
+	// when the render pass ends instead of ending it. Everything that writes memory other than
+	// attachments already ends the render pass and orders itself (dispatch, buffer-writing
+	// draw, copy, fill, upload barriers); images are ordered by Image::Transit, which also ends
+	// it. The draws that stay in the render pass only add attachment writes.
+	void DeferGlobalBarrier() const noexcept { m_pending_global_barrier = true; }
+	[[nodiscard]] bool HasPendingGlobalBarrier() const noexcept { return m_pending_global_barrier; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -185,6 +196,8 @@ private:
 	mutable RenderState  m_render_state;
 	mutable DynamicState m_dynamic_state;
 	mutable bool         m_rendering   = false;
+	mutable uint64_t     m_render_serial = 0;
+	mutable bool         m_pending_global_barrier = false;
 	HW::Context*         m_registers   = nullptr;
 	HW::UserConfig*      m_user_config = nullptr;
 	HW::Shader*          m_shaders     = nullptr;
@@ -289,6 +302,32 @@ private:
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
 	std::unique_ptr<MeshIndirectDraw>       m_mesh_indirect;
+	// KYTY_MESH_PRECONVERT (live, default 1; g1b: GPU busy 74 -> 69%, +0.9% fps): the GPU-converted mesh draws that followed a segment's first
+	// one (same render pass) are converted with it in one batch before the render pass begins,
+	// so they do not end it again. Learned per first draw from the previous occurrence.
+	struct MeshPreconvert {
+		struct Learned {
+			uint64_t                 key       = 0;
+			uint64_t                 args      = 0; // guest address
+			uint64_t                 args_size = 0;
+			MeshIndirectDraw::Params params;        // args filled at conversion time
+		};
+		struct Converted {
+			uint64_t                 key = 0;
+			MeshIndirectDraw::Result result;
+		};
+		std::unordered_map<uint64_t, std::vector<Learned>> learned;
+		uint64_t                                           segment_key    = 0;
+		uint64_t                                           segment_serial = 0; // 0: none
+		std::vector<Learned>                               segment;
+		std::vector<Converted>                             converted;
+		uint64_t                                           batch_start = 0; // ring count before
+		std::vector<MeshIndirectDraw::Params>              batch_params;
+		std::vector<MeshIndirectDraw::Result>              batch_results;
+		std::vector<uint64_t>                              batch_keys;
+		uint64_t hits = 0, misses = 0, starts = 0, batched = 0, unused = 0, writes = 0;
+	};
+	MeshPreconvert m_mesh_pre;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -6,13 +6,13 @@
 > other games and the latest KytyPS5, use [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5).
 > You need your own dump of the game: no game files, keys or firmware are included.
 
-**Status (2026-10-07), work in progress.** Tested on a Ryzen 7 5800X3D + Radeon RX 7900 XT, Mesa RADV,
+**Status (2026-10-08), work in progress.** Tested on a Ryzen 7 5800X3D + Radeon RX 7900 XT, Mesa RADV,
 Linux 7.2, in the opening jungle area:
 
 | | Frame rate |
 |---|---|
-| Standing / exploring | ~20 fps (was ~10 on 2026-10-05) |
-| Combat | ~11 fps on average |
+| Standing / exploring | ~22 fps (~20 on 2026-10-07, ~10 on 2026-10-05) |
+| Combat | ~11-16 fps (varies a lot with the fight) |
 | Heavy combat (fire, many enemies) | 7-12 fps |
 
 The goal is a stable 30 fps. Build and run instructions: **[packaging/wolverine/linux-amd](packaging/wolverine/linux-amd/README.md)**.
@@ -38,6 +38,12 @@ with a same-process A/B switch:
 - `FindImage` memo, texture description cache, lazy timeline-semaphore queries, shader-expansion
   hashing, a shared address-space lock for write-tracking protections, bigger fault-ahead and readback
   windows, GPU-side data loads for shaders whose data the GPU itself just wrote, PGO builds.
+- 2026-10-08 (command processor -11% per frame): the in-order walk replay runs a flat recorded request
+  list; replay traces drop pass-through ops and repeated user-data reads at record time; the vertex/mesh
+  stage of a draw materializes its resources on a worker thread while the command processor does the
+  pixel stage; per-descriptor diagnostics and hot-path clock reads off by default.
+- GPU: the mesh-indirect argument conversions of a render pass run in one batch before it begins, so
+  those draws no longer end the render pass (~5 points less GPU load).
 
 **Tooling** (all behind `KYTY_*` switches, most of them changeable while the game runs): GPU and
 command-buffer profilers, readback and write-fault statistics, verify modes for every replay/memo,
@@ -45,10 +51,10 @@ scripted gameplay A/B runs.
 
 ## Next
 
-- GPU: the frame is split into ~2200 small, serialized pieces (~4900 barriers and ~930 render passes per
-  frame); batching the mesh-indirect argument conversion is first.
-- Command processor: draw records (skip the whole per-draw preparation for repeated draws), needed for
-  heavy combat.
+- Command processor (still the limit, ~39 ms of CPU per frame, ~130k instructions per draw): a pipelined
+  command processor (resource preparation of the next draws ahead of the current one) or draw records
+  (skip the whole per-draw preparation for repeated draws), needed for 30 fps and for heavy combat.
+- GPU: the frame is still split into many small, serialized pieces (barriers, render-pass breaks).
 
 ## Credits
 

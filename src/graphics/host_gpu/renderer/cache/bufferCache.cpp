@@ -1471,13 +1471,15 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    if (lazy && direct_wanted && !copies.empty()) {
 			    direct = m_scheduler.IsFree(buffer.last_gpu_copy_tick);
 		    }
+		    // Locked adds only for KYTY_SYNC_STATS (they drained the store buffer per upload).
+		    const bool count = stats.load(std::memory_order_relaxed) != 0;
 		    if (!direct) {
-			    g_upload_bytes[0].fetch_add(total_size, std::memory_order_relaxed);
+			    if (count) g_upload_bytes[0].fetch_add(total_size, std::memory_order_relaxed);
 			    source = UploadCopies(buffer, copies, total_size);
 			    return;
 		    }
 		    for (const auto& copy: copies) {
-			    g_upload_bytes[1].fetch_add(copy.size, std::memory_order_relaxed);
+			    if (count) g_upload_bytes[1].fetch_add(copy.size, std::memory_order_relaxed);
 			    ReadGuestForUpload(buffer.Mapped().data() + copy.dstOffset,
 			                       buffer.CpuAddress() + copy.dstOffset, copy.size);
 			    if (!buffer.IsCoherent()) {

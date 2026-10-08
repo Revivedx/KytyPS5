@@ -158,8 +158,15 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 	return *m_video_out;
 }
 
+static thread_local uint64_t t_fault_count = 0;
+
+uint64_t RenderContext::ThreadFaultCount() noexcept {
+	return t_fault_count;
+}
+
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	KYTY_PROFILER_FUNCTION();
+	t_fault_count++;
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;

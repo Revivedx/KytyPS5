@@ -1765,7 +1765,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto image_start  = m_descriptor_images.size();
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
-				const bool note = m_context.GetGraphics().address_binding_report_enabled;
+				// KYTY_LOCAL_HACK KYTY_DESCRIPTOR_NOTES (live, default 0): GPU-fault diagnostics only
+				// (which image a faulting descriptor named); a clock read per image (~0.6% of the CP).
+				static auto& notes = Common::LiveSwitches::Get("KYTY_DESCRIPTOR_NOTES", 0);
+				const bool   note  = m_context.GetGraphics().address_binding_report_enabled &&
+				                  notes.load(std::memory_order_relaxed) != 0;
 				for (const auto resource: binding.resources) {
 					const auto& texture = descriptors.images.at(resource);
 					m_descriptor_images.push_back(

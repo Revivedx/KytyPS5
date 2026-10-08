@@ -35,6 +35,7 @@
 
 #include <string>
 #include <set>
+#include <unordered_set>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1361,30 +1362,220 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			m_mesh_indirect = std::make_unique<MeshIndirectDraw>(
 			    m_context.GetGraphics(), m_context.GetCommandScheduler());
 		}
-		buffer.EndRendering();
+		{
+			// KYTY_LOCAL_HACK (research): KYTY_MESH_PRED_STATS=1 (live) reports every 5 s how many
+			// GPU-converted mesh draws end an active render pass and how many repeat the
+			// arguments and parameters of a draw of the previous frame(s).
+			static auto& pred_stats = Common::LiveSwitches::Get("KYTY_MESH_PRED_STATS", 0);
+			if (pred_stats.load(std::memory_order_relaxed) != 0) {
+				static std::unordered_set<uint64_t> cur, prev, prev2, cur_addr, prev_addr;
+				static uint64_t frame = 0, frames = 0, total = 0, active = 0, hit1 = 0, hit2 = 0,
+				                addr_hit = 0, distinct = 0;
+				static auto     report = std::chrono::steady_clock::now();
+				const uint64_t  now_frame =
+				    m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+				if (now_frame != frame) {
+					distinct += cur.size();
+					prev2 = std::move(prev);
+					prev  = std::move(cur);
+					cur.clear();
+					prev_addr = std::move(cur_addr);
+					cur_addr.clear();
+					frame = now_frame;
+					frames++;
+				}
+				uint64_t key = emit.indirect_args;
+				for (const uint64_t v: {index_source.address, uint64_t {draw.IsIndexed()},
+				                        uint64_t {draw.index_count},
+				                        uint64_t {index_source.guest_element_size},
+				                        uint64_t {mesh_info.InputPrimitiveSize()},
+				                        uint64_t {mesh_info.InputPrimitiveStep()},
+				                        uint64_t {mesh_info.primitives_per_group},
+				                        uint64_t {mesh_info.fast_launch}}) {
+					key = (key ^ v) * 0x100000001b3ull + (key >> 29u);
+				}
+				total++;
+				active += buffer.IsRendering() ? 1u : 0u;
+				const bool in1 = prev.contains(key);
+				hit1 += in1 ? 1u : 0u;
+				hit2 += (in1 || prev2.contains(key)) ? 1u : 0u;
+				addr_hit += prev_addr.contains(emit.indirect_args) ? 1u : 0u;
+				cur.insert(key);
+				cur_addr.insert(emit.indirect_args);
+				if (const auto now = std::chrono::steady_clock::now();
+				    now - report > std::chrono::seconds(5)) {
+					std::printf("Mesh pred (5 s): %llu conversions, %llu frames, %llu in an active render "
+					            "pass, same tuple prev frame %llu, prev 2 frames %llu, same args addr %llu, "
+					            "distinct/frame %.1f\n",
+					            (unsigned long long)total, (unsigned long long)frames,
+					            (unsigned long long)active, (unsigned long long)hit1,
+					            (unsigned long long)hit2, (unsigned long long)addr_hit,
+					            frames != 0 ? double(distinct) / double(frames) : 0.0);
+					auto& pre = m_mesh_pre;
+					std::printf("Mesh preconvert (5 s): segments %llu, batched %llu, hits %llu, misses %llu, "
+					            "unused %llu, write invalidations %llu, learned keys %zu\n",
+					            (unsigned long long)pre.starts, (unsigned long long)pre.batched,
+					            (unsigned long long)pre.hits, (unsigned long long)pre.misses,
+					            (unsigned long long)pre.unused, (unsigned long long)pre.writes,
+					            pre.learned.size());
+					pre.starts = pre.batched = pre.hits = pre.misses = pre.unused = pre.writes = 0;
+					total = active = hit1 = hit2 = addr_hit = distinct = frames = 0;
+					report = now;
+				}
+			}
+		}
 		const auto args_size = draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                        : sizeof(vk::DrawIndirectCommand);
-		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    emit.indirect_args, args_size, false, false, {}, true);
-		EXIT_IF(args_buffer == nullptr || !args_buffer->HasDeviceAddress());
-		const auto converted = m_mesh_indirect->Convert(
-		    buffer.Recorder(),
-		    {.args                 = args_buffer->BufferDeviceAddress() + args_offset,
-		     .index_address        = index_source.address,
-		     .indexed              = draw.IsIndexed(),
-		     .max_index_count      = draw.index_count,
-		     .element_size         = index_source.guest_element_size,
-		     .primitive_size       = mesh_info.InputPrimitiveSize(),
-		     .primitive_step       = mesh_info.InputPrimitiveStep(),
-		     .primitives_per_group = mesh_info.primitives_per_group,
-		     .fast_launch          = mesh_info.fast_launch});
-		auto gpu_emit               = emit;
-		gpu_emit.indirect_args      = 0; // consumed by the conversion
-		gpu_emit.mesh_groups_buffer = converted.groups_buffer;
-		gpu_emit.mesh_groups_offset = converted.groups_offset;
-		gpu_emit.mesh_draw_data     = converted.draw_data;
-		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, gpu_emit,
-		                            index_source, primitive_restart_enable);
+		MeshIndirectDraw::Params params {.args                 = 0,
+		                                 .index_address        = index_source.address,
+		                                 .indexed              = draw.IsIndexed(),
+		                                 .max_index_count      = draw.index_count,
+		                                 .element_size         = index_source.guest_element_size,
+		                                 .primitive_size       = mesh_info.InputPrimitiveSize(),
+		                                 .primitive_step       = mesh_info.InputPrimitiveStep(),
+		                                 .primitives_per_group = mesh_info.primitives_per_group,
+		                                 .fast_launch          = mesh_info.fast_launch};
+		auto& cache = m_context.GetBufferCache();
+		// The arguments' device address, or 0 when they are not in a device-address buffer.
+		const auto args_address = [&](uint64_t args, uint64_t size) -> vk::DeviceAddress {
+			const auto [args_buffer, args_offset] =
+			    cache.ObtainBuffer(args, size, false, false, {}, true);
+			return args_buffer != nullptr && args_buffer->HasDeviceAddress()
+			           ? args_buffer->BufferDeviceAddress() + args_offset
+			           : 0;
+		};
+		const auto run = [&](const MeshIndirectDraw::Result& converted) {
+			auto gpu_emit               = emit;
+			gpu_emit.indirect_args      = 0; // consumed by the conversion
+			gpu_emit.mesh_groups_buffer = converted.groups_buffer;
+			gpu_emit.mesh_groups_offset = converted.groups_offset;
+			gpu_emit.mesh_draw_data     = converted.draw_data;
+			ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, gpu_emit,
+			                            index_source, primitive_restart_enable);
+		};
+		auto&       pre = m_mesh_pre;
+		const auto end_segment = [&] {
+			if (pre.segment_key != 0) {
+				if (pre.segment.empty()) {
+					pre.learned.erase(pre.segment_key);
+				} else {
+					if (pre.learned.size() > 65536) {
+						pre.learned.clear();
+					}
+					pre.learned[pre.segment_key] = std::move(pre.segment);
+				}
+			}
+			pre.unused += pre.converted.size();
+			pre.segment.clear();
+			pre.converted.clear();
+			pre.segment_key    = 0;
+			pre.segment_serial = 0;
+		};
+		// The render pass the draw ran in continues the segment; one ended for another reason
+		// ends it (whatever ended it may have written arguments).
+		const auto after_draw = [&](bool own_break) {
+			if (!buffer.IsRendering()) {
+				end_segment();
+			} else if (buffer.RenderSerial() != pre.segment_serial) {
+				if (own_break) {
+					pre.segment_serial = buffer.RenderSerial();
+				} else {
+					end_segment();
+				}
+			}
+		};
+		static auto& preconvert = Common::LiveSwitches::Get("KYTY_MESH_PRECONVERT", 1);
+		if (preconvert.load(std::memory_order_relaxed) == 0) {
+			if (pre.segment_key != 0 || !pre.learned.empty()) {
+				end_segment();
+				pre.learned.clear();
+			}
+			buffer.EndRendering();
+			params.args = args_address(emit.indirect_args, args_size);
+			EXIT_IF(params.args == 0);
+			run(m_mesh_indirect->Convert(buffer.Recorder(), params));
+			return;
+		}
+		uint64_t key = emit.indirect_args;
+		for (const uint64_t value:
+		     {params.index_address, uint64_t {params.indexed}, uint64_t {params.max_index_count},
+		      uint64_t {params.element_size}, uint64_t {params.primitive_size},
+		      uint64_t {params.primitive_step}, uint64_t {params.primitives_per_group},
+		      uint64_t {params.fast_launch}}) {
+			key = (key ^ value) * 0x100000001b3ull + (key >> 29u);
+		}
+		key |= 1u; // never 0 (no segment)
+		if (pre.segment_serial != 0 && buffer.IsRendering() &&
+		    buffer.RenderSerial() == pre.segment_serial) {
+			// A later mesh draw of the segment's render pass: learned for the next time, and
+			// drawn from its batch conversion when there is one. The batch read the arguments
+			// before the render pass began; only GPU-written arguments are batched, and
+			// nothing in the render pass since then wrote buffers (a draw that does clears the
+			// batch), so they are unchanged.
+			if (key != pre.segment_key && pre.segment.size() < MeshIndirectDraw::MaxBatch - 1 &&
+			    std::ranges::none_of(pre.segment, [&](const auto& l) { return l.key == key; })) {
+				pre.segment.push_back({key, emit.indirect_args, args_size, params});
+			}
+			const auto it = std::ranges::find_if(pre.converted,
+			                                     [&](const auto& c) { return c.key == key; });
+			if (it != pre.converted.end() &&
+			    m_mesh_indirect->Count() - pre.batch_start < MeshIndirectDraw::RingEntries &&
+			    cache.IsRegionGpuModified(emit.indirect_args, args_size)) {
+				pre.hits++;
+				const auto result = it->result;
+				pre.converted.erase(it);
+				run(result);
+				after_draw(false);
+				return;
+			}
+			pre.misses++;
+			buffer.EndRendering();
+			params.args = args_address(emit.indirect_args, args_size);
+			EXIT_IF(params.args == 0);
+			run(m_mesh_indirect->Convert(buffer.Recorder(), params));
+			after_draw(true);
+			return;
+		}
+		// The first mesh draw of a render pass: converted together with the draws that
+		// followed it last time.
+		end_segment();
+		pre.starts++;
+		pre.segment_key = key;
+		buffer.EndRendering();
+		params.args = args_address(emit.indirect_args, args_size);
+		EXIT_IF(params.args == 0);
+		pre.batch_params.assign(1, params);
+		pre.batch_keys.assign(1, key);
+		if (const auto learned = pre.learned.find(key); learned != pre.learned.end()) {
+			for (const auto& item: learned->second) {
+				if (pre.batch_params.size() >= MeshIndirectDraw::MaxBatch) {
+					break;
+				}
+				if (!cache.IsRegionGpuModified(item.args, item.args_size)) {
+					continue;
+				}
+				auto item_params = item.params;
+				item_params.args = args_address(item.args, item.args_size);
+				if (item_params.args == 0) {
+					continue;
+				}
+				pre.batch_params.push_back(item_params);
+				pre.batch_keys.push_back(item.key);
+			}
+		}
+		pre.batch_results.resize(pre.batch_params.size());
+		pre.batch_start = m_mesh_indirect->Count();
+		m_mesh_indirect->ConvertBatch(buffer.Recorder(), pre.batch_params, pre.batch_results);
+		pre.batched += pre.batch_params.size() - 1;
+		for (size_t i = 1; i < pre.batch_params.size(); i++) {
+			pre.converted.push_back({pre.batch_keys[i], pre.batch_results[i]});
+		}
+		run(pre.batch_results[0]);
+		if (buffer.IsRendering()) {
+			pre.segment_serial = buffer.RenderSerial();
+		} else {
+			end_segment();
+		}
 		return;
 	}
 	// Research: mesh and legacy quad draws expand their counts on the host, so their
@@ -1673,6 +1864,11 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 
+	if (feedback_aspects && buffer.HasPendingGlobalBarrier()) {
+		// A feedback loop samples what the render pass's earlier draws wrote: the deferred
+		// guest barrier must come first.
+		buffer.EndRendering();
+	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u, ps_hash);

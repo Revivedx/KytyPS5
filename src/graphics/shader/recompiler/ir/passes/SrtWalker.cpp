@@ -7,13 +7,16 @@
 #include <algorithm>
 #include <cinttypes>
 #include <atomic>
+#include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -772,11 +775,27 @@ constexpr uint32_t NativeAfterWalkers = 8;
 
 // Set while VerifyNative's reference walkers run.
 thread_local bool g_native_suppressed = false;
+thread_local std::string g_condition_failure; // the last condition that could not be evaluated
+// Only in the verify modes (KYTY_PARALLEL_MATERIALIZE >= 2).
+bool SrtDiagnosticsOn() {
+	static auto& mode = Common::LiveSwitches::Get("KYTY_PARALLEL_MATERIALIZE", 1);
+	return mode.load(std::memory_order_relaxed) >= 2;
+}
+thread_local std::string g_trace_event;      // the last trace abandon/abort on this thread
+
 
 SrtNativeStats g_native_stats;
 bool           g_native_report = false;
 
 } // namespace
+
+std::string TakeSrtDiagnostics() {
+	std::string text = g_condition_failure + " | trace " + g_trace_event;
+	g_condition_failure.clear();
+	g_trace_event.clear();
+	return text;
+}
+
 
 bool TakeSrtNativeReport(SrtNativeStats& stats) {
 	if (!g_native_report) {
@@ -798,7 +817,12 @@ void SrtWalker::BindNative() {
 			return;
 		}
 		program.native_attempted = true;
-		program.native_code      = SrtNativeCode::Compile(program);
+		{
+			// KYTY_PARALLEL_MATERIALIZE: two threads may compile plans at the same time.
+			static std::mutex compile_mutex;
+			std::lock_guard   lock(compile_mutex);
+			program.native_code = SrtNativeCode::Compile(program);
+		}
 		auto& stats              = g_native_stats;
 		if (program.native_code == nullptr) {
 			stats.failed++;
@@ -1820,6 +1844,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		} else {
 			known = predicate.Evaluate(block.condition, condition);
 		}
+		if (!known && SrtDiagnosticsOn()) {
+			// Diagnostics (KYTY_PARALLEL_MATERIALIZE verify): why a condition could not be evaluated.
+			g_condition_failure = fmt::format(
+			    "block {} native {} trace {} read_failure '{}' addr 0x{:x}", index,
+			    predicate.UseNativeTables() ? 1 : 0, m_trace != nullptr ? 1 : 0,
+			    predicate.m_read_failure != nullptr ? predicate.m_read_failure : "-",
+			    predicate.m_read_failure_address);
+		}
 		return known ? (condition != 0u ? 1u : 0u) : 2u;
 	};
 	// The walk is a function of the outcomes it sees: if the last walk's conditions give the same
@@ -1845,13 +1877,23 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		const char* value = std::getenv("KYTY_WALK_INORDER_AFTER");
 		return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {3000000};
 	}();
-	static uint64_t refreshes_seen = 0;
-	const auto      inorder_mode   = walk_inorder.load(std::memory_order_relaxed);
-	const bool      inorder_on =
-	    inorder_mode == 1 || (inorder_mode == 2 && ++refreshes_seen > inorder_after);
-	if (inorder_mode == 2 && refreshes_seen == inorder_after + 1) {
-		std::fprintf(stderr, "SRT in-order walk replay: on after %llu refreshes\n",
-		             static_cast<unsigned long long>(inorder_after));
+	// Atomic, and latched once crossed: KYTY_PARALLEL_MATERIALIZE refreshes on two threads, and a
+	// plain counter could step back across the threshold, turning the in-order replay off and on
+	// again; each switch changes the request order under a recorded trace ("different call").
+	static std::atomic<uint64_t> refreshes_seen {0};
+	static std::atomic<bool>     inorder_latched {false};
+	const auto                   inorder_mode = walk_inorder.load(std::memory_order_relaxed);
+	bool                         inorder_on   = inorder_mode == 1;
+	if (inorder_mode == 2) {
+		if (inorder_latched.load(std::memory_order_relaxed)) {
+			inorder_on = true;
+		} else if (refreshes_seen.fetch_add(1, std::memory_order_relaxed) + 1 > inorder_after) {
+			inorder_on = true;
+			if (!inorder_latched.exchange(true)) {
+				std::fprintf(stderr, "SRT in-order walk replay: on after %llu refreshes\n",
+				             static_cast<unsigned long long>(inorder_after));
+			}
+		}
 	}
 	if (m_trace != nullptr && !replay && m_program.active_walk_valid && inorder_on &&
 	    walk_once_switch_value() != 0) {
@@ -1862,22 +1904,39 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		const auto stamp = m_program.walk_generation;
 		bool       same  = true;
-		for (const auto& [index, outcome]: m_program.active_walk) {
-			for (const auto slot: m_program.control_flow[index].srt_reads) {
-				if (slot < stamps.size()) {
-					if (stamps[slot] == stamp) continue;
-					stamps[slot] = stamp;
+		// KYTY_LOCAL_HACK KYTY_WALK_PLAN (live, default 1): the recorded flat sequence instead of
+		// the blocks' read lists and per-read stamps (cache misses in control_flow/srt_reads).
+		static auto& walk_plan = Common::LiveSwitches::Get("KYTY_WALK_PLAN", 1);
+		if (walk_plan.load(std::memory_order_relaxed) != 0 && !m_program.active_walk_plan.empty()) {
+			for (const auto entry: m_program.active_walk_plan) {
+				if ((entry & ResourcePlan::WalkPlanCheck) != 0u) {
+					if (outcome_of(entry & 0x0fffffffu) != ((entry >> 28u) & 3u)) {
+						same = false;
+						break;
+					}
+				} else if (!refresh(entry)) {
+					return false;
 				}
-				if (!refresh(slot)) return false;
 			}
-			if (outcome_of(index) != outcome) {
-				same = false;
-				break;
+		} else {
+			for (const auto& [index, outcome]: m_program.active_walk) {
+				for (const auto slot: m_program.control_flow[index].srt_reads) {
+					if (slot < stamps.size()) {
+						if (stamps[slot] == stamp) continue;
+						stamps[slot] = stamp;
+					}
+					if (!refresh(slot)) return false;
+				}
+				if (outcome_of(index) != outcome) {
+					same = false;
+					break;
+				}
 			}
 		}
 		static std::atomic<uint64_t> inorder_counts[2] {};
 		inorder_counts[same ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
-		if (std::getenv("KYTY_SRT_TRACE_STATS") != nullptr &&
+		static const bool trace_stats = std::getenv("KYTY_SRT_TRACE_STATS") != nullptr;
+		if (trace_stats &&
 		    (inorder_counts[0].load() + inorder_counts[1].load()) % 200000 == 0) {
 			std::fprintf(stderr, "SRT in-order walk replay: same %llu, differ %llu\n",
 			             static_cast<unsigned long long>(inorder_counts[0].load()),
@@ -1945,6 +2004,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	// A walk that fails part way leaves a partial record: never replay it with the result of the
 	// walk before (as Senaxx cfa45677 does).
 	m_program.active_walk_valid = false;
+	auto& plan                  = m_program.active_walk_plan;
+	plan.clear();
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
@@ -1958,9 +2019,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 				stamps[slot] = stamp;
 			}
 			if (!refresh(slot)) return false;
+			plan.push_back(slot);
 		}
 		const auto outcome = outcome_of(index);
 		walk.emplace_back(index, outcome);
+		plan.push_back(ResourcePlan::WalkPlanCheck | (uint32_t {outcome} << 28u) | index);
 		if (outcome != 2u) {
 			pending.push_back(block.successors[outcome != 0u ? 0u : 1u]);
 		} else {
@@ -1975,6 +2038,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (replay || m_trace != nullptr) {
 		m_program.active_walk_result = active;
 		m_program.active_walk_valid  = true;
+	}
+	// Slots and block indices must fit the encoding.
+	if (!walk_once || m_program.srt_reads.size() >= ResourcePlan::WalkPlanCheck ||
+	    m_program.control_flow.size() >= (1u << 28u)) {
+		plan.clear();
 	}
 	return true;
 }
@@ -2013,6 +2081,8 @@ void CountTrace(uint64_t TraceStats::*field, const char* reason = nullptr) {
 	}
 	g_trace_stats.*field += 1;
 	if (reason != nullptr) {
+		static std::mutex reasons_mutex; // KYTY_PARALLEL_MATERIALIZE: two threads count
+		std::lock_guard   lock(reasons_mutex);
 		g_trace_stats.reasons[reason]++;
 	}
 }
@@ -2060,7 +2130,12 @@ SrtTraceSession::SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, 
 		CountTrace(&TraceStats::off);
 		return;
 	}
-	if (program.srt_trace != nullptr && program.srt_trace->key == key) {
+	// KYTY_LOCAL_HACK KYTY_TRACE_PASS_ALIAS (live, default 1): see OnInst; a trace recorded with the
+	// other setting is recorded again (same-process A/B).
+	static auto& pass_alias = Common::LiveSwitches::Get("KYTY_TRACE_PASS_ALIAS", 1);
+	const auto   alias      = static_cast<uint8_t>(pass_alias.load(std::memory_order_relaxed) != 0 ? 1 : 0);
+	if (program.srt_trace != nullptr && program.srt_trace->key == key &&
+	    program.srt_trace->alias == alias) {
 		m_mode  = Mode::Serve;
 		m_trace = program.srt_trace;
 		thread_local std::vector<uint64_t> values;
@@ -2074,10 +2149,12 @@ SrtTraceSession::SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, 
 	} else if (++program.srt_trace_uses >= TraceAfterUses) {
 		m_mode      = Mode::Record;
 		m_recording = std::make_unique<SrtTrace>();
-		m_recording->key = key;
+		m_recording->key   = key;
+		m_recording->alias = alias;
 		for (auto& slots: m_slots) {
 			slots.assign(program.evaluation_value_count, -1);
 		}
+		m_leaf_ops.clear();
 	} else {
 		return;
 	}
@@ -2127,12 +2204,14 @@ void SrtTraceSession::RestoreEvaluators() {
 }
 
 void SrtTraceSession::Abort(const char* reason) {
+	if (SrtDiagnosticsOn()) g_trace_event = std::string("abort ") + reason;
 	if (m_mode == Mode::Record && m_abort == nullptr) {
 		m_abort = reason;
 	}
 }
 
 void SrtTraceSession::Abandon(const char* reason) {
+	if (SrtDiagnosticsOn()) g_trace_event = std::string("abandon ") + reason;
 	m_mode = Mode::Passthrough;
 	RestoreEvaluators();
 	CountTrace(&TraceStats::abandoned, reason);
@@ -2341,6 +2420,45 @@ void SrtTraceSession::OnInst(const SrtWalker& walker, const Inst& inst, uint32_t
 		Abort("unsupported instruction");
 		return;
 	}
+	// KYTY_LOCAL_HACK KYTY_TRACE_PASS_ALIAS (live, default 1): a Pass of an op's result (Phi, bit
+	// casts, ReadConst, ConditionRef, extract of a pair) is that op's event: no op to replay. Only
+	// when it recorded the same status and value (and not for immediates: slots hold op refs).
+	const bool pass_alias = m_recording->alias != 0;
+	if (pass_alias && op.kind == SrtTraceOp::Pass && frame.count == 1) {
+		const auto source = frame.events[0];
+		if (source.ref >= 0 && source.ok == ok && source.value == value) {
+			if (ok) {
+				auto& slots = m_slots[walker.m_trace_id];
+				if (index < slots.size()) {
+					slots[index] = source.ref;
+				}
+			}
+			frame.result = {source.ref, ok, value};
+			frame.have   = true;
+			return;
+		}
+	}
+	// The same user data word or shader base read through another instruction: the op already
+	// recorded for it (a leaf, its value fixed for the whole refresh), if it recorded the same.
+	uint64_t leaf_key = 0;
+	if (pass_alias && (op.kind == SrtTraceOp::UserData || op.kind == SrtTraceOp::ShaderBase)) {
+		leaf_key = (uint64_t {op.kind} << 40u) | (uint64_t {op.walker} << 32u) |
+		           static_cast<uint32_t>(op.imm);
+		for (const auto& [key, ref]: m_leaf_ops) {
+			if (key != leaf_key) continue;
+			const auto& earlier = m_recording->ops[static_cast<size_t>(ref)];
+			if (earlier.ok != ok) break;
+			if (ok) {
+				auto& slots = m_slots[walker.m_trace_id];
+				if (index < slots.size()) {
+					slots[index] = ref;
+				}
+			}
+			frame.result = {ref, ok, value};
+			frame.have   = true;
+			return;
+		}
+	}
 	auto& ops = m_recording->ops;
 	if (ops.size() >= TraceMaxOps) {
 		Abort("trace too long");
@@ -2348,6 +2466,9 @@ void SrtTraceSession::OnInst(const SrtWalker& walker, const Inst& inst, uint32_t
 	}
 	ops.push_back(op);
 	const auto ref = static_cast<int32_t>(ops.size() - 1);
+	if (leaf_key != 0) {
+		m_leaf_ops.emplace_back(leaf_key, ref);
+	}
 	if (ok) {
 		auto& slots = m_slots[walker.m_trace_id];
 		if (index < slots.size()) {
@@ -2404,6 +2525,29 @@ bool SrtTraceSession::RunOps(uint32_t end) {
 	const auto* imms  = trace.immediates.data();
 	auto*       vals  = m_values;
 	auto*       stat  = m_status;
+	// KYTY_LOCAL_HACK KYTY_TRACE_OP_STATS=1 (live, research): replayed ops per kind, every 5 s.
+	static auto& op_stats = Common::LiveSwitches::Get("KYTY_TRACE_OP_STATS", 0);
+	if (op_stats.load(std::memory_order_relaxed) != 0 && end > m_next_op) {
+		static std::array<uint64_t, 10> counts {};
+		static uint64_t                 runs   = 0;
+		static auto                     report = std::chrono::steady_clock::now();
+		for (uint32_t i = m_next_op; i < end; i++) {
+			counts[std::min<size_t>(ops[i].kind, counts.size() - 1)]++;
+		}
+		if ((++runs & 4095u) == 0u) {
+			if (const auto now = std::chrono::steady_clock::now(); now - report > std::chrono::seconds(5)) {
+				std::printf("Trace ops (5 s): pure %llu, user %llu, base %llu, pass %llu, extract %llu, "
+				            "carry %llu, select %llu, and %llu, or %llu, raw %llu\n",
+				            (unsigned long long)counts[0], (unsigned long long)counts[1],
+				            (unsigned long long)counts[2], (unsigned long long)counts[3],
+				            (unsigned long long)counts[4], (unsigned long long)counts[5],
+				            (unsigned long long)counts[6], (unsigned long long)counts[7],
+				            (unsigned long long)counts[8], (unsigned long long)counts[9]);
+				counts = {};
+				report = now;
+			}
+		}
+	}
 	for (uint32_t i = m_next_op; i < end; i++) {
 		const auto& op = ops[i];
 		uint64_t    v[5] {};

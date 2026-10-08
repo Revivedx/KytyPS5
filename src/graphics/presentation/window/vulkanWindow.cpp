@@ -734,7 +734,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		}
 	}
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
-	if (HasExtension(device_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+	// KYTY_LOCAL_HACK KYTY_ADDRESS_BINDING_REPORT=0: no address binding report (GPU fault
+	// diagnostics); it timestamps every image descriptor the CP writes (~0.6% of the CP).
+	static const bool binding_report = [] {
+		const char* value = std::getenv("KYTY_ADDRESS_BINDING_REPORT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (binding_report &&
+	    HasExtension(device_extensions, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
 		vk::PhysicalDeviceAddressBindingReportFeaturesEXT supported_binding {};
 		vk::PhysicalDeviceFeatures2                       binding_query {};
 		binding_query.pNext = &supported_binding;

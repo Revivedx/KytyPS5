@@ -53,6 +53,7 @@
 #include <string_view>
 #include <tuple>
 #include <thread>
+#include <pthread.h>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -160,6 +161,79 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 	return false;
 }
 
+// KYTY_LOCAL_HACK KYTY_PARALLEL_MATERIALIZE: set on the materialize worker thread. Its reads use the
+// caches' concurrent GPU-clean queries (the GPU thread's own ones refuse other threads), and a read
+// that is not GPU-clean is refused instead of faulting the page in (a fault there would ask the GPU
+// thread, which waits for the worker): the stage is then materialized again on the CP.
+thread_local bool t_parallel_worker  = false;
+thread_local bool t_parallel_refused = false;
+thread_local bool t_materialize_evaluated = false; // the last Materialize evaluated (no memo hit)
+std::atomic<uint64_t> g_worker_faults {0}; // faults handled on the worker (must stay 0)
+uint64_t              g_cp_pre_faults = 0; // faults during the CP's last pixel pre-materialize
+
+bool CleanGuestRead(uint64_t address, void* data, uint64_t size) {
+	return t_parallel_worker
+	           ? Libs::LibKernel::Memory::TryReadGpuCleanBackingConcurrent(address, data, size)
+	           : Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size);
+}
+
+// One persistent worker thread running one job at a time for the CP (KYTY_PARALLEL_MATERIALIZE).
+// It spins for a while between jobs (draws come every few microseconds), then sleeps.
+class MaterializeWorker {
+public:
+	MaterializeWorker() {
+		std::thread([this] { Loop(); }).detach(); // lives as long as the process
+	}
+	template <typename F>
+	void Start(F& job) {
+		m_job  = [](void* data) { (*static_cast<F*>(data))(); };
+		m_data = &job;
+		m_seq.fetch_add(1, std::memory_order_acq_rel);
+		m_seq.notify_one();
+	}
+	void Wait() {
+		const auto seq = m_seq.load(std::memory_order_relaxed);
+		while (m_done.load(std::memory_order_acquire) != seq) {
+			__builtin_ia32_pause();
+		}
+	}
+
+private:
+	void Loop() {
+		pthread_setname_np(pthread_self(), "MaterializeWkr");
+		t_parallel_worker = true;
+		// KYTY_PARALLEL_WORKER_NO_TRACE=1 (env, diagnostics): the worker evaluates without traces.
+		if (const char* v = std::getenv("KYTY_PARALLEL_WORKER_NO_TRACE"); v != nullptr && v[0] == '1') {
+			ShaderRecompiler::IR::SrtTraceSession::Suppressed() = true;
+		}
+		uint32_t last = 0;
+		for (;;) {
+			uint32_t seq = m_seq.load(std::memory_order_acquire);
+			for (uint32_t spin = 0; seq == last && spin < 200000u; spin++) {
+				__builtin_ia32_pause();
+				seq = m_seq.load(std::memory_order_acquire);
+			}
+			if (seq == last) {
+				m_seq.wait(last, std::memory_order_acquire);
+				continue;
+			}
+			m_job(m_data);
+			last = seq;
+			m_done.store(seq, std::memory_order_release);
+		}
+	}
+
+	std::atomic<uint32_t> m_seq {0};
+	std::atomic<uint32_t> m_done {0};
+	void (*m_job)(void*) = nullptr;
+	void* m_data         = nullptr;
+};
+
+const uint8_t* CleanGuestBacking(uint64_t address, uint64_t size) {
+	return t_parallel_worker ? Libs::LibKernel::Memory::FindGpuCleanBackingConcurrent(address, size)
+	                         : Libs::LibKernel::Memory::FindGpuCleanBacking(address, size);
+}
+
 // The resource walker reads guest memory one dword per scalar load, and every read pays the
 // GPU-ownership checks and the address-space lock. KYTY_SHADER_READ_CHUNKS (a live switch):
 // 1 reads each aligned 256-byte chunk once per program lookup and serves its dwords from that
@@ -200,7 +274,7 @@ public:
 		if (slot == nullptr) {
 			slot        = &m_slots[m_next++ % m_slots.size()];
 			slot->base  = base;
-			slot->clean = Libs::LibKernel::Memory::TryReadGpuCleanBacking(base, slot->words.data(),
+			slot->clean = CleanGuestRead(base, slot->words.data(),
 			                                                              ChunkSize);
 		}
 		if (!slot->clean) {
@@ -237,7 +311,7 @@ public:
 			auto&        slot  = m_pages_cache[index];
 			m_last_page        = index;
 			slot = {.base    = base,
-			        .backing = Libs::LibKernel::Memory::FindGpuCleanBacking(base, TRACKER_PAGE_SIZE)};
+			        .backing = CleanGuestBacking(base, TRACKER_PAGE_SIZE)};
 			page = &slot;
 		}
 		return page->backing;
@@ -312,7 +386,7 @@ private:
 			m_last_page        = index;
 			slot       = {.base = base,
 			              .backing =
-			                  Libs::LibKernel::Memory::FindGpuCleanBacking(base, TRACKER_PAGE_SIZE)};
+			                  CleanGuestBacking(base, TRACKER_PAGE_SIZE)};
 			page       = &slot;
 		}
 		if (page->backing == nullptr) {
@@ -357,9 +431,13 @@ bool ReadShaderGuestMemoryImpl(ShaderReadChunks* chunks, uint64_t address,
 	if (chunks != nullptr && chunks->Read(address, values)) {
 		return true;
 	}
-	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
+	if (CleanGuestRead(address, values.data(),
 	                                                    values.size_bytes())) {
 		return true;
+	}
+	if (t_parallel_worker) {
+		t_parallel_refused = true;
+		return false;
 	}
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
 		return false;
@@ -765,6 +843,7 @@ struct PipelineCache::ProgramCache {
 	// stored result instead of evaluating the resource plan again.
 	bool Materialize(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                 ShaderReadChunks& reads) {
+		t_materialize_evaluated = true; // cleared again by a memo hit
 		if (!ResourceMemoEnabled()) {
 			DrawRecordCensus::g_flags |= 1u;
 			return ShaderRecompiler::IR::MaterializeResources(
@@ -783,6 +862,7 @@ struct PipelineCache::ProgramCache {
 				// vertex/instance offsets).
 				entry.resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 				slot.last_use = memo_clock;
+				t_materialize_evaluated = false;
 				memo_hits++;
 				entry.stat_exact++;
 				DrawRecordCensus::g_flags |= 4u;
@@ -838,7 +918,9 @@ struct PipelineCache::ProgramCache {
 		static auto& log_reuse = Common::LiveSwitches::Get("KYTY_LOG_REUSE", 1);
 		const bool   reuse     = log_reuse.load(std::memory_order_relaxed) != 0;
 		ShaderReadChunks::ReadLog fresh_log;
-		auto& log = reuse ? memo_scratch_log : fresh_log;
+		// Per thread (KYTY_PARALLEL_MATERIALIZE runs two materializations at once).
+		thread_local ShaderReadChunks::ReadLog scratch_log;
+		auto& log = reuse ? scratch_log : fresh_log;
 		log.reads.clear();
 		log.words.clear();
 		static auto& read_opt = Common::LiveSwitches::Get("KYTY_READ_OPT", 1);
@@ -849,7 +931,9 @@ struct PipelineCache::ProgramCache {
 			log.words.reserve(prev.words.size() + 16);
 		}
 		reads.SetLog(&log);
-		const auto miss_start = std::chrono::steady_clock::now();
+		// Timed only for the miss classifier (KYTY_MEMO_CLASSIFY).
+		const auto miss_start = memo_last_class >= 0 ? std::chrono::steady_clock::now()
+		                                             : std::chrono::steady_clock::time_point {};
 		const bool ok = ShaderRecompiler::IR::MaterializeResources(
 		    entry.resource_plan, runtime, entry.resources, entry.specialization);
 		reads.SetLog(nullptr);
@@ -1053,6 +1137,7 @@ struct PipelineCache::ProgramCache {
 			if (skip_stable && address == read.address) {
 				continue;
 			}
+			thread_local std::vector<uint32_t> memo_words; // per thread (parallel materialize)
 			memo_words.resize(read.count);
 			const bool ok = ReadShaderGuestMemoryImpl(&reads, address, memo_words);
 			if (ok != read.ok || (ok && !std::equal(memo_words.begin(), memo_words.end(),
@@ -1493,6 +1578,10 @@ struct PipelineCache::ProgramCache {
 	}
 
 	void ReportMemo() {
+		// Called for every Materialize: read the clock every 256th call only.
+		if ((++memo_report_calls & 255u) != 0u) {
+			return;
+		}
 		const auto now = std::chrono::steady_clock::now();
 		if (now - memo_report < std::chrono::seconds(5)) {
 			return;
@@ -1635,9 +1724,187 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// KYTY_LOCAL_HACK KYTY_PARALLEL_MATERIALIZE: a stage looked up and materialized ahead (possibly on
+	// the worker thread). Get uses it only when the entry it finds is still that one.
+	struct PreMaterialized {
+		bool               ok    = false;
+		const SourceEntry* entry = nullptr;
+		bool               evaluated = false; // diagnostics (verify)
+		std::string        diag;
+		std::vector<std::pair<uint32_t, uint8_t>> walk;
+	};
+
+	template <typename InputInfo>
+	void BuildLookupKey(const ShaderParams& params, const InputInfo& input_info, ShaderType stage,
+	                    std::span<const uint32_t> user_data, ProgramKey& key) {
+		key.stage           = stage;
+		key.hash            = params.hash;
+		key.user_data_count = params.user_data_count;
+		key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, key.static_state);
+		if (const auto found = call_targets.find(params.hash); found != call_targets.end()) {
+			for (const auto index: found->second) {
+				key.static_state.push_back(index < user_data.size() ? user_data[index] : 0u);
+			}
+		}
+		key.function_code.clear();
+	}
+
+	// The lookup and materialization of a graphics stage, without inserting anything (a missing
+	// program is left to Get). On the worker thread, reads that are not GPU-clean refuse it.
+	template <typename InputInfo>
+	void PreMaterialize(const ShaderParams& params, InputInfo& input_info, ShaderType stage,
+	                    ProgramKey& key, PreMaterialized& out) {
+		out = {};
+		if (SkipShaderRequested(params.hash) || LiveSkipShader(params.hash, stage)) {
+			return;
+		}
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		BuildLookupKey(params, input_info, stage, user_data, key);
+		if (unsupported.contains(key)) {
+			return;
+		}
+		const auto entry = programs.find(key);
+		if (entry == programs.end()) {
+			return;
+		}
+		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = user_data,
+		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryRaw,
+		    .userdata                   = &read_chunks,
+		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		};
+		if (read_chunks.PageMode()) {
+			runtime.map_clean_page = +[](void* userdata, uint64_t page) {
+				return static_cast<ShaderReadChunks*>(userdata)->MapPage(page);
+			};
+			runtime.log_read = +[](void* userdata, uint64_t address, uint32_t word) {
+				static_cast<ShaderReadChunks*>(userdata)->Log(address, {&word, 1}, true);
+			};
+			runtime.page_userdata = &read_chunks;
+		}
+		t_parallel_refused = false;
+		const bool materialized = Materialize(entry->second, runtime, read_chunks);
+		out.ok    = materialized && !t_parallel_refused;
+		out.entry = &entry->second;
+		out.evaluated = t_materialize_evaluated;
+		static auto& mode = Common::LiveSwitches::Get("KYTY_PARALLEL_MATERIALIZE", 1);
+		if (out.evaluated && !t_parallel_worker && mode.load(std::memory_order_relaxed) >= 2) {
+			out.walk = entry->second.resource_plan.active_walk; // verify diagnostics only
+			out.diag = ShaderRecompiler::IR::TakeSrtDiagnostics();
+		}
+	}
+
+	void CheckFresh(const ShaderParams& params, SourceEntry& entry,
+	                const std::vector<std::pair<uint32_t, uint8_t>>& pre_walk, const std::string& diag) {
+		const auto ahead = entry.resources;
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = user_data,
+		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryRaw,
+		    .userdata                   = &read_chunks,
+		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		};
+		ShaderRecompiler::IR::ResourceSnapshot       fresh;
+		ShaderRecompiler::IR::ResourceSpecialization fresh_spec;
+		const bool ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime, fresh,
+		                                                           fresh_spec);
+		static uint64_t checks = 0, differ = 0;
+		checks++;
+		const bool same = ok && ahead.buffers == fresh.buffers && ahead.images == fresh.images &&
+		                  ahead.samplers == fresh.samplers && ahead.flattened_srt == fresh.flattened_srt;
+		if (!same && differ++ < 12) {
+			const auto& plan = entry.resource_plan;
+			const auto& walk = plan.active_walk;
+			std::string wd;
+			for (size_t i = 0; i < std::max(walk.size(), pre_walk.size()); i++) {
+				const auto a = i < pre_walk.size() ? pre_walk[i] : std::pair<uint32_t, uint8_t> {~0u, 9};
+				const auto b = i < walk.size() ? walk[i] : std::pair<uint32_t, uint8_t> {~0u, 9};
+				if (a != b) {
+					wd = fmt::format("walk[{}] block {} outcome {} -> block {} outcome {} (len {} -> {})", i,
+					                 a.first, a.second, b.first, b.second, pre_walk.size(), walk.size());
+					break;
+				}
+			}
+			std::printf("Parallel fresh MISMATCH: hash 0x%016" PRIx64 " native %d trace %d alias %d: %s || pre: %s\n",
+			            params.hash, plan.native_code != nullptr ? 1 : 0, plan.srt_trace != nullptr ? 1 : 0,
+			            plan.srt_trace != nullptr ? plan.srt_trace->alias : -1, wd.c_str(), diag.c_str());
+			std::fflush(stdout);
+		}
+		if ((checks & 0xffffu) == 0u) {
+			std::printf("Parallel fresh verify: %" PRIu64 " checked, %" PRIu64 " differ\n", checks, differ);
+		}
+	}
+
+	// The pixel and vertex stages of a draw: their lookups and materializations run at the same
+	// time (the vertex stage on the worker), then Get runs for each in the usual order (pixel
+	// first: the push data cursor and any compile stay sequential).
+	void GetPixelVertex(const ShaderParams& pixel_params, ShaderPixelInputInfo& pixel_info,
+	                    const ShaderParams& vertex_params, ShaderVertexInputInfo& vertex_info,
+	                    uint32_t& push_data_cursor, ShaderProgram& pixel, ShaderProgram& vertex) {
+		static MaterializeWorker worker;
+		PreMaterialized          pre_vertex;
+		PreMaterialized          pre_pixel;
+		auto job = [&] {
+			const auto faults0 = RenderContext::ThreadFaultCount();
+			PreMaterialize(vertex_params, vertex_info, vertex_info.logical_stage, worker_key, pre_vertex);
+			g_worker_faults += RenderContext::ThreadFaultCount() - faults0;
+		};
+		const auto cp_faults0 = RenderContext::ThreadFaultCount();
+		// KYTY_PARALLEL_MATERIALIZE=3 (control for the verify mode): the same ahead-of-time
+		// materializations, both on the CP, one after the other.
+		static auto& parallel = Common::LiveSwitches::Get("KYTY_PARALLEL_MATERIALIZE", 1);
+		if (parallel.load(std::memory_order_relaxed) == 3) {
+			PreMaterialize(pixel_params, pixel_info, ShaderType::Pixel, cp_pre_key, pre_pixel);
+			job();
+			if (pre_pixel.ok && pre_pixel.evaluated) {
+				CheckFresh(pixel_params, *const_cast<SourceEntry*>(pre_pixel.entry), pre_pixel.walk,
+				           pre_pixel.diag);
+			}
+		} else if (parallel.load(std::memory_order_relaxed) == 4) {
+			// Control: the vertex stage on the worker, but not at the same time as the pixel stage.
+			worker.Start(job);
+			worker.Wait();
+			PreMaterialize(pixel_params, pixel_info, ShaderType::Pixel, cp_pre_key, pre_pixel);
+		} else {
+			worker.Start(job);
+			PreMaterialize(pixel_params, pixel_info, ShaderType::Pixel, cp_pre_key, pre_pixel);
+			worker.Wait();
+			// KYTY_PARALLEL_MATERIALIZE=2: an evaluation of the pixel stage made while the worker ran,
+			// evaluated again now from scratch (no memo) and compared.
+			if (parallel.load(std::memory_order_relaxed) == 2 && pre_pixel.entry != nullptr &&
+			    pre_vertex.entry != nullptr) {
+				const auto& a = pre_pixel.entry->resource_plan;
+				const auto& b = pre_vertex.entry->resource_plan;
+				static uint32_t shared_reports = 0;
+				if ((&a == &b || (a.srt_trace != nullptr && a.srt_trace == b.srt_trace) ||
+				     (a.compiled_srt != nullptr && a.compiled_srt == b.compiled_srt)) &&
+				    shared_reports++ < 8) {
+					std::printf("Parallel SHARED: plan %d trace %d compiled %d (ps 0x%016" PRIx64 " vs 0x%016" PRIx64 ")\n",
+					            &a == &b ? 1 : 0, a.srt_trace != nullptr && a.srt_trace == b.srt_trace ? 1 : 0,
+					            a.compiled_srt != nullptr && a.compiled_srt == b.compiled_srt ? 1 : 0,
+					            pixel_params.hash, vertex_params.hash);
+				}
+			}
+			if (parallel.load(std::memory_order_relaxed) == 2 && pre_pixel.ok && pre_pixel.evaluated) {
+				CheckFresh(pixel_params, *const_cast<SourceEntry*>(pre_pixel.entry), pre_pixel.walk,
+				           pre_pixel.diag);
+			}
+		}
+		g_cp_pre_faults = RenderContext::ThreadFaultCount() - cp_faults0;
+		pixel  = Get(pixel_params, pixel_info, push_data_cursor, &pre_pixel);
+		vertex = Get(vertex_params, vertex_info, push_data_cursor, &pre_vertex);
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor, const PreMaterialized* pre = nullptr) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -1728,7 +1995,82 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry != programs.end()) {
 			bool materialized = false;
-			{
+			if (pre != nullptr && pre->ok && pre->entry == &entry->second) {
+				materialized = true; // done ahead (KYTY_PARALLEL_MATERIALIZE)
+				// KYTY_PARALLEL_MATERIALIZE=2: materialize again here and compare (verify).
+				static auto& parallel = Common::LiveSwitches::Get("KYTY_PARALLEL_MATERIALIZE", 1);
+				if (parallel.load(std::memory_order_relaxed) >= 2) {
+					const auto ahead = entry->second.resources;
+					materialized     = Materialize(entry->second, runtime, read_chunks);
+					const auto& now  = entry->second.resources;
+					const bool  same = materialized && ahead.buffers == now.buffers &&
+					                  ahead.images == now.images && ahead.samplers == now.samplers &&
+					                  ahead.flattened_srt == now.flattened_srt;
+					static uint64_t checked = 0, differ = 0;
+					checked++;
+					if (!same && differ++ < 16) {
+						std::string detail;
+						const auto diff_desc = [&](const char* name, const auto& a, const auto& b) {
+							if (a.size() != b.size()) {
+								detail += fmt::format(" {} size {}->{}", name, a.size(), b.size());
+								return;
+							}
+							for (size_t i = 0; i < a.size(); i++) {
+								if (!(a[i] == b[i])) {
+									detail += fmt::format(" {}[{}]", name, i);
+									if constexpr (std::is_same_v<std::decay_t<decltype(a[i])>, uint32_t>) {
+										detail += fmt::format("={:08x}->{:08x}", a[i], b[i]);
+									} else {
+										detail += fmt::format("={:08x}.{:08x}->{:08x}.{:08x}", a[i].dwords[0],
+										                      a[i].dwords[1], b[i].dwords[0], b[i].dwords[1]);
+									}
+									return;
+								}
+							}
+						};
+						diff_desc("buf", ahead.buffers, now.buffers);
+						diff_desc("img", ahead.images, now.images);
+						diff_desc("smp", ahead.samplers, now.samplers);
+						diff_desc("srt", ahead.flattened_srt, now.flattened_srt);
+						// Did a word the ahead evaluation read change since (memory), or not (evaluation)?
+						for (const auto& slot: entry->second.memo) {
+							if (slot.resources.flattened_srt != ahead.flattened_srt ||
+							    !(slot.resources.buffers == ahead.buffers)) {
+								continue;
+							}
+							size_t changed = 0;
+							for (const auto& read: slot.log.reads) {
+								std::vector<uint32_t> words(read.count);
+								const bool ok = ReadShaderGuestMemoryImpl(nullptr, read.address, words);
+								const bool same_words =
+								    ok == read.ok &&
+								    (!ok || std::equal(words.begin(), words.end(),
+								                       slot.log.words.begin() + read.first));
+								if (!same_words && changed++ == 0) {
+									detail += fmt::format(" | read 0x{:x} ok {}->{} word {:08x}->{:08x}",
+									                      read.address, read.ok, ok,
+									                      read.ok ? slot.log.words[read.first] : 0u,
+									                      ok ? words[0] : 0u);
+								}
+							}
+							detail += fmt::format(" | {} of {} logged reads changed", changed,
+							                      slot.log.reads.size());
+							break;
+						}
+						std::printf("Parallel materialize MISMATCH: stage %u hash 0x%016" PRIx64
+						            " ok %d (cp pre faults %llu, worker faults %llu):%s\n",
+						            static_cast<uint32_t>(stage), params.hash, materialized ? 1 : 0,
+						            (unsigned long long)g_cp_pre_faults,
+						            (unsigned long long)g_worker_faults.load(), detail.c_str());
+					}
+					if ((checked & 0xffffu) == 0u) {
+						std::printf("Parallel materialize verify: %" PRIu64 " checked, %" PRIu64
+						            " differ, worker faults %llu\n",
+						            checked, differ, (unsigned long long)g_worker_faults.load());
+						std::fflush(stdout);
+					}
+				}
+			} else {
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
 				static auto& plan_stats = Common::LiveSwitches::Get("KYTY_MEMO_PLAN_STATS", 0);
 				if (plan_stats.load(std::memory_order_relaxed) != 0) {
@@ -2782,6 +3124,8 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander          function_expander;
 	ProgramKey                                                  lookup_key;
+	ProgramKey                                                  worker_key; // KYTY_PARALLEL_MATERIALIZE
+	ProgramKey                                                  cp_pre_key;
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
 	// KYTY_RESOURCE_MEMO bookkeeping (GPU thread).
@@ -2792,6 +3136,7 @@ struct PipelineCache::ProgramCache {
 	// Research: 0 cold, 1-3 user data 1/2/3-4 dwords (unclassified), 4 5+ dwords, 5 reads;
 	// 6 pass same, 7 pass differ, 8 reloc same, 9 reloc differ.
 	int                                   memo_last_class = -1;
+	uint32_t                              memo_report_calls = 0;
 	std::array<uint64_t, 10>              memo_class_ns {};
 	std::array<uint64_t, 10>              memo_class_calls {};
 	std::array<uint64_t, 4>               memo_delta_kinds {};
@@ -2802,8 +3147,7 @@ struct PipelineCache::ProgramCache {
 	uint64_t                              rebase_disabled = 0;
 	std::vector<uint32_t>                 rebase_old;
 	std::vector<uint32_t>                 rebase_new;
-	std::vector<uint32_t>                 memo_words;
-	ShaderReadChunks::ReadLog             memo_scratch_log;
+	std::vector<uint32_t>                 memo_words; // research paths (GPU thread only)
 	std::chrono::steady_clock::time_point memo_report = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
@@ -3148,6 +3492,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	// KYTY_LOCAL_HACK KYTY_PARALLEL_MATERIALIZE (live, default 1; pm4 +4%): the pixel and vertex stages' resource
+	// materialization at the same time (ProgramCache::GetPixelVertex).
+	static auto& parallel = Common::LiveSwitches::Get("KYTY_PARALLEL_MATERIALIZE", 1);
+	if (pixel_active && !tess_active && parallel.load(std::memory_order_relaxed) != 0) {
+		m_program_cache->GetPixelVertex(pixel_params, pixel_info, vertex_params[0], vertex_info[0],
+		                                push_data_cursor, result.pixel, result.vertex[0]);
+		if (!result.vertex[0]) {
+			return {};
+		}
+		return result;
+	}
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}

@@ -909,6 +909,30 @@ const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->FindBacking(vaddr, size);
 }
 
+// KYTY_LOCAL_HACK KYTY_PARALLEL_MATERIALIZE: the same verdicts off the GPU thread, through the caches'
+// concurrent queries (the buffer cache's dirty ranges under their lock, the texture cache's lock).
+static bool GpuCleanConcurrent(uint64_t vaddr, uint64_t size) {
+	// KYTY_PARALLEL_NO_IMAGE_CHECK=1 (env, diagnostics): skip the texture cache query.
+	static const bool no_image = [] {
+		const char* value = std::getenv("KYTY_PARALLEL_NO_IMAGE_CHECK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	       (GetGpuResources().GetBufferCache().IsCleanForConcurrentRead(vaddr, size) &&
+	        (no_image || !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)));
+}
+
+bool TryReadGpuCleanBackingConcurrent(uint64_t vaddr, void* data, uint64_t size) {
+	return GpuCleanConcurrent(vaddr, size) && TryReadBacking(vaddr, data, size);
+}
+
+const uint8_t* FindGpuCleanBackingConcurrent(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr || !GpuCleanConcurrent(vaddr, size)) {
+		return nullptr;
+	}
+	return g_guest_address_space->FindBacking(vaddr, size);
+}
+
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
 	return g_gpu_resources != nullptr &&
 	       g_gpu_resources->CanServeCleanRead(fault_vaddr, vaddr, size) &&

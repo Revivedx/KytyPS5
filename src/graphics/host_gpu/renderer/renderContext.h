@@ -53,6 +53,8 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Faults this thread has handled (KYTY_PARALLEL_MATERIALIZE verify diagnostics).
+	[[nodiscard]] static uint64_t ThreadFaultCount() noexcept;
 	// Lifts write protection ahead of a sequential write-fault stream (KYTY_FAULT_AHEAD).
 	void FaultAhead(uint64_t fault_vaddr) noexcept;
 	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,

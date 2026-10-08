@@ -123,6 +123,9 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // work has written any of them, else nullptr. Current until the GPU thread marks them
 // GPU-written or the guest remaps them.
 [[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// Off the GPU thread (KYTY_PARALLEL_MATERIALIZE worker): the same, never faulting.
+bool                         TryReadGpuCleanBackingConcurrent(uint64_t vaddr, void* data, uint64_t size);
+[[nodiscard]] const uint8_t* FindGpuCleanBackingConcurrent(uint64_t vaddr, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);

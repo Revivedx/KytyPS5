@@ -666,6 +666,11 @@ struct ResourcePlan {
 	mutable std::vector<std::pair<uint32_t, uint8_t>> active_walk;
 	mutable std::vector<uint8_t>                      active_walk_result;
 	mutable bool                                      active_walk_valid = false;
+	// KYTY_LOCAL_HACK KYTY_WALK_PLAN: the last walk's request sequence, flat: each read slot it
+	// refreshed (once per walk, in order), and after each block its condition check
+	// (WalkPlanCheck | outcome << 28 | block). Valid with active_walk_valid.
+	static constexpr uint32_t                         WalkPlanCheck = 0x80000000u;
+	mutable std::vector<uint32_t>                     active_walk_plan;
 	mutable std::shared_ptr<const SrtNativeCode> native_code;
 	mutable uint32_t                             native_uses      = 0;
 	mutable bool                                 native_attempted = false;

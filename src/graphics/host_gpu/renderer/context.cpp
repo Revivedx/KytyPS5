@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <atomic>
+
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
@@ -127,8 +129,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Recorder().beginRendering(rendering);
-	m_render_state = state;
-	m_rendering    = true;
+	static std::atomic<uint64_t> serial = 0;
+	m_render_serial = serial.fetch_add(1, std::memory_order_relaxed) + 1;
+	m_render_state  = state;
+	m_rendering     = true;
 }
 
 void CommandBuffer::EndRendering() const {
@@ -138,6 +142,18 @@ void CommandBuffer::EndRendering() const {
 	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+	if (m_pending_global_barrier) {
+		m_pending_global_barrier = false;
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		Recorder().pipelineBarrier2(dependency);
+	}
 }
 
 } // namespace Libs::Graphics

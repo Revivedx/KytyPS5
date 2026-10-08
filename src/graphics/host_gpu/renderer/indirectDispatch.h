@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <span>
 #include <vulkan/vulkan.hpp>
 
 namespace Libs::Graphics {
@@ -78,12 +79,23 @@ public:
 	// Records the conversion; binds a compute pipeline and push state and must run outside a
 	// render pass, before the draw's own bindings are committed.
 	[[nodiscard]] Result Convert(const CommandRecorder& command, const Params& params);
+	// The same for several draws behind one pair of barriers (KYTY_MESH_PRECONVERT): the
+	// draws of a render pass converted before it begins. At most MaxBatch draws.
+	void ConvertBatch(const CommandRecorder& command, std::span<const Params> params,
+	                  std::span<Result> results);
+	static constexpr uint32_t MaxBatch = 1024;
+	// Conversions recorded so far; an entry stays valid for Entries - 1 later ones.
+	[[nodiscard]] uint64_t Count() const noexcept { return m_count; }
+	static constexpr uint32_t RingEntries = 4096;
 
 private:
+	Result RecordOne(const CommandRecorder& command, const Params& params);
+
 	// Ring of entries (groups at 0, draw parameters at 4). An entry is rewritten only after 4096
 	// later conversions, each ordered behind the reads before it.
-	static constexpr uint32_t Entries     = 4096;
+	static constexpr uint32_t Entries     = RingEntries;
 	static constexpr uint32_t EntryDwords = 16;
+	uint64_t                  m_count     = 0;
 
 	GraphicContext&         m_graphics;
 	Buffer                  m_entries;
