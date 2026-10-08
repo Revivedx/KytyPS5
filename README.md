@@ -1,31 +1,61 @@
-# KytyPS5: Marvel's Wolverine build
+# KytyPS5: Marvel's Wolverine on Linux + AMD
 
 > [!NOTE]
-> **This is a fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) tuned for Marvel's Wolverine**
-> (PPSA03671, version 01.001.005). It is not the official KytyPS5 repository; for other games
-> and the latest KytyPS5, use [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5).
+> **Fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on running Marvel's Wolverine
+> (PPSA03671) on Linux with AMD GPUs (Mesa RADV).** It is not the official KytyPS5 repository; for
+> other games and the latest KytyPS5, use [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5).
+> You need your own dump of the game: no game files, keys or firmware are included.
 
-**[Download the latest Wolverine build](https://github.com/IDXTRI/KytyPS5/releases/latest)**
-(Windows x64). Extract it, run `Play Wolverine.bat` and enter the folder that contains the game's
-`eboot.bin`. The `README.md` inside the download covers recommended settings, known issues and
-troubleshooting. You need your own dump of the game: no game files, keys or firmware are
-included.
+**Status (2026-10-07), work in progress.** Tested on a Ryzen 7 5800X3D + Radeon RX 7900 XT, Mesa RADV,
+Linux 7.2, in the opening jungle area:
 
-**Status:** test release. The opening areas are playable at roughly 12-30 fps on a Ryzen 7
-7800X3D + RTX 4070 Ti, with visual glitches (flickering shadows, a tiled moon) and occasional GPU
-crashes. Ray-traced effects are skipped.
+| | Frame rate |
+|---|---|
+| Standing / exploring | ~20 fps (was ~10 on 2026-10-05) |
+| Combat | ~11 fps on average |
+| Heavy combat (fire, many enemies) | 7-12 fps |
 
-**What this fork adds** on top of KytyPS5 (release 2026-10-03, f53e5d2):
+The goal is a stable 30 fps. Build and run instructions: **[packaging/wolverine/linux-amd](packaging/wolverine/linux-amd/README.md)**.
 
-- the Marvel's Wolverine work from KytyPS5 PR #937;
-- lower VRAM use (about 10-11 GB instead of 12.7 GB), GPU fault handling and safer texture
-  memory reuse;
-- streamed-texture updates, Wolverine fixes on the new KytyPS5 code, Xbox View button as the PS5
-  touchpad, and Wolverine's settings as defaults.
+## What was done
 
-**Credits:** KytyPS5 and its contributors; **Mac (itsmemac), Senaxx and Ali Almohaya** for the
-Marvel's Wolverine work (PR #937) and Senaxx's later fixes; **Jetsku** for the SPIR-V
-Function-array shrink pass; **DXTR** for this build.
+**Getting it to run and render correctly on AMD/RADV**
+- Title screen, menus and gameplay: shader clock divisor, mesh draws over 65535 groups split, BC6H/BC7
+  3D image flags, out-of-bounds fix in the ATRAC9 audio decoder (combat crash).
+- Character models: vertices that export no position are culled instead of left undefined (orange/black
+  slabs over faces); guest wave32 mesh shaders run one guest wave per pass (cracks in skin, clothes and
+  ground); wave32 vertex shaders wrap the lane index at 32 (strand geometry).
+- Effects: pixel shaders run with the guest's wave size (rainbow sparkles on sparks, fire and smoke).
+
+**No gameplay stutter from shader compiles**
+- Warm shader cache plus asynchronous pipeline compiles: shader recompiles during play went from ~27 s
+  per session to a few milliseconds.
+
+**Performance of the emulated GPU command processor** (the main bottleneck), each change measured
+with a same-process A/B switch:
+- Replay traces of the shader resource walk (port of Senaxx's work) and an in-order replay of the walk:
+  about +20% together.
+- `FindImage` memo, texture description cache, lazy timeline-semaphore queries, shader-expansion
+  hashing, a shared address-space lock for write-tracking protections, bigger fault-ahead and readback
+  windows, GPU-side data loads for shaders whose data the GPU itself just wrote, PGO builds.
+
+**Tooling** (all behind `KYTY_*` switches, most of them changeable while the game runs): GPU and
+command-buffer profilers, readback and write-fault statistics, verify modes for every replay/memo,
+scripted gameplay A/B runs.
+
+## Next
+
+- GPU: the frame is split into ~2200 small, serialized pieces (~4900 barriers and ~930 render passes per
+  frame); batching the mesh-indirect argument conversion is first.
+- Command processor: draw records (skip the whole per-draw preparation for repeated draws), needed for
+  heavy combat.
+
+## Credits
+
+Based on IDXTRI's `wolverine-v1` (KytyPS5 2026-10-03 with the Marvel's Wolverine work of KytyPS5
+PR #937 by Mac (itsmemac), Senaxx and Ali Almohaya). Thanks to Senaxx for the SRT replay traces and the
+AMD lane fix ported here, chenxiao07 and Jetsku for ideas, and the KytyPS5 contributors.
+GPL-2.0, like the rest of the repository.
 
 Not affiliated with Sony Interactive Entertainment, Insomniac Games or Marvel.
 
