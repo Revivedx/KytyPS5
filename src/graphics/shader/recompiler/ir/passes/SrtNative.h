@@ -99,6 +99,22 @@ public:
 		return &m_descriptor_dwords[static_cast<size_t>(source) * 8u];
 	}
 
+	// KYTY_LOCAL_HACK KYTY_FAST_FLAT: srt_reads in a compact form for SrtWalker::RefreshFlatBuffer's
+	// fast loop (one entry per read: flat slot, clean flag from the plan's clean_flat_slots, and
+	// the routine offset per mode or the immediate).
+	struct FlatOp {
+		uint32_t flat_offset = 0;
+		uint8_t  kind        = 0; // SrtNativeValue::Kind
+		uint8_t  clean       = 0;
+		uint32_t routine[2]  = {UINT32_MAX, UINT32_MAX};
+		uint64_t immediate   = 0;
+	};
+	[[nodiscard]] const std::vector<FlatOp>& FlatOps() const { return m_flat_ops; }
+	// Runs one routine (an offset from FlatOps) on a frame, like Evaluate.
+	bool Run(SrtNativeFrame& frame, uint32_t routine, uint64_t& result) const {
+		return m_entry(&frame, m_memory + routine, &result);
+	}
+
 	[[nodiscard]] size_t CodeSize() const { return m_size; }
 	[[nodiscard]] uint32_t Instructions() const { return m_instructions; }
 	[[nodiscard]] uint32_t Interpreted() const { return m_interpreted; }
@@ -114,6 +130,7 @@ private:
 	// Routine offsets by evaluation index, per mode; UINT32_MAX when the index has no routine.
 	std::vector<uint32_t> m_routines[2];
 	std::vector<SrtNativeValue> m_flat_reads;
+	std::vector<FlatOp>         m_flat_ops;
 	std::vector<SrtNativeValue> m_conditions;
 	std::vector<SrtNativeValue> m_descriptor_dwords;
 	uint32_t              m_instructions = 0;

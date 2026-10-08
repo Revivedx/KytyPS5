@@ -160,6 +160,8 @@ struct EmitterState {
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
 	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
+	// KYTY_LOCAL_HACK (pixel history): FragCoord input used by KYTY_PIXEL_HISTORY records.
+	uint32_t                   pixel_history_frag_coord              = 0;
 	uint32_t                   cull_distance_variable                = 0;
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
@@ -194,6 +196,9 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state);
 uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
 uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+void     EmitDefaultKilledPosition(EmitterState& state);
+bool     PixelHistoryEnabled(int* x = nullptr, int* y = nullptr, int* w = nullptr,
+                             int* h = nullptr);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class);
@@ -205,6 +210,19 @@ inline void EmitLabel(EmitterState& state, uint32_t label) {
 
 uint32_t TypeId(EmitterState& state, IR::Type type);
 
+// KYTY_LOCAL_HACK (NaN hunt): KYTY_NAN_SCRUB=1 replaces NaN by 0 in every float colour export and
+// float storage-image write; KYTY_NAN_SCRUB=<file> only in the shaders whose hex hashes it lists.
+bool NanScrubShader(uint64_t shader_hash);
+uint32_t EmitScrubNanF32x4(EmitterState& state, uint32_t value);
+
+inline bool NoContractF32() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NO_CONTRACT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // Shared instruction construction; typed aliases add no forwarding functions.
 template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
@@ -213,6 +231,16 @@ uint32_t EmitNative(EmitterState& state, Args... args) {
 	if constexpr (type == IR::Type::F64 &&
 	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
 		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
+	// The guest's V_MUL_F32 and V_ADD_F32 round separately; only V_FMA/V_MAC fuse. A host
+	// compiler that contracts mul+add differently in two shaders computing the same position
+	// (depth prepass and an EQUAL-tested material pass) fails the depth test on whole triangles.
+	// KYTY_NO_CONTRACT=0 restores contraction (A/B).
+	if constexpr (type == IR::Type::F32 &&
+	              (opcode == spv::OpFMul || opcode == spv::OpFAdd || opcode == spv::OpFSub)) {
+		if (NoContractF32()) {
+			state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+		}
 	}
 	return result;
 }
@@ -417,6 +445,8 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
 // A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
 [[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
+// A mesh program whose draw parameters live behind the device address in push dwords 0-1.
+[[nodiscard]] bool MeshDrawDataIndirect(const EmitterState& state);
 // Guest DMA, or DispatchDimensionsIndirect: the module uses physical storage buffer pointers.
 [[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
 

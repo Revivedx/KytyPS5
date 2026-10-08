@@ -592,6 +592,7 @@ struct CompiledSrt;
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 class SrtNativeCode;
+struct SrtTrace;
 
 struct ResourcePlan {
 	struct EvaluationContext {
@@ -646,6 +647,12 @@ struct ResourcePlan {
 	mutable uint32_t                       evaluation_depth       = 0;
 	mutable std::vector<uint8_t>            active_sources;
 	mutable std::vector<uint8_t>            visited_blocks;
+	// KYTY_LOCAL_HACK (Senaxx 1f1eb128, cfa45677; KYTY_WALK_ONCE): active_sources before the walk
+	// (sources no block guards), built once per plan; per-read stamps so a read listed under
+	// several blocks is refreshed once per walk.
+	mutable std::vector<uint8_t>            active_initial;
+	mutable std::vector<uint32_t>           walk_slot_stamps;
+	mutable uint32_t                        walk_generation = 0;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	// Built on first use by SrtWalker when KYTY_SRT_COMPILED is on; null if the plan cannot be
@@ -662,6 +669,12 @@ struct ResourcePlan {
 	mutable std::shared_ptr<const SrtNativeCode> native_code;
 	mutable uint32_t                             native_uses      = 0;
 	mutable bool                                 native_attempted = false;
+	// KYTY_LOCAL_HACK (Senaxx 598030de): the replay trace of the last refresh (SrtWalker.h,
+	// SrtTraceSession), and how recording went.
+	mutable std::shared_ptr<SrtTrace> srt_trace;
+	mutable uint32_t                  srt_trace_uses    = 0;
+	mutable uint32_t                  srt_trace_misses  = 0;
+	mutable uint32_t                  srt_trace_backoff = 0;
 };
 
 struct Program: ResourcePlan {

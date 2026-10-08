@@ -359,6 +359,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
+	// KYTY_LOCAL_HACK KYTY_FAST_SKIP (live, default 1): a dispatch of a --skip-shaders shader is
+	// dropped here, before the pending-operation pass, the lock and the program lookup that
+	// skipped it anyway (Wolverine: ~1470 per frame, ~3 us each).
+	{
+		static auto& fast_skip = Common::LiveSwitches::Get("KYTY_FAST_SKIP", 1);
+		if (fast_skip.load(std::memory_order_relaxed) != 0) {
+			const auto code = buffer.GetShaders().GetCs().cs_regs.data_addr;
+			if (code != 0 && IsSkipListedShader(ShaderDeclaredHash(code))) {
+				return;
+			}
+		}
+	}
+	// KYTY_LOCAL_HACK research: draw-record census (KYTY_MEMO_CLASSIFY=1).
+	DrawRecordCensus::g_flags = 0;
+	struct CensusEnd {
+		bool     compute;
+		uint64_t start;
+		~CensusEnd() { DrawRecordCensus::Record(compute, start); }
+	} census_end {true, DrawRecordCensus::NowNs()};
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -575,9 +594,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		FlushShadowWritebacks(vk_buffer);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		m_context.GetCommandScheduler().ProfileMark(0, program.shader_hash, 0);
 	} while (recovery.Retry());
 	ResetBindings();
 }
@@ -585,6 +606,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	// KYTY_LOCAL_HACK KYTY_FAST_SKIP (live, default 1): a dispatch of a --skip-shaders shader is
+	// dropped here, before the pending-operation pass, the lock and the program lookup that
+	// skipped it anyway (Wolverine: ~1470 per frame, ~3 us each).
+	{
+		static auto& fast_skip = Common::LiveSwitches::Get("KYTY_FAST_SKIP", 1);
+		if (fast_skip.load(std::memory_order_relaxed) != 0) {
+			const auto code = buffer.GetShaders().GetCs().cs_regs.data_addr;
+			if (code != 0 && IsSkipListedShader(ShaderDeclaredHash(code))) {
+				return;
+			}
+		}
+	}
+	// KYTY_LOCAL_HACK research: draw-record census (KYTY_MEMO_CLASSIFY=1).
+	DrawRecordCensus::g_flags = 0;
+	struct CensusEnd {
+		bool     compute;
+		uint64_t start;
+		~CensusEnd() { DrawRecordCensus::Record(compute, start); }
+	} census_end {true, DrawRecordCensus::NowNs()};
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
 	// shader bounds its threads by the counts it reads from the same memory.
 	const bool use_thread_dimensions =
@@ -670,7 +710,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		FlushShadowWritebacks(vk_buffer);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		m_context.GetCommandScheduler().ProfileMark(1, program.shader_hash, 0);
 	} while (recovery.Retry());
 	ResetBindings();
 }

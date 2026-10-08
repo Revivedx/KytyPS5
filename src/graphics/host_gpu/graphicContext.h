@@ -52,6 +52,7 @@ struct GraphicContext {
 	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
+	bool                               calibrated_timestamps_enabled         = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -79,6 +80,8 @@ struct GraphicContext {
 	// Queue 1 of queue_family, if the device has it; used by the GPU thread only (BufferCache).
 	uint32_t              queue_count    = 1;
 	vk::Queue             readback_queue = nullptr;
+	// The family readback_queue belongs to (queue_family, or a compute family: KYTY_READBACK_COMPUTE_QUEUE).
+	uint32_t              readback_queue_family = static_cast<uint32_t>(-1);
 	std::atomic<uint64_t> presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {

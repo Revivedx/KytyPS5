@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -471,6 +473,8 @@ uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	return result;
 }
 
+void EmitPixelHistory(ValueEmitContext& ctx, uint32_t data, uint32_t mrt);
+
 void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
@@ -502,6 +506,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (exp.kind == IR::ExportTargetKind::Position && exp.index != 0) {
 			EmitAuxPositionExport(ctx, data, exp);
 			return;
+		}
+		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt) {
+			EmitPixelHistory(ctx, data, exp.index);
 		}
 		if (exp.kind == IR::ExportTargetKind::MrtZ) {
 			if ((exp.en & 1u) != 0u && state.depth_variable != 0) {
@@ -539,6 +546,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                         : sint_output ? TypeI32Vector(state, 4)
 		                                       : TypeF32Vector(state, 4);
 		auto       value       = ExportVector(ctx, data, exp, uint_output || sint_output);
+		if (mrt && !uint_output && !sint_output && NanScrubShader(state.program.shader_hash)) {
+			value = EmitScrubNanF32x4(state, value);
+		}
 		if (sint_output) {
 			const auto signed_value = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpBitcast, vector_type, signed_value, value);
@@ -597,12 +607,47 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto distance_pointer = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal,
 				                          value, zero);
-				state.builder.AddFunction(spv::OpAll, TypeBool(state), invalid, equal);
+				const auto all_zero = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAll, TypeBool(state), all_zero, equal);
+				// Guest vertex shaders also kill vertices with a non-finite position (Wolverine
+				// hair strands export x = +Inf, w = 0); the PS5 clipper discards such primitives.
+				const auto inf = state.builder.AllocateId();
+				const auto nan = state.builder.AllocateId();
+				const auto any_inf = state.builder.AllocateId();
+				const auto any_nan = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpIsInf, TypeBoolVector(state, 4), inf, value);
+				state.builder.AddFunction(spv::OpIsNan, TypeBoolVector(state, 4), nan, value);
+				state.builder.AddFunction(spv::OpAny, TypeBool(state), any_inf, inf);
+				state.builder.AddFunction(spv::OpAny, TypeBool(state), any_nan, nan);
+				state.builder.AddFunction(
+				    spv::OpLogicalOr, TypeBool(state), invalid, all_zero,
+				    Binary(state, spv::OpLogicalOr, TypeBool(state), any_inf, any_nan));
+				// A finite stand-in keeps the clipper's interpolation defined (0 * Inf is NaN);
+				// the clip distance below still removes every primitive that uses the vertex.
+				const auto invalid_vector = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeBoolVector(state, 4),
+				                          invalid_vector, invalid, invalid, invalid, invalid);
+				const auto stand_in = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4),
+				                          stand_in, ConstantF32Value(state, 0.0f),
+				                          ConstantF32Value(state, 0.0f),
+				                          ConstantF32Value(state, 0.0f),
+				                          ConstantF32Value(state, 1.0f));
+				const auto guarded = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpSelect, TypeF32Vector(state, 4), guarded,
+				                          invalid_vector, stand_in, value);
+				value = guarded;
 				// Zero at valid vertices makes a primitive containing an invalid position
 				// collapse to its remaining edge, before the undefined 0/0 perspective divide.
+				// KYTY_LOCAL_HACK (research): KYTY_CLIP_ALL_HASH=<hex> clips every vertex of that shader.
+				static const uint64_t clip_all_hash = [] {
+					const char* value = std::getenv("KYTY_CLIP_ALL_HASH");
+					return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+				}();
+				const bool clip_all = clip_all_hash != 0 && clip_all_hash == state.program.shader_hash;
 				state.builder.AddFunction(spv::OpSelect, TypeF32(state), distance, invalid,
 				                          ConstantF32Value(state, -1.0f),
-				                          ConstantF32Value(state, 0.0f));
+				                          ConstantF32Value(state, clip_all ? -1.0f : 0.0f));
 				state.builder.AddFunction(
 				    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
 				    distance_pointer, state.clip_distance_variable,
@@ -624,6 +669,101 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, variable, value);
 		}
 	});
+}
+
+// A guest vertex shader lane that never exports its position has no vertex on hardware, and
+// the primitive using it is dropped. Vulkan leaves such an output undefined (RADV: zero, which
+// draws wedges to the screen center), so every invocation starts as a killed vertex that the
+// position export overwrites. Wolverine hair strands (VS b5c409dab00a0247) depend on this.
+bool PixelHistoryEnabled(int* x, int* y, int* w, int* h) {
+	static const auto target = [] {
+		std::array<int, 5> result {0, -1, -1, 1, 1};
+		if (const char* value = std::getenv("KYTY_PIXEL_HISTORY"); value != nullptr) {
+			char* end = nullptr;
+			result[1] = static_cast<int>(std::strtol(value, &end, 10));
+			result[2] = static_cast<int>(std::strtol(end + 1, &end, 10));
+			if (*end == ',') {
+				result[3] = static_cast<int>(std::strtol(end + 1, &end, 10));
+				result[4] = static_cast<int>(std::strtol(end + 1, &end, 10));
+			}
+			result[0] = 1;
+		}
+		return result;
+	}();
+	if (x != nullptr) *x = target[1];
+	if (y != nullptr) *y = target[2];
+	if (w != nullptr) *w = target[3];
+	if (h != nullptr) *h = target[4];
+	return target[0] != 0;
+}
+
+// KYTY_PIXEL_HISTORY=x,y[,w,h]: every pixel shader color export inside that rectangle records
+// hash (low dword), (mrt << 24 | dx << 12 | dy), the four raw exported dwords and FragCoord.z.
+void EmitPixelHistory(ValueEmitContext& ctx, uint32_t data, uint32_t mrt) {
+	auto& state = ctx.state;
+	int   x = 0, y = 0, w = 1, h = 1;
+	if (state.pixel_history_frag_coord == 0 || !PixelHistoryEnabled(&x, &y, &w, &h)) {
+		return;
+	}
+	const auto coord = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), coord,
+	                          state.pixel_history_frag_coord);
+	const auto component = [&](uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+		return value;
+	};
+	const auto offset = [&](uint32_t index, int origin) {
+		return Binary(state, spv::OpISub, TypeI32(state),
+		              Unary(state, spv::OpConvertFToS, TypeI32(state), component(index)),
+		              state.builder.Constant(spv::OpConstant, TypeI32(state),
+		                                     static_cast<uint32_t>(origin)));
+	};
+	const auto dx = Unary(state, spv::OpBitcast, TypeU32(state), offset(0, x));
+	const auto dy = Unary(state, spv::OpBitcast, TypeU32(state), offset(1, y));
+	// Unsigned compares also reject negative offsets.
+	const auto inside = Binary(
+	    state, spv::OpLogicalAnd, TypeBool(state),
+	    Binary(state, spv::OpULessThan, TypeBool(state), dx, ConstantU32(state, w)),
+	    Binary(state, spv::OpULessThan, TypeBool(state), dy, ConstantU32(state, h)));
+	EmitIfCondition(state, inside, [&]() {
+		const auto packed = Binary(
+		    state, spv::OpBitwiseOr, TypeU32(state), ConstantU32(state, mrt << 24u),
+		    Binary(state, spv::OpBitwiseOr, TypeU32(state),
+		           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), dx, ConstantU32(state, 12)),
+		           dy));
+		EmitDebugProbe(state, 0, ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)),
+		               packed, ExportRawComponent(ctx, data, 0), ExportRawComponent(ctx, data, 1),
+		               ExportRawComponent(ctx, data, 2), ExportRawComponent(ctx, data, 3),
+		               Unary(state, spv::OpBitcast, TypeU32(state), component(2)));
+	});
+}
+
+void EmitDefaultKilledPosition(EmitterState& state) {
+	if (state.program.stage != ShaderType::Vertex ||
+	    state.invalid_position_clip_distance == UINT32_MAX) {
+		return;
+	}
+	const auto variable =
+	    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Position, .index = 0});
+	if (variable == 0) {
+		return;
+	}
+	const auto stand_in = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), stand_in,
+	                          ConstantF32Value(state, 0.0f), ConstantF32Value(state, 0.0f),
+	                          ConstantF32Value(state, 0.0f), ConstantF32Value(state, 1.0f));
+	const auto position = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassOutput, TypeF32Vector(state, 4)),
+	                          position, variable, ConstantU32(state, 0));
+	state.builder.AddFunction(spv::OpStore, position, stand_in);
+	const auto distance = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)), distance,
+	                          state.clip_distance_variable,
+	                          ConstantU32(state, state.invalid_position_clip_distance));
+	state.builder.AddFunction(spv::OpStore, distance, ConstantF32Value(state, -1.0f));
 }
 
 uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
@@ -658,6 +798,30 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto index  = inst.Arg(0).U32();
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
+	}
+	const auto push_dword = [&](uint32_t dword) {
+		const auto element = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          element, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword));
+		return Unary(state, spv::OpLoad, TypeU32(state), element);
+	};
+	if (MeshDrawDataIndirect(state)) {
+		// The parameters were written on the GPU from the guest's indirect arguments.
+		const auto u64     = TypeScalarU64(state);
+		const auto base    = Binary(
+            state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, push_dword(0)),
+            Binary(state, spv::OpShiftLeftLogical, u64,
+		           Unary(state, spv::OpUConvert, u64, push_dword(1)),
+		           state.builder.Constant(spv::OpConstant, u64, 32u, 0u)));
+		const auto address = Binary(state, spv::OpIAdd, u64, base,
+		                            state.builder.Constant(spv::OpConstant, u64, index * 4u, 0u));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		return result;
 	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
@@ -928,27 +1092,27 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	return ctx.Def(IR::Value(uint64_t {0}));
 }
 
+namespace {
+std::atomic<uint32_t> g_shader_clock_divisor {8};
+std::atomic<uint64_t> g_shader_clock_offset {0};
+} // namespace
+
 uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx) {
-	auto&      state = ctx.state;
-	const auto clock = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpReadClockKHR, TypeU32Vector(state, 2), clock,
+	auto&      state   = ctx.state;
+	const auto divisor = g_shader_clock_divisor.load(std::memory_order_relaxed);
+	const auto clock   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpReadClockKHR, TypeScalarU64(state), clock,
 	                          ConstantU32(state, spv::ScopeDevice));
-	const auto low  = state.builder.AllocateId();
-	const auto high = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, clock, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, clock, 1);
-	constexpr uint32_t ClockShift = 3;
-	const auto low_shifted = Binary(state, spv::OpShiftRightLogical, TypeU32(state), low,
-	                                ConstantU32(state, ClockShift));
-	const auto high_carried = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), high,
-	                                 ConstantU32(state, 32u - ClockShift));
-	const auto low_result =
-	    Binary(state, spv::OpBitwiseOr, TypeU32(state), low_shifted, high_carried);
-	const auto high_result = Binary(state, spv::OpShiftRightLogical, TypeU32(state), high,
-	                                ConstantU32(state, ClockShift));
+	// Rescale the device clock to the 100 MHz clock S_MEMREALTIME reads on the console.
+	const auto scaled = divisor <= 1u ? clock
+	                                  : Binary(state, spv::OpUDiv, TypeScalarU64(state), clock,
+	                                           ConstantDeviceAddress(state, divisor));
+	const auto offset = g_shader_clock_offset.load(std::memory_order_relaxed);
+	const auto shifted = offset == 0u ? scaled
+	                                  : Binary(state, spv::OpIAdd, TypeScalarU64(state), scaled,
+	                                           ConstantDeviceAddress(state, offset));
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result, low_result,
-	                          high_result);
+	state.builder.AddFunction(spv::OpBitcast, TypeU64(state), result, shifted);
 	return result;
 }
 
@@ -956,4 +1120,95 @@ void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Fail(inst, "must be lowered before SPIR-V emission");
 }
 
+// KYTY_LOCAL_HACK (debug probe): device address of the host-visible probe buffer, or 0.
+// Layout: word 0 counts records; record r (8 words: sequence, 7 values) sits at byte
+// 32 + 32 * (r % DebugProbeMaxRecords).
+std::atomic<uint64_t> g_debug_probe_address {0};
+constexpr uint32_t    DebugProbeMaxRecords = 65536;
+
+void EmitDebugProbe(EmitterState& state, uint32_t pc, uint32_t v0, uint32_t v1, uint32_t v2,
+                    uint32_t v3, uint32_t v4, uint32_t v5, uint32_t v6) {
+	const auto base = g_debug_probe_address.load(std::memory_order_relaxed);
+	if (base == 0) {
+		return;
+	}
+	const auto pointer_at = [&](uint32_t address) {
+		return Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+	};
+	// KYTY_PROBE_FILTER=clip: only finite positions (v0..v3 = x, y, z, w) far outside the
+	// view volume (w <= 0.001, |x| or |y| > 8 |w|) are recorded.
+	static const bool clip_filter = [] {
+		const char* filter = std::getenv("KYTY_PROBE_FILTER");
+		return filter != nullptr && std::strcmp(filter, "clip") == 0;
+	}();
+	uint32_t condition = ConstantBool(state, true);
+	if (clip_filter) {
+		const auto f = [&](uint32_t value) { return Unary(state, spv::OpBitcast, TypeF32(state), value); };
+		const auto x = f(v0), y = f(v1), z = f(v2), w = f(v3);
+		const auto finite = [&](uint32_t value) {
+			return Binary(state, spv::OpLogicalAnd, TypeBool(state),
+			              Unary(state, spv::OpLogicalNot, TypeBool(state),
+			                    Unary(state, spv::OpIsInf, TypeBool(state), value)),
+			              Unary(state, spv::OpLogicalNot, TypeBool(state),
+			                    Unary(state, spv::OpIsNan, TypeBool(state), value)));
+		};
+		const auto all_finite =
+		    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+		           Binary(state, spv::OpLogicalAnd, TypeBool(state), finite(x), finite(y)),
+		           Binary(state, spv::OpLogicalAnd, TypeBool(state), finite(z), finite(w)));
+		const auto abs = [&](uint32_t value) { return EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(state, value); };
+		const auto limit = Binary(state, spv::OpFMul, TypeF32(state), abs(w),
+		                          ConstantF32Value(state, 8.0f));
+		const auto outside = Binary(
+		    state, spv::OpLogicalOr, TypeBool(state),
+		    Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), w,
+		           ConstantF32Value(state, 0.001f)),
+		    Binary(state, spv::OpLogicalOr, TypeBool(state),
+		           Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), abs(x), limit),
+		           Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), abs(y), limit)));
+		condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), all_finite, outside);
+	}
+	EmitIfCondition(state, condition, [&]() {
+	const auto counter = pointer_at(ConstantDeviceAddress(state, base));
+	const auto record  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), record, counter,
+	                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+	                          ConstantU32(state, 1));
+	// A ring: the newest records overwrite the oldest; word 0 of a record is its sequence.
+	const auto slot = Binary(state, spv::OpBitwiseAnd, TypeU32(state), record,
+	                         ConstantU32(state, DebugProbeMaxRecords - 1));
+	{
+		const auto offset = Binary(
+		    state, spv::OpIAdd, TypeScalarU64(state), ConstantDeviceAddress(state, base + 32),
+		    Unary(state, spv::OpUConvert, TypeScalarU64(state),
+		          Binary(state, spv::OpShiftLeftLogical, TypeU32(state), slot,
+		                 ConstantU32(state, 5))));
+		(void)pc;
+		const uint32_t values[8] {record, v0, v1, v2, v3, v4, v5, v6};
+		for (uint32_t word = 0; word < 8; word++) {
+			const auto address = Binary(state, spv::OpIAdd, TypeScalarU64(state), offset,
+			                            ConstantDeviceAddress(state, word * 4u));
+			state.builder.AddFunction(spv::OpStore, pointer_at(address), values[word],
+			                          spv::MemoryAccessAlignedMask, 4u);
+		}
+	}
+	});
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+void SetDebugProbeAddress(uint64_t address) {
+	Emitter::g_debug_probe_address.store(address, std::memory_order_relaxed);
+}
+
+void SetShaderClockDivisor(uint32_t divisor) {
+	Emitter::g_shader_clock_divisor.store(std::max(divisor, 1u), std::memory_order_relaxed);
+}
+
+void SetShaderClockOffset(uint64_t offset) {
+	Emitter::g_shader_clock_offset.store(offset, std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

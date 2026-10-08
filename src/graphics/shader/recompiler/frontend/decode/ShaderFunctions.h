@@ -40,7 +40,7 @@ public:
 
 	bool Expand(std::span<const uint32_t> code, uint64_t base, std::span<const uint32_t> user_data,
 	            const ShaderCodeReader& read, std::vector<uint32_t>& expanded, std::string& reason,
-	            uint32_t wave_size);
+	            uint32_t wave_size, uint64_t code_hash = 0);
 
 private:
 	struct Impl;

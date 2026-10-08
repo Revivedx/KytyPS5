@@ -171,8 +171,14 @@ bool DispatchDimensionsIndirect(const EmitterState& state) {
 	       state.program.bindings.has_dispatch_dimensions;
 }
 
+bool MeshDrawDataIndirect(const EmitterState& state) {
+	return state.program.stage == ShaderType::Mesh && state.input_info.vertex != nullptr &&
+	       state.input_info.vertex->mesh.draw_data_indirect;
+}
+
 bool UsesPhysicalAddresses(const EmitterState& state) {
-	return state.program.info.uses_dma || DispatchDimensionsIndirect(state);
+	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
+	       MeshDrawDataIndirect(state);
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
@@ -614,6 +620,19 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
+	if (state.program.stage == ShaderType::Pixel && PixelHistoryEnabled()) {
+		const auto existing = std::ranges::find_if(state.inputs, [](const InputBinding& input) {
+			return input.kind == IR::StageInputKind::FragCoord;
+		});
+		if (existing != state.inputs.end()) {
+			state.pixel_history_frag_coord = existing->variable_id;
+		} else {
+			state.pixel_history_frag_coord = DefineInterfaceVariable(
+			    state, TypeF32Vector(state, 4), spv::StorageClassInput, "gl_FragCoord_history");
+			state.builder.AddAnnotation(spv::OpDecorate, state.pixel_history_frag_coord,
+			                            spv::DecorationBuiltIn, spv::BuiltInFragCoord);
+		}
+	}
 	if (state.requirements.subgroup_local_invocation_id) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
@@ -790,6 +809,7 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.requirements.shader_clock) {
 		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
+		state.builder.RequireCapability(spv::CapabilityInt64); // The clock is read as one uint64.
 		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
 	if (state.clip_distance_variable != 0) {

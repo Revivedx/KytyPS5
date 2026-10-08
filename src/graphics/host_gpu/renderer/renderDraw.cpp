@@ -33,8 +33,13 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <string>
+#include <set>
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cinttypes>
+#include <type_traits>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -410,8 +415,23 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	if (!known || cached.depth_write_enable != depth.depth_write_enable) {
 		vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
 	}
-	if (!known || cached.depth_compare_op != depth.depth_compare_op) {
-		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	// KYTY_LOCAL_HACK (research): KYTY_EQUAL_RELAX=1 turns depth EQUAL into GREATER_OR_EQUAL
+	// (reverse Z), to test whether material passes lose pixels to inexact prepass depth.
+	static const bool equal_relax = [] {
+		const char* value = std::getenv("KYTY_EQUAL_RELAX");
+		return value != nullptr && value[0] == '1';
+	}();
+	static const bool equal_always = [] {
+		const char* value = std::getenv("KYTY_EQUAL_RELAX");
+		return value != nullptr && value[0] == '2';
+	}();
+	const auto compare_op = (equal_relax || equal_always) &&
+	                                depth.depth_compare_op == vk::CompareOp::eEqual
+	                            ? (equal_always ? vk::CompareOp::eAlways
+	                                            : vk::CompareOp::eGreaterOrEqual)
+	                            : depth.depth_compare_op;
+	if (!known || cached.depth_compare_op != compare_op) {
+		vk_buffer.setDepthCompareOp(compare_op);
 	}
 
 	const auto& mode              = ctx.GetModeControl();
@@ -432,6 +452,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 		depth_bias = {constant_factor, poly_offset.clamp, slope_factor};
+		{
+			// KYTY_LOCAL_HACK: report each distinct depth-bias setup once.
+			static std::mutex                    bias_log_mutex;
+			static std::vector<std::array<float, 6>> bias_seen;
+			const std::array<float, 6> key {guest_constant_factor, slope_factor, poly_offset.clamp,
+			                                static_cast<float>(poly_offset.neg_num_db_bits),
+			                                poly_offset.db_is_float_fmt ? 1.0f : 0.0f,
+			                                static_cast<float>(depth.desc.view_info.format)};
+			std::lock_guard bias_lock(bias_log_mutex);
+			if (bias_seen.size() < 64 &&
+			    std::find(bias_seen.begin(), bias_seen.end(), key) == bias_seen.end()) {
+				bias_seen.push_back(key);
+				printf("DEPTHBIAS: host=%s float_fmt=%d neg_bits=%d offset=%g -> %g slope=%g clamp=%g "
+				       "front=%d back=%d\n",
+				       vk::to_string(depth.desc.view_info.format).c_str(),
+				       poly_offset.db_is_float_fmt ? 1 : 0, poly_offset.neg_num_db_bits,
+				       guest_constant_factor, constant_factor, slope_factor, poly_offset.clamp,
+				       use_front ? 1 : 0, use_back ? 1 : 0);
+			}
+		}
 		// The bias values only matter while biasing is enabled, so they are compared then only.
 		if (!known || !cached.depth_bias_enable || cached.depth_bias != depth_bias) {
 			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
@@ -470,7 +510,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 		cached.blend_constants    = blend_constants;
 		cached.depth_test_enable  = depth.depth_test_enable;
 		cached.depth_write_enable = depth.depth_write_enable;
-		cached.depth_compare_op   = depth.depth_compare_op;
+		cached.depth_compare_op   = compare_op;
 		// Keep the last bias values recorded: they still hold while biasing is off.
 		if (depth_bias_enable) {
 			cached.depth_bias = depth_bias;
@@ -518,6 +558,9 @@ struct DrawRenderState {
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
+	// Set before PrepareDrawRenderState: an indirect draw, whose mesh program (if any) reads its
+	// parameters on the GPU (ShaderMeshInputInfo::draw_data_indirect).
+	bool                  mesh_draw_indirect = false;
 };
 
 struct DrawCallInfo {
@@ -695,6 +738,11 @@ struct DrawEmitInfo {
 	uint32_t first_instance = 0;
 	// Research: guest address of indirect arguments the GPU reads itself (0: CPU counts).
 	uint64_t indirect_args = 0;
+	// An indirect mesh draw converted on the GPU (MeshIndirectDraw): workgroup counts for
+	// drawMeshTasksIndirectEXT and the device address of the six draw parameters.
+	vk::Buffer        mesh_groups_buffer = nullptr;
+	vk::DeviceSize    mesh_groups_offset = 0;
+	vk::DeviceAddress mesh_draw_data     = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -959,7 +1007,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+	    state.mesh_draw_indirect);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -971,7 +1020,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	const bool phases      = DrawRecordCensus::PhasesOn();
+	uint64_t   phase_start = phases ? DrawRecordCensus::NowNs() : 0;
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (phases) DrawRecordCensus::Phase(0, phase_start);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
 		return false;
 	}
@@ -1000,6 +1052,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	if (phases) DrawRecordCensus::Phase(1, phase_start);
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1117,6 +1170,155 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, const CommandRecorder
 	}
 }
 
+
+// KYTY_LOCAL_HACK research, KYTY_DRAW_RECORDS=2 (live, default 0): verify-only draw records. A
+// draw's key is its compiled programs, their user data, its render targets and pipeline; on the
+// key's second sighting the prepared result (per part) is stored, and every later sighting
+// compares what the normal path prepared with it. No draw changes: this measures how often a
+// replayed record would be right, and whether its differences are data (shader data, flattened
+// SRT: patchable) or structure (buffers, images, samplers, bindless: the record would be stale).
+namespace {
+struct DrawRecordVerify {
+	// buffers (vk handles + ranges), images, samplers, shader data, flattened SRT, bindless,
+	// buffer offsets + guest addresses.
+	static constexpr int Parts = 7;
+	struct Record {
+		std::array<uint64_t, Parts> sig {};
+		uint32_t                    sightings = 0;
+	};
+	struct Stats {
+		uint64_t first = 0, stored = 0, same = 0, data_only = 0, structural = 0;
+		std::array<uint64_t, Parts> differ {};
+	};
+	// [0] K1: programs, masked user data (record_key), pipeline, targets.
+	// [1] K3: programs, user data minus pointer-looking pairs (record_key_reloc), pipeline, targets.
+	std::array<std::unordered_map<uint64_t, Record>, 2> records;
+	std::array<Stats, 2>                                stats;
+	std::unordered_map<uint64_t, uint32_t>              occurrences; // K2 base -> uses this frame
+	uint64_t                                            frame = 0;
+	uint64_t                                            draws = 0;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+DrawRecordVerify g_draw_record_verify;
+
+struct Fnv {
+	uint64_t h = 0xcbf29ce484222325ull;
+	void     Add(const void* data, size_t bytes) {
+        const auto* p = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < bytes; i++) {
+            h = (h ^ p[i]) * 0x100000001b3ull;
+        }
+	}
+	template <typename T>
+	void Value(const T& value) {
+		static_assert(std::is_trivially_copyable_v<T>);
+		Add(&value, sizeof(value));
+	}
+	template <typename T>
+	void Range(const std::vector<T>& values) {
+		Value(values.size());
+		if (!values.empty()) {
+			Add(values.data(), values.size() * sizeof(T));
+		}
+	}
+};
+
+int DrawRecordsMode() {
+	static auto& mode = Common::LiveSwitches::Get("KYTY_DRAW_RECORDS", 0);
+	return static_cast<int>(mode.load(std::memory_order_relaxed));
+}
+
+void VerifyDrawRecord(std::span<PreparedBindings* const> stages, const void* pipeline,
+                      const RenderColorInfo* colors, uint32_t color_count,
+                      const RenderDepthInfo& depth, uint64_t frame) {
+	auto& v = g_draw_record_verify;
+	v.draws++;
+	if (frame != v.frame) {
+		v.frame = frame;
+		v.occurrences.clear();
+	}
+	Fnv base;
+	base.Value(pipeline);
+	for (uint32_t i = 0; i < color_count; i++) {
+		base.Value(colors[i].image_id);
+	}
+	base.Value(depth.image_id);
+	std::array<Fnv, DrawRecordVerify::Parts> sig;
+	Fnv k1 = base;
+	Fnv k3 = base;
+	for (const auto* stage: stages) {
+		const auto& runtime = *stage->runtime;
+		base.Value(runtime.program);
+		k1.Value(runtime.program);
+		k1.Value(runtime.resources->record_key);
+		k3.Value(runtime.program);
+		k3.Value(runtime.resources->record_key_reloc);
+		for (const auto& b: stage->buffers) {
+			sig[0].Value(b.buffer);
+			sig[0].Value(b.range);
+			sig[6].Value(b.offset);
+		}
+		for (const auto& src: stage->buffer_sources) {
+			sig[6].Value(src.address);
+			sig[0].Value(src.size);
+		}
+		for (const auto& image: stage->images) {
+			sig[1].Value(image.image_id);
+			sig[1].Value(image.image_view);
+			sig[1].Value(image.layout);
+			sig[1].Range(image.mip_views);
+		}
+		sig[2].Range(stage->samplers);
+		sig[3].Range(stage->shader_data);
+		sig[4].Range(runtime.resources->flattened_srt);
+		sig[5].Range(stage->bindless_patches);
+		sig[5].Range(stage->bindless_heaps);
+	}
+	const std::array<uint64_t, 2> keys {k1.h, k3.h};
+	for (int k = 0; k < 2; k++) {
+		auto& st     = v.stats[k];
+		auto& record = v.records[k][keys[k]];
+		record.sightings++;
+		if (record.sightings == 1) {
+			st.first++;
+		} else if (record.sightings == 2) {
+			st.stored++;
+		} else {
+			bool data = false, structure = false;
+			for (int part = 0; part < DrawRecordVerify::Parts; part++) {
+				if (record.sig[part] != sig[part].h) {
+					st.differ[part]++;
+					(part == 3 || part == 4 || part == 6 ? data : structure) = true;
+				}
+			}
+			(structure ? st.structural : data ? st.data_only : st.same)++;
+		}
+		for (int part = 0; part < DrawRecordVerify::Parts; part++) {
+			record.sig[part] = sig[part].h; // a re-store keeps the latest result
+		}
+		if (v.records[k].size() > 400000) {
+			v.records[k].clear();
+		}
+	}
+	if (const auto now = std::chrono::steady_clock::now(); now - v.last >= std::chrono::seconds(5)) {
+		for (int k = 0; k < 2; k++) {
+			const auto& st = v.stats[k];
+			std::printf("Draw records verify %s (5 s): %" PRIu64 " draws, %" PRIu64 " first, %" PRIu64
+			            " stored, replays: %" PRIu64 " identical, %" PRIu64 " data-only, %" PRIu64
+			            " structural; differ: buffers %" PRIu64 " images %" PRIu64 " samplers %" PRIu64
+			            " shader-data %" PRIu64 " flattened %" PRIu64 " bindless %" PRIu64
+			            " buffer-offsets %" PRIu64 "; %zu keys\n",
+			            k == 0 ? "K1 masked-ud" : "K5 structural", v.draws, st.first, st.stored, st.same,
+			            st.data_only, st.structural, st.differ[0], st.differ[1], st.differ[2],
+			            st.differ[3], st.differ[4], st.differ[5], st.differ[6], v.records[k].size());
+		}
+		v.stats = {};
+		v.draws = 0;
+		v.last  = now;
+	}
+}
+} // namespace
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1129,6 +1331,60 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (emit.indirect_args == 0 || (!mesh && !quad)) {
 		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, emit, index_source,
 		                            primitive_restart_enable);
+		return;
+	}
+	const auto& mesh_info = state.vertex_info[0].mesh;
+	{
+		// KYTY_LOCAL_HACK (research): KYTY_DRAW_STATS=1 (live) counts the indirect draws whose
+		// arguments are read here, by kind, every 5 s.
+		static auto& draw_stats = Common::LiveSwitches::Get("KYTY_DRAW_STATS", 0);
+		if (draw_stats.load(std::memory_order_relaxed) != 0) {
+			static std::array<uint64_t, 5> counts {};
+			static auto                    report = std::chrono::steady_clock::now();
+			counts[!mesh ? 0 : quad ? 1 : mesh_info.draw_data_indirect ? 3 : mesh_info.fast_launch ? 2 : 4]++;
+			if (const auto now = std::chrono::steady_clock::now(); now - report > std::chrono::seconds(5)) {
+				std::printf("Indirect draws (5 s): quad %llu, mesh quad %llu, mesh fast-launch CPU %llu, "
+				            "mesh GPU %llu, mesh CPU %llu (indexed last %d)\n",
+				            (unsigned long long)counts[0], (unsigned long long)counts[1],
+				            (unsigned long long)counts[2], (unsigned long long)counts[3],
+				            (unsigned long long)counts[4], draw.IsIndexed() ? 1 : 0);
+				counts = {};
+				report = now;
+			}
+		}
+	}
+	if (mesh && !quad && mesh_info.draw_data_indirect) {
+		// The arguments stay on the GPU: a pass converts them into the workgroup counts and
+		// the mesh program's draw parameters (MeshIndirectDraw). It is a dispatch, so it runs
+		// outside the render pass, before the draw's bindings.
+		if (m_mesh_indirect == nullptr) {
+			m_mesh_indirect = std::make_unique<MeshIndirectDraw>(
+			    m_context.GetGraphics(), m_context.GetCommandScheduler());
+		}
+		buffer.EndRendering();
+		const auto args_size = draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                        : sizeof(vk::DrawIndirectCommand);
+		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    emit.indirect_args, args_size, false, false, {}, true);
+		EXIT_IF(args_buffer == nullptr || !args_buffer->HasDeviceAddress());
+		const auto converted = m_mesh_indirect->Convert(
+		    buffer.Recorder(),
+		    {.args                 = args_buffer->BufferDeviceAddress() + args_offset,
+		     .index_address        = index_source.address,
+		     .indexed              = draw.IsIndexed(),
+		     .max_index_count      = draw.index_count,
+		     .element_size         = index_source.guest_element_size,
+		     .primitive_size       = mesh_info.InputPrimitiveSize(),
+		     .primitive_step       = mesh_info.InputPrimitiveStep(),
+		     .primitives_per_group = mesh_info.primitives_per_group,
+		     .fast_launch          = mesh_info.fast_launch});
+		auto gpu_emit               = emit;
+		gpu_emit.indirect_args      = 0; // consumed by the conversion
+		gpu_emit.mesh_groups_buffer = converted.groups_buffer;
+		gpu_emit.mesh_groups_offset = converted.groups_offset;
+		gpu_emit.mesh_draw_data     = converted.draw_data;
+		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, gpu_emit,
+		                            index_source, primitive_restart_enable);
 		return;
 	}
 	// Research: mesh and legacy quad draws expand their counts on the host, so their
@@ -1179,6 +1435,9 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	uint32_t   mesh_groups = 0;
+	uint32_t   mesh_slices = 1;
+	uint32_t   mesh_fast_total = 0;
+	std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawDwordCount> mesh_draw_data {};
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
@@ -1193,17 +1452,31 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
 		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
+		if (emit.mesh_draw_data == 0 && (primitives == 0 || draw.instance_count == 0)) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		// GPU-converted indirect draws: the counts are computed and bounded on the GPU.
+		mesh_groups        = emit.mesh_draw_data != 0 ? 1u
+		                                              : (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+		// Non-fast-launch shaders read WorkgroupId.x + WorkgroupId.z * MeshGroupSplitStride, and
+		// groups past the draw's end emit no vertices.
+		if (mesh_groups > limits.maxMeshWorkGroupCount[0] && !mesh.fast_launch) {
+			mesh_slices = (mesh_groups - 1u) / MeshGroupSplitStride + 1u;
+			mesh_groups = MeshGroupSplitStride;
+		} else if (mesh_groups > limits.maxMeshWorkGroupCount[0]) {
+			// Fast launch derives the base vertex from draw(1) + WorkgroupId.x, so issue several
+			// draws and advance draw(1) by each one's first group.
+			mesh_fast_total = mesh_groups;
+			mesh_groups     = MeshGroupSplitStride;
+		}
 		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+		    mesh_slices > limits.maxMeshWorkGroupCount[2] ||
+		    static_cast<uint64_t>(mesh_groups) * draw.instance_count * mesh_slices >
 		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+			EXIT("mesh draw exceeds host workgroup limits: %ux%ux%u\n", mesh_groups,
+			     draw.instance_count, mesh_slices);
 		}
 	}
 
@@ -1215,6 +1488,8 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	const bool phases       = DrawRecordCensus::PhasesOn();
+	uint64_t   phase_start  = phases ? DrawRecordCensus::NowNs() : 0;
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1228,7 +1503,9 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	if (phases) DrawRecordCensus::Phase(2, phase_start);
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	if (phases) DrawRecordCensus::Phase(3, phase_start);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1269,6 +1546,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs, may_defer);
+	if (phases) DrawRecordCensus::Phase(4, phase_start);
 	if (deferred_pipeline == nullptr) {
 		return;
 	}
@@ -1277,6 +1555,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	if (phases) DrawRecordCensus::Phase(5, phase_start);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1310,23 +1589,86 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u, ps_hash);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (mesh_active) {
-		const uint32_t draw_data[] {
+	if (phases) DrawRecordCensus::Phase(6, phase_start);
+	if (DrawRecordsMode() == 2) {
+		VerifyDrawRecord(stages, &pipeline, state.color_info, state.color_count, state.depth_info,
+		                 m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed));
+	}
+	if (mesh_active && emit.mesh_draw_data != 0) {
+		// The mesh program reads its parameters through this address (draw_data_indirect).
+		mesh_draw_data = {static_cast<uint32_t>(emit.mesh_draw_data),
+		                  static_cast<uint32_t>(emit.mesh_draw_data >> 32u), 0u, 0u, 0u, 0u};
+		vk_buffer.pushConstants(pipeline.pipeline_layout,
+		                        vk::ShaderStageFlagBits::eMeshEXT |
+		                            vk::ShaderStageFlagBits::eFragment,
+		                        0, sizeof(mesh_draw_data), mesh_draw_data.data());
+	} else if (mesh_active) {
+		mesh_draw_data = {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
 		    emit.first_instance, index_source.guest_element_size,
 		    static_cast<uint32_t>(index_source.address),
 		    static_cast<uint32_t>(index_source.address >> 32u)};
-		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		static_assert(std::tuple_size_v<decltype(mesh_draw_data)> == 6);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
+		                        0, sizeof(mesh_draw_data), mesh_draw_data.data());
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	// KYTY_LOCAL_HACK (research): KYTY_ZPS=<hex[,hex]> logs the depth state of draws with those
+	// pixel shaders once; KYTY_ZPS_MODE=always|nowrite|off changes it for them.
+	auto depth_info = state.depth_info;
+	{
+		static const auto listed = [] {
+			std::vector<uint64_t> result;
+			const char* value = std::getenv("KYTY_ZPS");
+			while (value != nullptr && *value != 0) {
+				char* end = nullptr;
+				result.push_back(std::strtoull(value, &end, 16));
+				value = *end == ',' ? end + 1 : nullptr;
+			}
+			return result;
+		}();
+		static const std::string mode = [] {
+			const char* value = std::getenv("KYTY_ZPS_MODE");
+			return std::string(value != nullptr ? value : "");
+		}();
+		const uint64_t ps_hash = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                             ? state.ps_input_info.stage.program->shader_hash
+		                             : 0;
+		if (ps_hash != 0 && std::ranges::find(listed, ps_hash) != listed.end()) {
+			static std::mutex                   mutex;
+			static std::set<std::string>        seen;
+			const auto line = fmt::format(
+			    "ZPS {:016x}: test={} op={} write={} vs={:016x} stencil={} front(op={} ref={} "
+			    "cmp={:x} wr={:x}) bounds={} [{} {}] early_z={} kill={} zexport={}",
+			    ps_hash, depth_info.depth_test_enable, vk::to_string(depth_info.depth_compare_op),
+			    depth_info.depth_write_enable, vertex_stages.back().stage.program->shader_hash,
+			    depth_info.stencil_test_enable, vk::to_string(depth_info.stencil_front.compareOp),
+			    depth_info.stencil_front.reference, depth_info.stencil_front.compareMask,
+			    depth_info.stencil_front.writeMask, depth_info.depth_bounds_test_enable,
+			    depth_info.depth_min_bounds, depth_info.depth_max_bounds,
+			    state.ps_input_info.ps_early_z, state.ps_input_info.ps_pixel_kill_enable,
+			    state.ps_input_info.ps_depth_export_enable);
+			{
+				std::lock_guard lock(mutex);
+				if (seen.insert(line).second) {
+					std::printf("%s\n", line.c_str());
+				}
+			}
+			if (mode == "always") {
+				depth_info.depth_compare_op = vk::CompareOp::eAlways;
+			} else if (mode == "off") {
+				depth_info.depth_test_enable = false;
+			} else if (mode == "nostencil") {
+				depth_info.stencil_test_enable = false;
+			}
+		}
+	}
+	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), depth_info, rendering);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
@@ -1346,14 +1688,33 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u, ps_hash);
 	}
-	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+	if (mesh_active && emit.mesh_draw_data != 0) {
+		vk_buffer.drawMeshTasksIndirectEXT(emit.mesh_groups_buffer, emit.mesh_groups_offset, 1,
+		                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+	} else if (mesh_active) {
+		if (mesh_fast_total == 0) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, mesh_slices);
+		} else {
+			const auto first_vertex = mesh_draw_data[1];
+			for (uint32_t first = 0; first < mesh_fast_total; first += MeshGroupSplitStride) {
+				mesh_draw_data[1] = first_vertex + first;
+				vk_buffer.pushConstants(pipeline.pipeline_layout,
+				                        vk::ShaderStageFlagBits::eMeshEXT |
+				                            vk::ShaderStageFlagBits::eFragment,
+				                        0, sizeof(mesh_draw_data), mesh_draw_data.data());
+				vk_buffer.drawMeshTasksEXT(std::min(MeshGroupSplitStride, mesh_fast_total - first),
+				                           draw.instance_count, 1);
+			}
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit,
 		                   indirect_buffer != nullptr ? indirect_buffer->Handle() : nullptr,
 		                   indirect_offset);
 	}
 
+	m_context.GetCommandScheduler().ProfileMark(
+	    mesh_active ? (emit.mesh_draw_data != 0 ? 4u : 3u) : 2u,
+	    vertex_stages[0].stage.program->shader_hash, ps_hash);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u, ps_hash);
 	}
@@ -1379,6 +1740,13 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	// KYTY_LOCAL_HACK research: draw-record census (KYTY_MEMO_CLASSIFY=1).
+	DrawRecordCensus::g_flags = 0;
+	struct CensusEnd {
+		bool     compute;
+		uint64_t start;
+		~CensusEnd() { DrawRecordCensus::Record(compute, start); }
+	} census_end {false, DrawRecordCensus::NowNs()};
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1465,6 +1833,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
+	state.mesh_draw_indirect = args.gpu_args != 0;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -1491,6 +1860,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	// KYTY_LOCAL_HACK research: draw-record census (KYTY_MEMO_CLASSIFY=1).
+	DrawRecordCensus::g_flags = 0;
+	struct CensusEnd {
+		uint64_t start;
+		~CensusEnd() { DrawRecordCensus::Record(false, start); }
+	} census_end {DrawRecordCensus::NowNs()};
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1543,6 +1918,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	DrawRenderState state {};
+	state.mesh_draw_indirect = args.gpu_args != 0;
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;

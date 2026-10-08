@@ -8,9 +8,14 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -75,6 +80,30 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 	m_graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create fault-buffer pipeline");
 	SetVulkanObjectNameF(m_graphics.device, m_fault_process_pipeline, "Fault Buffer Parser");
+
+	// KYTY_LOCAL_HACK (debug probe): KYTY_PROBE_HASH enables the DebugProbe records (see
+	// Translate.cpp); the whole buffer is written to KYTY_PROBE_OUT (default probe.bin) every 2 s.
+	if (std::getenv("KYTY_PROBE_HASH") != nullptr) {
+		constexpr uint64_t size = 32 + 32ull * 65536;
+		m_probe_buffer          = std::make_unique<Buffer>(
+            graphics, scheduler, MemoryUsage::Download, 0,
+            AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
+		ShaderRecompiler::Spirv::SetDebugProbeAddress(m_probe_buffer->BufferDeviceAddress());
+		const char* out  = std::getenv("KYTY_PROBE_OUT");
+		std::string path = out != nullptr ? out : "probe.bin";
+		std::thread([buffer = m_probe_buffer.get(), path] {
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::seconds(2));
+				buffer->Invalidate(0, buffer->Size());
+				if (auto* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+					std::fwrite(buffer->Mapped().data(), 1, buffer->Size(), file);
+					std::fclose(file);
+				}
+			}
+		}).detach();
+		std::printf("Debug probe: buffer at 0x%016" PRIx64 ", dumping to %s\n",
+		            static_cast<uint64_t>(m_probe_buffer->BufferDeviceAddress()), path.c_str());
+	}
 }
 
 FaultManager::~FaultManager() {

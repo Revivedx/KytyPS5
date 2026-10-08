@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "common/liveSwitches.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -11,6 +12,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -252,6 +254,56 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
+	// KYTY_LOCAL_HACK research: KYTY_BC3D_ZERO=1 (live) uploads zeros into block-compressed volumes
+	// (are the rainbow sparkles their detiled data?). Logs each such upload's layout once.
+	if (info.IsBlock() && info.IsVolume()) {
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1) < 24) {
+			std::printf("BC3D upload: %s %ux%ux%u mips %u tile %u pitch %u size 0x%" PRIx64 " guest 0x%" PRIx64 "\n",
+			            vk::to_string(info.pixel_format).c_str(), info.extent.width, info.extent.height,
+			            info.extent.depth, info.resources.levels, static_cast<uint32_t>(info.tile_mode),
+			            info.pitch, info.data.size, info.data.address);
+		}
+		// KYTY_BC3D_DUMP=<dir>: the guest bytes of the first 4 BC4 volumes, for offline detiling.
+		if (static const char* dump_dir = std::getenv("KYTY_BC3D_DUMP");
+		    dump_dir != nullptr && info.pixel_format == vk::Format::eBc4UnormBlock) {
+			static std::atomic<uint32_t> dumped = 0;
+			if (dumped.fetch_add(1) < 4) {
+				std::vector<uint8_t> bytes(info.data.size);
+				if (Libs::LibKernel::Memory::TryReadBacking(info.data.address, bytes.data(), bytes.size())) {
+					const auto path = fmt::format("{}/bc4_{}x{}x{}_m{}_{:x}.bin", dump_dir, info.extent.width,
+					                              info.extent.height, info.extent.depth,
+					                              info.resources.levels, info.data.address);
+					if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+						std::fwrite(bytes.data(), 1, bytes.size(), f);
+						std::fclose(f);
+						std::printf("BC3D dump: %s\n", path.c_str());
+					}
+				}
+			}
+		}
+		static auto& zero = Common::LiveSwitches::Get("KYTY_BC3D_ZERO", 0);
+		// KYTY_BC3D_ZERO_FMT=<VkFormat number> limits it to one format (0: all).
+		static auto& zero_format = Common::LiveSwitches::Get("KYTY_BC3D_ZERO_FMT", 0);
+		const auto   only        = zero_format.load(std::memory_order_relaxed);
+		if (zero.load(std::memory_order_relaxed) != 0 &&
+		    (only == 0 || only == static_cast<int64_t>(info.pixel_format))) {
+			const auto fill_offset = offset & ~uint64_t {3};
+			const auto fill_size   = Common::AlignUp(size + (offset - fill_offset), uint64_t {4});
+			m_scheduler.Current().Recorder().Custom([buffer, fill_offset, fill_size](vk::CommandBuffer command) {
+				vk::MemoryBarrier2 barrier {};
+				barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+				barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+				barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllTransfer;
+				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+				vk::DependencyInfo dependency {};
+				dependency.memoryBarrierCount = 1;
+				dependency.pMemoryBarriers    = &barrier;
+				command.pipelineBarrier2(dependency);
+				command.fillBuffer(buffer, fill_offset, fill_size, 0);
+			});
+		}
+	}
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
 	buffer_barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
@@ -704,10 +756,34 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
+	const auto supported = [&] {
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                         create.usage, create.flags,
+		                                         &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	if (!supported()) {
+		// Some drivers (RADV) reject optional view-compatibility flags for block-compressed
+		// volumes. Drop them one at a time: such views of those images are never created.
+		for (const auto flag: {vk::ImageCreateFlagBits::e2DArrayCompatible,
+		                       vk::ImageCreateFlagBits::eBlockTexelViewCompatible}) {
+			if (!(create.flags & flag)) continue;
+			create.flags &= ~vk::ImageCreateFlags(flag);
+			if (flag == vk::ImageCreateFlagBits::eBlockTexelViewCompatible) {
+				create.flags &= ~vk::ImageCreateFlags(vk::ImageCreateFlagBits::eExtendedUsage);
+			}
+			if (supported()) {
+				static std::atomic<uint32_t> reported = 0;
+				if (reported.fetch_add(1) < 8) {
+					std::printf("Image: format %d type %d created without flag 0x%x (unsupported)\n",
+					            static_cast<int>(create.format), static_cast<int>(create.imageType),
+					            static_cast<vk::ImageCreateFlags::MaskType>(vk::ImageCreateFlags(flag)));
+				}
+				break;
+			}
+		}
+	}
+	if (!supported()) {
 		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
 		     "flags=0x%x samples=%u\n",
 		     static_cast<int>(create.format), static_cast<int>(create.imageType),
@@ -755,12 +831,97 @@ uint64_t Image::HashGuestEdges() const {
 	return XXH3_64bits(bytes.data(), static_cast<size_t>(head_size + tail_size));
 }
 
+Image::ShadowCopy Image::ShadowRegions(bool to_shadow) const {
+	ShadowCopy  copy;
+	const auto& image  = backing;
+	const auto& shadow = storage_shadow;
+	for (uint32_t level = 0; level < image.mip_levels && level < copy.regions.size(); level++) {
+		const vk::Extent3D main_extent {std::max(image.extent.width >> level, 1u),
+		                                std::max(image.extent.height >> level, 1u),
+		                                std::max(image.extent.depth >> level, 1u)};
+		const vk::Extent3D shadow_extent {std::max(shadow.extent.width >> level, 1u),
+		                                  std::max(shadow.extent.height >> level, 1u),
+		                                  std::max(shadow.extent.depth >> level, 1u)};
+		auto& region          = copy.regions[copy.count++];
+		region.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, 0,
+		                                                    image.layers};
+		region.dstSubresource = region.srcSubresource;
+		// Between compressed and uncompressed images the extent is in source texels.
+		region.extent = to_shadow ? main_extent : shadow_extent;
+	}
+	return copy;
+}
+
+static void ShadowBarrier(const CommandRecorder& recorder, const VulkanImage& image,
+                          vk::ImageLayout from, vk::ImageLayout to,
+                          vk::PipelineStageFlags2 destination_stage,
+                          vk::AccessFlags2 destination_access) {
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask     = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask    = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask     = destination_stage;
+	barrier.dstAccessMask    = destination_access;
+	barrier.oldLayout        = from;
+	barrier.newLayout        = to;
+	barrier.image            = image.image;
+	barrier.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0,
+	                                                      image.mip_levels, 0, image.layers};
+	recorder.Custom([barrier](vk::CommandBuffer command) {
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+	});
+}
+
+void Image::ShadowPreCopy(const CommandRecorder& recorder) {
+	Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, recorder);
+	ShadowBarrier(recorder, storage_shadow, storage_shadow_layout,
+	              vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllTransfer,
+	              vk::AccessFlagBits2::eTransferWrite);
+	const auto        copy   = ShadowRegions(true);
+	const vk::Image   source = backing.image;
+	const vk::Image   target = storage_shadow.image;
+	recorder.Custom([copy, source, target](vk::CommandBuffer command) {
+		command.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, target,
+		                  vk::ImageLayout::eTransferDstOptimal, copy.count, copy.regions.data());
+	});
+	ShadowBarrier(recorder, storage_shadow, vk::ImageLayout::eTransferDstOptimal,
+	              vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	storage_shadow_layout = vk::ImageLayout::eGeneral;
+}
+
+void Image::ShadowWriteBack(const CommandRecorder& recorder) {
+	ShadowBarrier(recorder, storage_shadow, storage_shadow_layout,
+	              vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eAllTransfer,
+	              vk::AccessFlagBits2::eTransferRead);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, recorder);
+	const auto      copy   = ShadowRegions(false);
+	const vk::Image source = storage_shadow.image;
+	const vk::Image target = backing.image;
+	recorder.Custom([copy, source, target](vk::CommandBuffer command) {
+		command.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, target,
+		                  vk::ImageLayout::eTransferDstOptimal, copy.count, copy.regions.data());
+	});
+	Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {}, recorder);
+	storage_shadow_layout = vk::ImageLayout::eTransferSrcOptimal;
+}
+
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);
 		}
+	}
+	for (const auto& cached: storage_shadow_views) {
+		if (cached.view != nullptr) {
+			m_graphics.device.destroyImageView(cached.view, nullptr);
+		}
+	}
+	if (storage_shadow.image != nullptr) {
+		m_graphics.DeleteImage(storage_shadow);
 	}
 	if (backing.image != nullptr) {
 		if (m_graphics.address_binding_report_enabled) {

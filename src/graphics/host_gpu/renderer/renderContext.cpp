@@ -30,12 +30,25 @@ public:
 		return enabled.load(std::memory_order_relaxed) != 0;
 	}
 
-	void Add(bool write, uint64_t vaddr) {
+	void Add(bool write, uint64_t vaddr, bool cp) {
 		std::lock_guard lock(m_mutex);
+		const auto      now  = std::chrono::steady_clock::now();
 		auto&           page = m_pages[vaddr >> 12u];
 		(write ? page.writes : page.reads)++;
 		(write ? m_writes : m_reads)++;
-		const auto now = std::chrono::steady_clock::now();
+		if (cp) {
+			(write ? m_cp_writes : m_cp_reads)++;
+			// CP write streams: the 64 KiB block of each fault (ring/image area being filled).
+			if (write) m_cp_blocks[vaddr >> 16u]++;
+		}
+		// A write fault right after one on the page below (< 20 ms): a sequential stream.
+		if (write) {
+			const auto below = m_last_write.find((vaddr >> 12u) - 1u);
+			if (below != m_last_write.end() && now - below->second < std::chrono::milliseconds(20)) {
+				m_sequential++;
+			}
+			m_last_write[vaddr >> 12u] = now;
+		}
 		if (now - m_report < std::chrono::seconds(5)) {
 			return;
 		}
@@ -46,14 +59,29 @@ public:
 			                  return a.second.reads + a.second.writes >
 			                         b.second.reads + b.second.writes;
 		                  });
-		::printf("Faults (5 s): %" PRIu64 " writes, %" PRIu64 " reads, %zu pages; top:", m_writes,
-		         m_reads, m_pages.size());
+		::printf("Faults (5 s): %" PRIu64 " writes (%" PRIu64 " sequential), %" PRIu64
+		         " reads, %zu pages; top:",
+		         m_writes, m_sequential, m_reads, m_pages.size());
 		for (size_t i = 0; i < count; i++) {
 			::printf(" 0x%" PRIx64 " w%" PRIu64 "/r%" PRIu64, top[i].first << 12u,
 			         top[i].second.writes, top[i].second.reads);
 		}
+		std::vector<std::pair<uint64_t, uint64_t>> blocks(m_cp_blocks.begin(), m_cp_blocks.end());
+		const auto bcount = std::min<size_t>(blocks.size(), 6);
+		std::partial_sort(blocks.begin(), blocks.begin() + static_cast<ptrdiff_t>(bcount), blocks.end(),
+		                  [](const auto& a, const auto& b) { return a.second > b.second; });
+		::printf("; CP: %" PRIu64 " writes, %" PRIu64 " reads, %zu blocks; top 64K:", m_cp_writes,
+		         m_cp_reads, blocks.size());
+		for (size_t i = 0; i < bcount; i++) {
+			::printf(" 0x%" PRIx64 " w%" PRIu64, blocks[i].first << 16u, blocks[i].second);
+		}
 		::printf("\n");
+		std::fflush(stdout);
+		m_cp_blocks.clear();
+		m_cp_writes = m_cp_reads = 0;
 		m_pages.clear();
+		m_last_write.clear();
+		m_sequential = 0;
 		m_writes = 0;
 		m_reads  = 0;
 		m_report = now;
@@ -66,6 +94,11 @@ private:
 	};
 	std::mutex                            m_mutex;
 	std::unordered_map<uint64_t, Counts>  m_pages;
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_last_write;
+	uint64_t                              m_sequential = 0;
+	uint64_t                              m_cp_writes  = 0;
+	uint64_t                              m_cp_reads   = 0;
+	std::unordered_map<uint64_t, uint64_t> m_cp_blocks;
 	uint64_t                              m_writes = 0;
 	uint64_t                              m_reads  = 0;
 	std::chrono::steady_clock::time_point m_report = std::chrono::steady_clock::now();
@@ -134,15 +167,45 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (FaultStats::Enabled()) {
-		g_fault_stats.Add(access == PageFaultAccess::Write, fault_vaddr);
+		g_fault_stats.Add(access == PageFaultAccess::Write, fault_vaddr, GuestGpu::IsGpuThread());
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		FaultAhead(fault_vaddr);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+// Most write faults in Wolverine continue a stream (the page below faulted a moment earlier on
+// the same thread: ring buffers filled in order). KYTY_FAULT_AHEAD=<pages> (live, default 0)
+// lifts the buffer cache's write protection of that many pages past the faulting one in one
+// step; the texture cache keeps watching its own pages, so those still fault.
+void RenderContext::FaultAhead(uint64_t fault_vaddr) noexcept {
+	static auto& ahead_pages = Common::LiveSwitches::Get("KYTY_FAULT_AHEAD", 0);
+	const auto   pages       = ahead_pages.load(std::memory_order_relaxed);
+	if (pages <= 0) {
+		return;
+	}
+	thread_local uint64_t                              expected_page = 0;
+	thread_local std::chrono::steady_clock::time_point last_fault {};
+	const auto page   = fault_vaddr / TRACKER_PAGE_SIZE;
+	const auto now    = std::chrono::steady_clock::now();
+	const bool stream = page == expected_page && now - last_fault < std::chrono::milliseconds(20);
+	last_fault        = now;
+	expected_page     = page + 1;
+	if (!stream) {
+		return;
+	}
+	const auto begin = (page + 1) * TRACKER_PAGE_SIZE;
+	const auto size  = static_cast<uint64_t>(pages) * TRACKER_PAGE_SIZE;
+	if (!IsMapped(begin, size)) {
+		return;
+	}
+	m_buffer_cache.InvalidateMemoryAhead(begin, size);
+	expected_page = page + 1 + static_cast<uint64_t>(pages);
 }
 
 bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
@@ -180,10 +243,49 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// KYTY_LOCAL_HACK KYTY_UNMAP_SKIP_DRAIN (live, default 1, upstream e6fce45d): a range no cached
+		// buffer or image covers has no GPU work to wait for; guest-memory completions still
+		// finish first. KYTY_UNMAP_STATS=1 (live, research): unmaps and drain time per 5 s.
+		static auto& skip_on  = Common::LiveSwitches::Get("KYTY_UNMAP_SKIP_DRAIN", 1);
+		static auto& stats_on = Common::LiveSwitches::Get("KYTY_UNMAP_STATS", 0);
+		const bool   stats    = stats_on.load(std::memory_order_relaxed) != 0;
+		const auto   start    = std::chrono::steady_clock::now();
+		bool         drained  = false;
+		bool         skippable = false;
 		if (m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
+			if (stats || skip_on.load(std::memory_order_relaxed) != 0) {
+				skippable = !m_buffer_cache.IsRegionRegistered(vaddr, size) &&
+				            !m_texture_cache.IsRegionRegistered(vaddr, size) &&
+				            !m_command_scheduler.HasPendingPriorityOperations();
+			}
+			if (!skippable || skip_on.load(std::memory_order_relaxed) == 0) {
+				const auto tick = m_command_scheduler.CurrentTick();
+				m_command_scheduler.Finish();
+				m_command_scheduler.WaitPriorityOperations(tick);
+				drained = true;
+			}
+		}
+		if (stats) {
+			static uint64_t count = 0, drains = 0, skippables = 0, ns = 0, bytes = 0;
+			static auto     report = start;
+			static const auto origin = start;
+			const auto      now    = std::chrono::steady_clock::now();
+			count++;
+			drains += drained ? 1u : 0u;
+			skippables += skippable ? 1u : 0u;
+			bytes += size;
+			ns += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+			if (now - report >= std::chrono::seconds(5)) {
+				report = now;
+				::printf("Unmap stats (5 s) t=%.0f: unmaps %" PRIu64 " (%.1f MiB), drains %" PRIu64
+				         ", skippable %" PRIu64 ", drain+check %.1f ms\n",
+				         std::chrono::duration<double>(now - origin).count(), count,
+				         static_cast<double>(bytes) / 1048576.0, drains, skippables,
+				         static_cast<double>(ns) / 1e6);
+				std::fflush(stdout);
+				count = drains = skippables = ns = bytes = 0;
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

@@ -229,6 +229,10 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding FindResolvedTexture(
+	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
+	    vk::Format view_format, uint32_t size);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -268,6 +272,9 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// KYTY_LOCAL_HACK (BC storage shadow): images whose shadow a compute dispatch writes.
+	std::vector<ImageId>                  m_shadow_writebacks;
+	void                                  FlushShadowWritebacks(const CommandRecorder& recorder);
 
 	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	uint64_t                              m_bindless_frame = UINT64_MAX;
@@ -281,6 +288,7 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
+	std::unique_ptr<MeshIndirectDraw>       m_mesh_indirect;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -797,6 +797,11 @@ static void WindowCreate(WindowContext& context) {
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
 	}
+	// KYTY_LOCAL_HACK: no desktop cursor over the fullscreen game (Steam's desktop layout moves
+	// it with the pad's stick while the emulator has focus).
+	if (Config::FullscreenEnabled()) {
+		SDL_HideCursor();
+	}
 
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);

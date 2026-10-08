@@ -8,6 +8,8 @@
 #include "graphics/guest_gpu/gpu_format.h"
 
 #include <algorithm>
+#include <cstring>
+#include <cstdlib>
 #include <array>
 #include <bit>
 
@@ -278,9 +280,18 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
 		case Prospero::TileMode::kStandard256B:
 			if (!volume) family = TileBlockFamily::Standard256B;
 			break;
-		case Prospero::TileMode::kStandard4KB:
-			family = volume ? TileBlockFamily::Standard4KB3D : TileBlockFamily::Standard4KB;
+		case Prospero::TileMode::kStandard4KB: {
+			// KYTY_LOCAL_HACK research: KYTY_VOLUME_THIN=1 lays block-compressed 4KB volumes out
+			// as thin (each slice in the 2D pattern) instead of the 3D thick pattern.
+			static const bool thin = [] {
+				const char* value = std::getenv("KYTY_VOLUME_THIN");
+				return value != nullptr && std::strcmp(value, "0") != 0;
+			}();
+			const bool block_compressed = Prospero::BlockCompressedBytesPerBlock(format) != 0;
+			family = volume && !(thin && block_compressed) ? TileBlockFamily::Standard4KB3D
+			                                               : TileBlockFamily::Standard4KB;
 			break;
+		}
 		case Prospero::TileMode::kStandard64KB:
 			family = volume ? TileBlockFamily::Standard64KB3D : TileBlockFamily::Standard64KB;
 			break;

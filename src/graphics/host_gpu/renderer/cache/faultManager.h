@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 
 namespace Libs::Graphics {
 
@@ -54,6 +55,8 @@ private:
 	size_t                                 m_download_area_size;
 	Buffer                                 m_fault_buffer;
 	Buffer                                 m_download_buffer;
+	// KYTY_LOCAL_HACK (debug probe): DebugProbe records, dumped to KYTY_PROBE_OUT.
+	std::unique_ptr<Buffer>                m_probe_buffer;
 	std::array<uint64_t, MaxPendingFaults> m_fault_areas {};
 	uint32_t                               m_current_area                  = 0;
 	bool                                   m_initialized                   = false;

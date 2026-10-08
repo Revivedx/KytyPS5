@@ -307,6 +307,63 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 
 } // namespace ImageViewOps
 
+vk::ImageView Image::FindShadowView(const ImageViewInfo& normalized) {
+	for (const auto& cached: storage_shadow_views) {
+		if (cached.info == normalized) {
+			return cached.view;
+		}
+	}
+	const auto& image = backing;
+	if (storage_shadow.image == nullptr) {
+		vk::ImageCreateInfo create {};
+		create.flags     = image.image_type == vk::ImageType::e3D
+		                       ? vk::ImageCreateFlags(vk::ImageCreateFlagBits::e2DArrayCompatible)
+		                       : vk::ImageCreateFlags {};
+		create.imageType = image.image_type;
+		create.extent    = {std::max((image.extent.width + 3u) / 4u, 1u),
+		                    std::max((image.extent.height + 3u) / 4u, 1u), image.extent.depth};
+		create.mipLevels     = image.mip_levels;
+		create.arrayLayers   = image.layers;
+		create.format        = normalized.format;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+		               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+		create.samples = vk::SampleCountFlagBits::e1;
+		if (info.bytes_per_block != 16 || normalized.format != vk::Format::eR32G32B32A32Uint ||
+		    !m_graphics.CreateImage(create, storage_shadow)) {
+			EXIT("BC storage shadow: cannot create %ux%ux%u format %d (block %u bytes)\n",
+			     create.extent.width, create.extent.height, create.extent.depth,
+			     static_cast<int>(create.format), info.bytes_per_block);
+		}
+		storage_shadow_layout = vk::ImageLayout::eUndefined;
+		std::printf("BC storage shadow: %s %ux%ux%u mips %u layers %u -> %s %ux%ux%u\n",
+		            vk::to_string(image.format).c_str(), image.extent.width, image.extent.height,
+		            image.extent.depth, image.mip_levels, image.layers,
+		            vk::to_string(create.format).c_str(), create.extent.width, create.extent.height,
+		            create.extent.depth);
+	}
+	vk::ImageViewUsageCreateInfo usage {};
+	usage.usage = vk::ImageUsageFlagBits::eStorage;
+	vk::ImageViewCreateInfo create {};
+	create.pNext                           = &usage;
+	create.image                           = storage_shadow.image;
+	create.viewType                        = normalized.type;
+	create.format                          = normalized.format;
+	create.components                      = normalized.mapping;
+	create.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	create.subresourceRange.baseMipLevel   = normalized.base_level;
+	create.subresourceRange.levelCount     = normalized.level_count;
+	create.subresourceRange.baseArrayLayer = normalized.base_layer;
+	create.subresourceRange.layerCount     = normalized.layer_count;
+	vk::ImageView view = nullptr;
+	if (m_graphics.device.createImageView(&create, nullptr, &view) != vk::Result::eSuccess) {
+		EXIT("BC storage shadow: cannot create view\n");
+	}
+	storage_shadow_views.push_back({.info = normalized, .view = view});
+	return view;
+}
+
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const auto& image      = backing;
 	auto        normalized = view_info;
@@ -323,6 +380,25 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	// KYTY_LOCAL_HACK research: views of block-compressed volumes in another format.
+	if (info.IsBlock() && info.IsVolume() && normalized.format != image.format) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 24) {
+			std::printf("BCVIEW: %s %ux%ux%u viewed as %s type %d storage %d\n",
+			            vk::to_string(image.format).c_str(), image.extent.width, image.extent.height,
+			            image.extent.depth, vk::to_string(normalized.format).c_str(),
+			            static_cast<int>(normalized.type), is_storage ? 1 : 0);
+		}
+	}
+	if (is_storage && !(image.usage & vk::ImageUsageFlagBits::eStorage) && info.IsBlock()) {
+		static const bool shadow_enabled = [] {
+			const char* value = std::getenv("KYTY_BC_STORAGE_SHADOW");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		if (shadow_enabled) {
+			return FindShadowView(normalized);
+		}
+	}
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;

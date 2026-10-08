@@ -1,3 +1,4 @@
+#include "common/liveSwitches.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -653,6 +654,7 @@ struct ShaderFunctionExpander::Impl {
 		std::vector<uint32_t> code;
 	};
 	struct Shader {
+		uint64_t               code_hash = 0;
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
 	};
@@ -680,7 +682,7 @@ ShaderFunctionExpander::~ShaderFunctionExpander() = default;
 bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
                                     std::span<const uint32_t> user_data,
                                     const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
-                                    std::string& reason, uint32_t wave_size) {
+                                    std::string& reason, uint32_t wave_size, uint64_t code_hash) {
 	expanded.clear();
 	reason.clear();
 	if (wave_size != 32u && wave_size != 64u) {
@@ -688,11 +690,18 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 		return false;
 	}
 	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
-	if (shader.analysis.code.size() != code.size() ||
-	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+	// KYTY_LOCAL_HACK KYTY_EXPAND_HASH (live, default 1): with the registered code hash (XXH3 of
+	// the code, what the program cache keys on) the analysis is valid without comparing the whole
+	// code again on every dispatch (~1.3% of the CP, pf4 perf 2026-10-06).
+	static auto& use_hash = Common::LiveSwitches::Get("KYTY_EXPAND_HASH", 1);
+	const bool   hash_ok  = code_hash != 0 && use_hash.load(std::memory_order_relaxed) != 0 &&
+	                     shader.code_hash == code_hash && shader.analysis.code.size() == code.size();
+	if (!hash_ok && (shader.analysis.code.size() != code.size() ||
+	                 !std::equal(code.begin(), code.end(), shader.analysis.code.begin()))) {
 		shader = {};
 		AnalyzeShader(code, shader.analysis);
 	}
+	shader.code_hash = code_hash;
 	const auto& analysis = shader.analysis;
 	if (!analysis.has_calls) return true;
 	if (analysis.has_setpc) {

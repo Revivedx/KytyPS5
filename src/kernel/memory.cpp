@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1071,6 +1072,8 @@ void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	std::printf("Memory: address-space mutex %p, backing mutex %p\n", g_guest_address_space->MutexAddress(),
+	            g_guest_address_space->BackingMutexAddress());
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();

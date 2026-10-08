@@ -295,6 +295,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    destination_offset < source_offset + size) {
 		EXIT("Buffer: overlapping self-copy\n");
 	}
+	last_gpu_copy_tick = m_scheduler->CurrentTick();
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),

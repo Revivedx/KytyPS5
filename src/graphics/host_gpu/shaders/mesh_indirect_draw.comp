@@ -1,0 +1,92 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// Indirect draws through a mesh-shader pipeline: the guest's arguments become the mesh workgroup
+// counts and the six draw parameters the mesh program reads (MeshDrawParameter), on the GPU.
+// Reading them on the CPU drained the queue for every such draw, since an earlier GPU pass
+// writes them (Wolverine: ~11 a frame, 3.6 ms each).
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// {count, instances, first index or vertex, vertex offset or first instance, first instance}
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer DrawArgs {
+    uint args[5];
+};
+
+layout(std430, binding = 0) writeonly buffer Entries {
+    uint entries[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 args_address;
+    uvec2 index_address;   // the index buffer's base (indexed draws)
+    uint  indexed;
+    uint  max_index_count; // the index buffer's size in indices (indexed draws)
+    uint  element_size;
+    uint  primitive_size;  // ShaderMeshInputInfo::InputPrimitiveSize
+    uint  primitive_step;  // ShaderMeshInputInfo::InputPrimitiveStep
+    uint  primitives_per_group;
+    uint  max_groups_x;
+    uint  max_groups_y;
+    uint  max_groups_z;
+    uint  max_groups_total;
+    uint  split_stride;    // MeshGroupSplitStride
+    uint  output_dword;
+    uint  fast_launch;     // dword 3 then holds the group count instead of the index size
+} pc;
+
+void main() {
+    DrawArgs draw = DrawArgs(pc.args_address);
+    uint count;
+    uint instances = draw.args[1];
+    uint offset_or_vertex;
+    uint first_instance;
+    uvec2 index_address = pc.index_address;
+    if (pc.indexed != 0u) {
+        count            = min(draw.args[0], pc.max_index_count);
+        offset_or_vertex = draw.args[3];
+        first_instance   = draw.args[4];
+        const uint skip  = draw.args[2] * pc.element_size;
+        const uint low   = index_address.x + skip;
+        index_address    = uvec2(low, index_address.y + (low < index_address.x ? 1u : 0u));
+    } else {
+        count            = draw.args[0];
+        offset_or_vertex = draw.args[2];
+        first_instance   = draw.args[3];
+    }
+
+    const uint primitives =
+        count < pc.primitive_size ? 0u : (count - pc.primitive_size) / pc.primitive_step + 1u;
+    const uint groups = primitives == 0u || instances == 0u
+                            ? 0u
+                            : (primitives - 1u) / pc.primitives_per_group + 1u;
+    // Groups past one host dimension continue along Z (WorkgroupId.x + WorkgroupId.z * stride);
+    // groups past the draw's end emit nothing.
+    uint x = groups;
+    uint z = 1u;
+    if (groups > pc.max_groups_x) {
+        x = pc.split_stride;
+        z = (groups - 1u) / pc.split_stride + 1u;
+    }
+    uint y = min(instances, pc.max_groups_y);
+    z      = min(z, pc.max_groups_z);
+    if (x != 0u && y != 0u) {
+        if (x > pc.max_groups_total / y) {
+            x = 0u; // beyond the host's limits: drawn as empty instead of undefined
+        } else {
+            z = min(z, max(pc.max_groups_total / (x * y), 1u));
+        }
+    }
+
+    const uint base = pc.output_dword;
+    entries[base + 0u] = x;
+    entries[base + 1u] = y;
+    entries[base + 2u] = z;
+    entries[base + 4u] = count;
+    entries[base + 5u] = offset_or_vertex;
+    entries[base + 6u] = first_instance;
+    entries[base + 7u] = pc.fast_launch != 0u ? groups : pc.element_size;
+    entries[base + 8u] = index_address.x;
+    entries[base + 9u] = index_address.y;
+}

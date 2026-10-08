@@ -1,5 +1,6 @@
 #include "graphics/presentation/renderDoc.h"
 
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -157,6 +158,13 @@ static void StartCapture() {
 }
 
 void RenderDocOnGuestFlip(RenderContext& renderer) {
+	// KYTY_LOCAL_HACK: changing KYTY_RD_CAPTURE in the live file requests a capture (no keyboard).
+	static auto&   trigger      = Common::LiveSwitches::Get("KYTY_RD_CAPTURE", 0);
+	static int64_t last_trigger = 0;
+	if (const auto value = trigger.load(std::memory_order_relaxed); value != last_trigger) {
+		last_trigger = value;
+		RenderDocRequestCapture();
+	}
 	const auto state = g_state.load(std::memory_order_acquire);
 	if (g_api == nullptr || state == RenderDocState::Idle) {
 		return;

@@ -6,9 +6,17 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics {
+
+// KYTY_LOCAL_HACK (research): recorded barriers and render passes, reported by KYTY_GPU_PROFILE.
+// 0 pipelineBarrier, 1 pipelineBarrier2, 2 beginRendering, 3 endRendering.
+inline std::array<std::atomic<uint64_t>, 4> g_recorder_counts {};
+inline std::atomic<bool>                    g_recorder_callers {false};
+// Records the two callers above the recorder method (offsets in the executable) for `what`.
+void NoteRecorderCaller(uint32_t what);
 
 // The Vulkan commands of the hot recording paths, with vk::CommandBuffer's names and arguments.
 // Bound to a raw command buffer it records directly; bound to a threaded scheduler
@@ -56,6 +64,12 @@ public:
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
 		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
+	}
+	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
+	                              uint32_t stride) const {
+		Run([=](vk::CommandBuffer command) {
+			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
+		});
 	}
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
@@ -139,6 +153,8 @@ public:
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images) const {
+		g_recorder_counts[0].fetch_add(1, std::memory_order_relaxed);
+		if (g_recorder_callers.load(std::memory_order_relaxed)) NoteRecorderCaller(0);
 		if (!Threaded()) {
 			m_direct.pipelineBarrier(source, destination, flags, memory_count, memory, buffer_count,
 			                         buffers, image_count, images);
@@ -156,6 +172,8 @@ public:
 		});
 	}
 	void pipelineBarrier2(const vk::DependencyInfo& dependency) const {
+		g_recorder_counts[1].fetch_add(1, std::memory_order_relaxed);
+		if (g_recorder_callers.load(std::memory_order_relaxed)) NoteRecorderCaller(1);
 		if (!Threaded()) {
 			m_direct.pipelineBarrier2(dependency);
 			return;
@@ -277,6 +295,8 @@ public:
 	}
 	void beginRendering(const vk::RenderingInfo* info) const { beginRendering(*info); }
 	void beginRendering(const vk::RenderingInfo& info) const {
+		g_recorder_counts[2].fetch_add(1, std::memory_order_relaxed);
+		if (g_recorder_callers.load(std::memory_order_relaxed)) NoteRecorderCaller(2);
 		if (!Threaded()) {
 			m_direct.beginRendering(info);
 			return;
@@ -295,6 +315,8 @@ public:
 		m_scheduler->Record([copy](vk::CommandBuffer command) { command.beginRendering(copy); });
 	}
 	void endRendering() const {
+		g_recorder_counts[3].fetch_add(1, std::memory_order_relaxed);
+		if (g_recorder_callers.load(std::memory_order_relaxed)) NoteRecorderCaller(3);
 		Run([](vk::CommandBuffer command) { command.endRendering(); });
 	}
 	void setCheckpointNV(const void* marker) const {
@@ -371,6 +393,12 @@ public:
 		Run([=](vk::CommandBuffer command) {
 			command.setAttachmentFeedbackLoopEnableEXT(aspects);
 		});
+	}
+
+	// KYTY_LOCAL_HACK: any command; the closure must be trivially copyable (no owning captures).
+	template <typename F>
+	void Custom(F&& fn) const {
+		Run(std::forward<F>(fn));
 	}
 
 private:

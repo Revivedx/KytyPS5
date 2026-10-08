@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <set>
+#include <vector>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,6 +19,20 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
+	// KYTY_LOCAL_HACK (research): KYTY_NO_DISCARD_HASH=<hex[,hex]> keeps the discarded pixels.
+	static const auto no_discard = [] {
+		std::vector<uint64_t> result;
+		const char* value = std::getenv("KYTY_NO_DISCARD_HASH");
+		while (value != nullptr && *value != 0) {
+			char* end = nullptr;
+			result.push_back(std::strtoull(value, &end, 16));
+			value = *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
+	}();
+	if (std::ranges::find(no_discard, state.program.shader_hash) != no_discard.end()) {
+		return;
+	}
 	const auto kill_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	const auto inactive    = state.builder.AllocateId();
@@ -30,6 +46,15 @@ void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 
 void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
 	if (state.pixel_valid_mask_variable == 0) {
+		return;
+	}
+	// KYTY_LOCAL_HACK (research): KYTY_VM_RESPECT_KILLENABLE=1 keeps pixels outside the valid
+	// mask when DB_SHADER_CONTROL.KILL_ENABLE is clear.
+	static const bool respect = [] {
+		const char* value = std::getenv("KYTY_VM_RESPECT_KILLENABLE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (respect && !state.input_info.pixel->ps_pixel_kill_enable) {
 		return;
 	}
 
@@ -1344,6 +1369,7 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	EmitDefaultKilledPosition(state);
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);

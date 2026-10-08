@@ -27,7 +27,9 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -423,6 +425,33 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    queue_family < families.size() && families[queue_family].queueCount >= 2 ? 2u : 1u;
 	queue_create_info.pQueuePriorities = queue_priorities;
 	graphics.queue_count               = queue_create_info.queueCount;
+	// KYTY_LOCAL_HACK KYTY_READBACK_COMPUTE_QUEUE (env, default off; 1 on: cq2 no gain): RADV has a single queue
+	// in the graphics family, so the copy-queue readback never ran there and every readback of
+	// GPU-written bytes drained the whole graphics queue (Wolverine 10-07 ci2: ~216 per 5 s,
+	// ~3.5 ms each, 15% of the GPU thread). A queue of a compute-only family serves it instead;
+	// the copy only reads buffers whose writers have finished (the timeline semaphore orders it),
+	// and buffers need no layout or ownership state on RADV.
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_infos {queue_create_info, vk::DeviceQueueCreateInfo {}};
+	uint32_t                                 queue_info_count = 1;
+	graphics.readback_queue_family =
+	    queue_create_info.queueCount >= 2 ? queue_family : static_cast<uint32_t>(-1);
+	const char* compute_readback = std::getenv("KYTY_READBACK_COMPUTE_QUEUE");
+	if (queue_create_info.queueCount < 2 && compute_readback != nullptr &&
+	    std::strcmp(compute_readback, "0") != 0) {
+		for (uint32_t family = 0; family < families.size(); family++) {
+			const auto flags = families[family].queueFlags;
+			if (family != queue_family && families[family].queueCount >= 1 &&
+			    (flags & vk::QueueFlagBits::eCompute) && !(flags & vk::QueueFlagBits::eGraphics)) {
+				queue_infos[1].queueFamilyIndex = family;
+				queue_infos[1].queueCount       = 1;
+				queue_infos[1].pQueuePriorities = queue_priorities;
+				queue_info_count                = 2;
+				graphics.readback_queue_family  = family;
+				std::printf("Vulkan: readback queue from compute family %u\n", family);
+				break;
+			}
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -689,6 +718,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			create_info.pNext                      = &diagnostics_config;
 		}
 	}
+	graphics.calibrated_timestamps_enabled =
+	    HasExtension(device_extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
 	if (HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
 		vk::PhysicalDeviceShaderClockFeaturesKHR supported_clock {};
@@ -733,8 +764,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_infos.data();
+	create_info.queueCreateInfoCount    = queue_info_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1153,6 +1184,9 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
 		}
+		if (HasExtension(available_extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+		}
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
@@ -1182,6 +1216,8 @@ void WindowContext::CreateVulkan() {
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	if (graphic_ctx.queue_count >= 2) {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	} else if (graphic_ctx.readback_queue_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_queue_family, 0, &graphic_ctx.readback_queue);
 	}
 
 	if (!graphic_ctx.CreateAllocator()) {

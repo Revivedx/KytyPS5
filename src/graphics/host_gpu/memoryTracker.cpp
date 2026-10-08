@@ -11,6 +11,12 @@ static_assert(std::atomic<void*>::is_always_lock_free);
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions          = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_cpu_summary_bits = std::make_unique<std::atomic<uint64_t>[]>(SUMMARY_WORDS);
+	m_created_bits     = std::make_unique<std::atomic<uint64_t>[]>(SUMMARY_WORDS);
+}
+
+bool MemoryTracker::UseCreatedBitmap() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_CREATED_BITMAP", 1);
+	return enabled.load(std::memory_order_relaxed) != 0;
 }
 
 bool MemoryTracker::UseRegionBitmap() {
@@ -73,6 +79,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	ptr->SetCpuSummaryBit(&m_cpu_summary_bits[index / 64], uint64_t {1} << (index % 64));
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	m_created_bits[index / 64].fetch_or(uint64_t {1} << (index % 64), std::memory_order_release);
 	return ptr;
 }
 

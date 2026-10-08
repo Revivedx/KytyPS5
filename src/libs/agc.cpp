@@ -28,10 +28,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #ifdef min
@@ -678,6 +682,41 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	*dst = h;
 
 	dbg_dump_shader(h);
+
+	// KYTY_LOCAL_HACK research: how many shaders the game registers, of which type, and when
+	// (load screens vs gameplay). Prints a running summary at most every 2 s when it changes.
+	{
+		static std::mutex                   mutex;
+		static std::unordered_set<uint64_t> bases;
+		static std::unordered_set<uint64_t> contents;
+		static std::map<uint32_t, uint32_t> types;
+		static uint64_t                     calls = 0;
+		static uint64_t                     bytes = 0;
+		static const auto                   start = std::chrono::steady_clock::now();
+		static auto                         last  = start;
+		std::lock_guard                     lock(mutex);
+		calls++;
+		bases.insert(base);
+		if (contents.insert(std::hash<std::string_view> {}(std::string_view(
+		                        static_cast<const char*>(const_cast<const void*>(code)),
+		                        h->shader_size)))
+		        .second) {
+			bytes += h->shader_size;
+		}
+		types[h->type]++;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last >= std::chrono::seconds(2)) {
+			last = now;
+			std::string by_type;
+			for (const auto& [type, count]: types) {
+				by_type += fmt::format(" t{}={}", type, count);
+			}
+			::printf("AgcCreateShader: +%.0f s: %" PRIu64 " calls, %zu addresses, %zu unique code (%.1f MiB);%s\n",
+			         std::chrono::duration<double>(now - start).count(), calls, bases.size(),
+			         contents.size(), bytes / 1048576.0, by_type.c_str());
+			std::fflush(stdout);
+		}
+	}
 
 	return OK;
 }

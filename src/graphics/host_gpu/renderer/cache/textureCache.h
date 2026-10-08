@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <functional>
 #include <map>
 #include <span>
@@ -65,6 +66,7 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	// A writable buffer binding over [address, address + size): the shader may write any of it.
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	// Any cached image shares bytes with [address, address + size).
@@ -190,6 +192,10 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// KYTY_LOCAL_HACK: one bit per image page table page that has an owner (kept by
+	// Register/UnregisterImage), so region queries skip empty pages 64 at a time
+	// (KYTY_IMAGE_PAGE_BITS, live, default 0: no gain in ib1).
+	std::vector<uint64_t>                             m_image_page_bits;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
@@ -224,6 +230,17 @@ private:
 	void     ReportGcStats(uint64_t clock);
 	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// KYTY_LOCAL_HACK KYTY_FIND_IMAGE_MEMO (live, default 1): FindImage's exact-backing result per
+	// request, valid while no image is registered or unregistered (m_image_set_epoch).
+	struct FindImageMemo {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t key     = 0;
+		uint64_t epoch   = UINT64_MAX;
+		ImageId  result {};
+	};
+	uint64_t                         m_image_set_epoch = 0;
+	std::array<FindImageMemo, 4096> m_find_image_memo {};
 	bool             m_readback_linear_images = false;
 
 	// The buffer cache's bytes during a KYTY_GC_COMBINED collection (see GcUsedMemory).

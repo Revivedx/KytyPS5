@@ -2,9 +2,14 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <cstdlib>
+#include <array>
+#include <immintrin.h>
+#include <thread>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -30,9 +35,18 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		// Test-and-test-and-set: spin on a plain load with PAUSE, and yield the CPU once the
+		// holder is slow (it may be inside mprotect, which contends on the process mmap lock on
+		// Linux), instead of hammering the cache line and starving the holder's core.
+		for (uint32_t spins = 0; m_lock.test_and_set(std::memory_order_acquire);) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			while (m_lock.test(std::memory_order_relaxed)) {
+				if (++spins < 64) {
+					_mm_pause();
+				} else {
+					std::this_thread::yield();
+				}
+			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -97,13 +111,42 @@ public:
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
+		// KYTY_LOCAL_HACK KYTY_REGION_FAST (live, default 1): word-wise range checks instead of a
+		// masked copy of the region's bit array; a GPU write over pages already GPU-dirty (the
+		// same written binding draw after draw) changes nothing; the heat walk only while hot
+		// pages are on.
+		static auto& region_fast = Common::LiveSwitches::Get("KYTY_REGION_FAST", 1);
+		const bool   fast        = region_fast.load(std::memory_order_relaxed) != 0;
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (fast ? m_gpu_dirty.AnyInRange(start, end) : RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (fast && HotPageThreshold() == 0 && m_gpu_dirty.AllInRange(start, end)) {
+				// Already GPU-dirty: the CPU-dirty conflict check below held when they were set,
+				// and protection was updated then. Only the summary is restated.
+				SetSummary<source>(true);
+				return;
+			}
+			// A hot page was uploaded before this GPU write; it stops being kept CPU-dirty.
+			bool cooled = false;
+			for (size_t page = start; page < end && (!fast || HotPageThreshold() != 0); ++page) {
+				if (m_heat[page] != 0 && IsHot(page)) {
+					m_cpu_dirty.UnsetRange(page, page + 1);
+					cooled = true;
+				}
+				m_heat[page] = 0;
+			}
+			if (cooled) {
+				// Write-protect the cooled pages now: a later UpdateProtection of the opposite
+				// direction would otherwise see them in its mask and drop a watcher never added.
+				if (m_cpu_dirty.None()) {
+					SetSummary<DirtySource::Cpu>(false);
+				}
+				UpdateProtection<true, false>();
+			}
+			if (fast ? m_cpu_dirty.AnyInRange(start, end) : RegionBits(m_cpu_dirty, start, end).Any()) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
@@ -113,6 +156,9 @@ public:
 			SetSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+				for (size_t page = start; page < end; ++page) {
+					if (m_heat[page] != 0xff) ++m_heat[page];
+				}
 			}
 		} else {
 			bits.UnsetRange(start, end);
@@ -137,6 +183,13 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			if constexpr (source == DirtySource::Cpu) {
+				for (const auto [first, last]: mask) {
+					for (size_t page = first; page < last; ++page) {
+						if (IsHot(page)) bits.Set(page);
+					}
+				}
+			}
 			if (bits.None()) {
 				SetSummary<source>(false);
 			}
@@ -163,6 +216,20 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	// Pages the CPU dirties again and again (per-frame constants) cost one write fault and two
+	// protection changes per frame. Past this many CPU dirtyings a page stays CPU-dirty: it keeps
+	// write access and is uploaded whenever the GPU uses it. KYTY_HOT_PAGES=0 turns this off.
+	// KYTY_HOT_PAGES is live: lowering it (to 0: off) is safe at any time, the pages it releases
+	// are write-protected again at their next upload.
+	static uint32_t HotPageThreshold() noexcept {
+		static auto& threshold = Common::LiveSwitches::Get("KYTY_HOT_PAGES", 8);
+		return static_cast<uint32_t>(threshold.load(std::memory_order_relaxed));
+	}
+	bool IsHot(size_t page) const noexcept {
+		const auto threshold = HotPageThreshold();
+		return threshold != 0 && m_heat[page] >= threshold;
+	}
+
 	template <DirtySource source>
 	void SetSummary(bool value) noexcept {
 		GetSummary<source>().store(value, std::memory_order_release);
@@ -239,6 +306,7 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	std::array<uint8_t, TRACKER_REGION_PAGES> m_heat {};
 	std::atomic<bool> m_cpu_maybe_dirty {true};
 	std::atomic<bool> m_gpu_maybe_dirty {false};
 	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;

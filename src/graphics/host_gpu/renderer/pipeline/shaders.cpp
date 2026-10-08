@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
@@ -307,6 +308,21 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		build.stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
 		                                      .module = pixel_program.module,
 		                                      .pName  = "main"};
+		// KYTY_PS_SUBGROUP (default 1; 0 disables): each pixel shader runs with the guest's wave
+		// size. RADV picks wave64 for fragment shaders by default, so a guest wave32 program's
+		// wave operations (readfirstlane, ballot) saw two guest waves: per-pixel data of another
+		// particle, the rainbow sparkles on Wolverine's sparks, smoke and fire (2026-10-05).
+		static const bool ps_subgroup = [] {
+			const char* value = std::getenv("KYTY_PS_SUBGROUP");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		const auto wave_size = ps_input_info != nullptr ? ps_input_info->wave_size : 0u;
+		if (ps_subgroup && graphics.compute_subgroup_size_control_enabled &&
+		    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eFragment) &&
+		    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+			build.ps_subgroup_size.requiredSubgroupSize       = wave_size;
+			build.stages[shader_stage_count - 1].pNext = &build.ps_subgroup_size;
+		}
 	}
 
 	auto& input_attr = build.input_attr;

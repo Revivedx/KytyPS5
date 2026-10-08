@@ -81,6 +81,10 @@ struct ShaderWorkgroupInputInfo {
 	uint32_t wave_size           = 64;
 };
 
+// Mesh draws with more primitive groups than one host dimension allows continue along Z, this
+// many groups per Z slice (the minimum maxMeshWorkGroupCount VK_EXT_mesh_shader guarantees).
+inline constexpr uint32_t MeshGroupSplitStride = 65535;
+
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t input_primitive      = 0;
 	uint32_t primitives_per_group = 0;
@@ -92,6 +96,9 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	// waves in this many sequential passes of equal size, each on the whole workgroup.
 	uint32_t passes               = 1;
 	bool     fast_launch          = false;
+	// The draw's six parameters (MeshDrawParameter) are read through the device address in push
+	// dwords 0-1 instead of from push dwords 0-5: indirect draws convert them on the GPU.
+	bool     draw_data_indirect   = false;
 
 	[[nodiscard]] constexpr uint32_t Waves() const {
 		return (threads_num[0] * threads_num[1] * threads_num[2] + wave_size - 1u) / wave_size;

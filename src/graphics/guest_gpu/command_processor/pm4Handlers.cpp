@@ -290,7 +290,23 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
                                       [[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {
+	// KYTY_LOCAL_HACK: report the alpha-to-mask values the game sets (not emulated yet).
+	static std::atomic<uint32_t> seen[8] = {};
+	if ((value & 1u) == 0) {
+		return;
+	}
+	for (auto& v: seen) {
+		uint32_t cur = v.load();
+		if (cur == value + 1) {
+			return;
+		}
+		if (cur == 0 && v.compare_exchange_strong(cur, value + 1)) {
+			printf("A2M: DB_ALPHA_TO_MASK enabled, value 0x%08" PRIx32 "\n", value);
+			return;
+		}
+	}
+}
 
 static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
 	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
@@ -1352,6 +1368,16 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (dst != nullptr && buffer_size != 0) {
+		// KYTY_LOCAL_HACK research: how often and how much the CP zeroes here.
+		static std::atomic<uint64_t> lod_calls {0};
+		static std::atomic<uint64_t> lod_bytes {0};
+		const auto calls = lod_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+		lod_bytes.fetch_add(buffer_size, std::memory_order_relaxed);
+		if (calls <= 4 || (calls & (calls - 1)) == 0) {
+			::printf("GetLodStats #%" PRIu64 ": dst=%p size=%u (total %" PRIu64 " KiB)\n", calls, dst,
+			         buffer_size, lod_bytes.load(std::memory_order_relaxed) / 1024u);
+			std::fflush(stdout);
+		}
 		memset(dst, 0, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {

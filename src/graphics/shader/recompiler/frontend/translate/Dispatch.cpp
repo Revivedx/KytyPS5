@@ -60,3 +60,31 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend
+
+namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+void Translator::EmitDebugProbe(uint32_t pc, const std::array<uint32_t, 7>& vgprs) {
+	// Numbers from 1000 name scalar operand codes (1000 + n: s<n>, 1106/1107: VCC halves).
+	const auto reg = [&](size_t index) {
+		if (vgprs[index] == UINT32_MAX) {
+			return IR::Value(0u);
+		}
+		if (vgprs[index] >= 1000u) {
+			return IR::Value(ReadScalarCode(vgprs[index] - 1000u));
+		}
+		return IR::Value(ir.GetVectorReg(static_cast<IR::VectorReg>(vgprs[index])));
+	};
+	ir.Emit(IR::ValueOpcode::DebugProbe,
+	        {IR::Value(pc), reg(0), reg(1), reg(2), reg(3), reg(4), reg(5), reg(6)});
+}
+
+void Translator::StashDebugProbe(const std::array<uint32_t, 3>& vgprs) {
+	for (uint32_t index = 0; index < vgprs.size(); index++) {
+		if (vgprs[index] != UINT32_MAX) {
+			ir.SetVectorReg(static_cast<IR::VectorReg>(253u + index),
+			                ir.GetVectorReg(static_cast<IR::VectorReg>(vgprs[index])));
+		}
+	}
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

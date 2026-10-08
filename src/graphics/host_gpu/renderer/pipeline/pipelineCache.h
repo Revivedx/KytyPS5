@@ -19,6 +19,33 @@
 
 namespace Libs::Graphics {
 
+// KYTY_LOCAL_HACK research (with KYTY_MEMO_CLASSIFY=1): how the resource lookups of all stages of
+// one draw or dispatch ended, and what the whole draw/dispatch cost on the GPU thread - the
+// ceiling of draw records (a record can replay a draw only when every stage could). GPU thread.
+// KYTY_LOCAL_HACK: true when the --skip-shaders list names this code hash.
+bool IsSkipListedShader(uint64_t shader_hash);
+
+namespace DrawRecordCensus {
+uint64_t NowNs();
+// 1 a stage not replayable (cold, compile, user data or reads differ), 4 an exact memo hit,
+// 8 a miss whose inputs were the same or only relocated (pass-same / reloc-same).
+inline uint32_t g_flags = 0;
+// KYTY_DRAW_PHASES=1 (live): GPU-thread time per draw phase: 0 RefreshShaders (lookup and
+// materialization), 1 render targets, 2 PrepareBindings, 3 PrepareGraphicsBindings, 4 pipeline,
+// 5 AcquireRenderTargets, 6 CommitBindings, 7 ExecutePreparedDrawResolved total, 8 ResolveTexture
+// (inside 2), 9 samplers + bindless + shader data (inside 2).
+inline uint64_t g_phase_ns[10]    = {};
+inline uint64_t g_phase_calls[10] = {};
+bool PhasesOn();
+inline void Phase(int phase, uint64_t& start) {
+	const auto now = NowNs();
+	g_phase_ns[phase] += now - start;
+	g_phase_calls[phase]++;
+	start = now;
+}
+void Record(bool compute, uint64_t start_ns);
+} // namespace DrawRecordCensus
+
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
@@ -117,6 +144,8 @@ struct GraphicsPipelineBuild {
 	vk::ShaderModule                                                      tess_control = nullptr;
 	vk::ShaderModule                                                      tess_eval    = nullptr;
 	std::array<vk::PipelineShaderStageCreateInfo, 4>                      stages {};
+	// KYTY_LOCAL_HACK (KYTY_PS_SUBGROUP): the fragment stage's required subgroup size.
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo                 ps_subgroup_size {};
 	std::array<vk::VertexInputAttributeDescription, ShaderVertexInputInfo::RES_MAX> input_attr {};
 	std::array<vk::VertexInputBindingDescription, ShaderVertexInputInfo::RES_MAX>   input_desc {};
 	vk::PipelineVertexInputStateCreateInfo                                vertex_input_info {};
@@ -178,7 +207,7 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	                    ShaderPixelInputInfo& pixel_info, bool mesh_draw_indirect = false);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);

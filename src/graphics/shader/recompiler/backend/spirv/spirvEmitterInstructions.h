@@ -194,6 +194,8 @@ inline constexpr auto EmitTtraceData   = EmitVoid;
 inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
 void     EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
+void     EmitDebugProbe(EmitterState& state, uint32_t pc, uint32_t v0, uint32_t v1, uint32_t v2,
+                        uint32_t v3, uint32_t v4, uint32_t v5, uint32_t v6);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);

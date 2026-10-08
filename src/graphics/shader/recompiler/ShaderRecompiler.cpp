@@ -1101,7 +1101,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			return sampler.source < ir.descriptor_sources.size() &&
 			       ir.descriptor_sources[sampler.source].bindless_sampler.has_value();
 		});
-		if (bindless_sampler) {
+		// KYTY_IR_DUMP_HASHES=<hex,hex,...> (environment, research): also these programs.
+		static const std::string extra_hashes = [] {
+			const char* value = std::getenv("KYTY_IR_DUMP_HASHES");
+			return std::string(value != nullptr ? value : "");
+		}();
+		const bool listed = !extra_hashes.empty() &&
+		                    extra_hashes.find(fmt::format("{:016x}", ir.shader_hash)) != std::string::npos;
+		if (bindless_sampler || listed) {
 			const auto text = MakeIrDump(translated.cfg_dump, ir);
 			const auto path = fmt::format("{}/{:016x}.txt", ir_dir, ir.shader_hash);
 			if (auto* file = std::fopen(path.c_str(), "wb"); file != nullptr) {

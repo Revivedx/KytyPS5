@@ -50,6 +50,49 @@ private:
 	uint32_t                m_next            = 0;
 };
 
+// Indirect draws through a mesh-shader pipeline: converts the guest's draw arguments into mesh
+// workgroup counts and the program's six draw parameters on the GPU (mesh_indirect_draw.comp),
+// instead of reading arguments an earlier GPU pass wrote on the CPU, which drained the queue.
+class MeshIndirectDraw {
+public:
+	MeshIndirectDraw(GraphicContext& graphics, CommandScheduler& scheduler);
+	~MeshIndirectDraw();
+	KYTY_CLASS_NO_COPY(MeshIndirectDraw);
+
+	struct Params {
+		vk::DeviceAddress args          = 0;
+		uint64_t          index_address = 0;
+		bool              indexed       = false;
+		uint32_t          max_index_count      = 0;
+		uint32_t          element_size         = 0;
+		uint32_t          primitive_size       = 0;
+		uint32_t          primitive_step       = 0;
+		uint32_t          primitives_per_group = 0;
+		bool              fast_launch          = false;
+	};
+	struct Result {
+		vk::Buffer        groups_buffer;
+		vk::DeviceSize    groups_offset = 0;
+		vk::DeviceAddress draw_data     = 0; // the six MeshDrawParameter dwords
+	};
+	// Records the conversion; binds a compute pipeline and push state and must run outside a
+	// render pass, before the draw's own bindings are committed.
+	[[nodiscard]] Result Convert(const CommandRecorder& command, const Params& params);
+
+private:
+	// Ring of entries (groups at 0, draw parameters at 4). An entry is rewritten only after 4096
+	// later conversions, each ordered behind the reads before it.
+	static constexpr uint32_t Entries     = 4096;
+	static constexpr uint32_t EntryDwords = 16;
+
+	GraphicContext&         m_graphics;
+	Buffer                  m_entries;
+	vk::DescriptorSetLayout m_set_layout      = nullptr;
+	vk::PipelineLayout      m_pipeline_layout = nullptr;
+	vk::Pipeline            m_pipeline        = nullptr;
+	uint32_t                m_next            = 0;
+};
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_INDIRECTDISPATCH_H_

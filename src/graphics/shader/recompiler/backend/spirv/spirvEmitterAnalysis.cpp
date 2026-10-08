@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <vector>
+#include <cstdlib>
+#include <cstdio>
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -243,6 +247,10 @@ void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_
 	if (!image.atomic) {
 		state.builder.RequireCapability(spv::CapabilityStorageImageWriteWithoutFormat);
 	}
+	if (image.numeric_class == Prospero::TextureNumericClass::Float && !image.atomic &&
+	    NanScrubShader(state.program.shader_hash)) {
+		texel = EmitScrubNanF32x4(state, texel);
+	}
 	const auto EmitWrite = [&](uint32_t mip) {
 		state.builder.AddFunction(spv::OpImageWrite, LoadImageDescriptor(state, resource, mip),
 		                          coord, texel);
@@ -264,6 +272,52 @@ spv::ExecutionModel ExecutionModelForStage(ShaderType stage) {
 		case ShaderType::Pixel: return spv::ExecutionModelFragment;
 		default: return spv::ExecutionModelGLCompute;
 	}
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+bool NanScrubShader(uint64_t shader_hash) {
+	static const std::pair<bool, std::vector<uint64_t>> config = [] {
+		std::pair<bool, std::vector<uint64_t>> result {false, {}};
+		const char* value = std::getenv("KYTY_NAN_SCRUB");
+		if (value == nullptr || value[0] == 0 || (value[0] == '0' && value[1] == 0)) {
+			return result;
+		}
+		if (value[0] == '1' && value[1] == 0) {
+			result.first = true;
+			return result;
+		}
+		if (FILE* f = std::fopen(value, "r"); f != nullptr) {
+			char line[64];
+			while (std::fgets(line, sizeof(line), f) != nullptr) {
+				if (const auto hash = std::strtoull(line, nullptr, 16); hash != 0) {
+					result.second.push_back(hash);
+				}
+			}
+			std::fclose(f);
+		}
+		std::printf("NaN scrub: %zu listed shaders\n", result.second.size());
+		return result;
+	}();
+	return config.first || std::find(config.second.begin(), config.second.end(), shader_hash) !=
+	                           config.second.end();
+}
+
+uint32_t EmitScrubNanF32x4(EmitterState& state, uint32_t value) {
+	const auto vec4  = TypeF32Vector(state, 4);
+	const auto bvec4 = TypeBoolVector(state, 4);
+	const auto is_nan = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsNan, bvec4, is_nan, value);
+	const auto is_inf = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsInf, bvec4, is_inf, value);
+	const auto nan = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalOr, bvec4, nan, is_nan, is_inf);
+	const auto zero = state.builder.Constant(spv::OpConstantNull, vec4);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, vec4, result, nan, zero, value);
+	return result;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

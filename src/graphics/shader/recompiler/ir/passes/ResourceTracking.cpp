@@ -943,9 +943,22 @@ private:
 				}
 			}
 		}
+		// KYTY_LOCAL_HACK KYTY_GPU_DATA_READS=<hex hash,...> (environment): in these programs the
+		// scalar address loads no descriptor depends on stay GPU loads (BDA) instead of being
+		// flattened. Flattening them makes the CP read words the GPU has just written (a
+		// readback drain per dispatch: Wolverine compute e5c3f328a12958b1 ~4% of the CP).
+		static const std::string gpu_data_reads = [] {
+			const char* value = std::getenv("KYTY_GPU_DATA_READS");
+			return std::string(value != nullptr ? value : "");
+		}();
+		const bool keep_data_on_gpu =
+		    !gpu_data_reads.empty() &&
+		    (gpu_data_reads == "all" ||
+		     gpu_data_reads.find(fmt::format("{:016x}", m_program.shader_hash)) != std::string::npos);
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				uint32_t index = 0;
+				if (keep_data_on_gpu && !m_srt_visited.contains(&inst)) continue;
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
 				    ScalarReadMemory(inst, index) != nullptr && inst.Arg(1).Resolve().IsImmediate() &&
 				    ValidateRuntimeValue(m_program, Value(&inst)))
@@ -2979,7 +2992,8 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op = inst.GetOpcode();
-		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap) {
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap ||
+		    op == ValueOpcode::DebugProbe) {
 			m_info.uses_dma = true;
 			return;
 		}

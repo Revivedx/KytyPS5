@@ -312,6 +312,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${dispatch_indirect_groups_shader_header}")
+
+set(mesh_indirect_draw_shader_source "${gpu_tiler_shader_dir}/mesh_indirect_draw.comp")
+set(mesh_indirect_draw_shader_spv "${gpu_tiler_generated_dir}/mesh_indirect_draw.spv")
+set(mesh_indirect_draw_shader_header "${gpu_tiler_generated_dir}/mesh_indirect_draw_spv.h")
+add_custom_command(
+	OUTPUT "${mesh_indirect_draw_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${mesh_indirect_draw_shader_spv}" "${mesh_indirect_draw_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${mesh_indirect_draw_shader_spv}
+	        -DOUTPUT=${mesh_indirect_draw_shader_header}
+	        -DSYMBOL=MESH_INDIRECT_DRAW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${mesh_indirect_draw_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${mesh_indirect_draw_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -407,6 +423,7 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(gcn_disasm "${KYTY_TESTS_DIR}/gcnDisasmTool.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -836,7 +853,9 @@ elseif(WIN32 OR LINUX)
 	target_link_options(kyty_emulator PRIVATE "-Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
 endif()
 
-if(LINUX)
+# KYTY_KEEP_SYMBOLS=ON keeps the symbol table in Release (profiling call sites).
+option(KYTY_KEEP_SYMBOLS "Keep the symbol table in Linux Release builds" OFF)
+if(LINUX AND NOT KYTY_KEEP_SYMBOLS)
     target_link_options(kyty_emulator PRIVATE
         $<$<CONFIG:Release>:-Wl,--strip-all>
     )

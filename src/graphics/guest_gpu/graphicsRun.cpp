@@ -27,6 +27,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <bit>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -124,25 +126,69 @@ struct DrawIndexedIndirectArgs {
 	uint32_t start_instance_location;
 };
 
+// KYTY_LOCAL_HACK KYTY_SUBMIT_LOCK_STATS=1 (live, research): every 5 s, per caller, the time spent
+// waiting for and holding the submission mutex (the guest's submit threads queue on it).
+struct SubmitLockStats {
+	std::mutex                                          mutex;
+	std::unordered_map<const char*, std::array<uint64_t, 4>> by_site; // wait ns, hold ns, calls, max wait ns
+	std::chrono::steady_clock::time_point                 last = std::chrono::steady_clock::now();
+};
+static SubmitLockStats g_submit_lock_stats;
+static bool SubmitLockStatsOn() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_SUBMIT_LOCK_STATS", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
 class GpuMutexLock final {
 public:
-	explicit GpuMutexLock(Common::Mutex& mutex): m_mutex(mutex) {
+	explicit GpuMutexLock(Common::Mutex& mutex, const char* site = "?"): m_mutex(mutex), m_site(site) {
 		if (g_gpu_mutex_owned) {
 			EXIT("recursive GPU mutex acquisition\n");
 		}
 		g_gpu_mutex_owned = true;
+		m_stats = SubmitLockStatsOn();
+		const auto start = m_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		m_mutex.Lock();
+		if (m_stats) {
+			m_acquired = std::chrono::steady_clock::now();
+			m_wait_ns  = static_cast<uint64_t>((m_acquired - start).count());
+		}
 	}
 	~GpuMutexLock() {
 		if (!g_gpu_mutex_owned) {
 			EXIT("invalid GPU mutex release\n");
 		}
+		const auto released = m_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		m_mutex.Unlock();
 		g_gpu_mutex_owned = false;
+		if (m_stats) {
+			std::lock_guard lock(g_submit_lock_stats.mutex);
+			auto& e = g_submit_lock_stats.by_site[m_site];
+			e[0] += m_wait_ns;
+			e[1] += static_cast<uint64_t>((released - m_acquired).count());
+			e[2]++;
+			e[3] = std::max(e[3], m_wait_ns);
+			if (released - g_submit_lock_stats.last >= std::chrono::seconds(5)) {
+				g_submit_lock_stats.last = released;
+				::printf("Submit lock (5 s):");
+				for (auto& [site, v]: g_submit_lock_stats.by_site) {
+					::printf(" %s n=%" PRIu64 " wait %.1f ms (max %.1f) hold %.1f ms;", site, v[2],
+					         static_cast<double>(v[0]) / 1e6, static_cast<double>(v[3]) / 1e6,
+					         static_cast<double>(v[1]) / 1e6);
+					v = {};
+				}
+				::printf("\n");
+				std::fflush(stdout);
+			}
+		}
 	}
 
 private:
-	Common::Mutex& m_mutex;
+	Common::Mutex&                         m_mutex;
+	const char*                            m_site;
+	bool                                   m_stats   = false;
+	uint64_t                               m_wait_ns = 0;
+	std::chrono::steady_clock::time_point  m_acquired {};
 };
 
 static bool GraphicsRunDebugDumpEnabled() {
@@ -338,7 +384,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	if (draw_commands.empty()) {
 		return;
 	}
-	GpuMutexLock lock(m_submission_mutex);
+	GpuMutexLock lock(m_submission_mutex, "Submit");
 	Submission   submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
@@ -351,7 +397,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 
 void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands) {
 	EXIT_IF(commands.empty());
-	GpuMutexLock lock(m_submission_mutex);
+	GpuMutexLock lock(m_submission_mutex, "SubmitCompute");
 
 	EXIT_NOT_IMPLEMENTED(queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount);
 
@@ -364,7 +410,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
-	GpuMutexLock lock(m_submission_mutex);
+	GpuMutexLock lock(m_submission_mutex, "SubmitFlipPreparation");
 	Submission   submission;
 	submission.type            = SubmissionType::FlipPreparation;
 	submission.queue_id        = 0;
@@ -375,7 +421,7 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 }
 
 void GuestGpu::Done() {
-	GpuMutexLock lock(m_submission_mutex);
+	GpuMutexLock lock(m_submission_mutex, "Done");
 	if (!IsGpuThread()) {
 		WaitForIdle();
 	}
@@ -395,7 +441,11 @@ void GuestGpu::SuspendPoint() {
 		Done();
 		return;
 	}
-	uint64_t gpu_tick = 0;
+	uint64_t   gpu_tick       = 0;
+	const bool prewait_stats  = SubmitLockStatsOn();
+	const auto prewait_start  = prewait_stats ? std::chrono::steady_clock::now()
+	                                          : std::chrono::steady_clock::time_point {};
+	std::chrono::steady_clock::time_point prewait_mid {};
 	{
 		Common::LockGuard lock(m_queue_mutex);
 		while (m_suspend_points_done < m_suspend_points_issued && !m_stopping) {
@@ -409,10 +459,24 @@ void GuestGpu::SuspendPoint() {
 	// The previous drain must also have executed on the GPU, as on the console. Without this the
 	// guest runs arbitrarily far ahead, and the uploads recorded for it pile up until an
 	// allocation fails. The tick is already submitted, so this never waits on guest work.
+	if (prewait_stats) prewait_mid = std::chrono::steady_clock::now();
 	if (gpu_tick != 0) {
 		m_renderer.GetCommandScheduler().GetMasterSemaphore().Wait(gpu_tick);
 	}
-	GpuMutexLock lock(m_submission_mutex);
+	if (prewait_stats) {
+		// Research: the suspend point's waits (previous drain processed by the CP / done on the GPU).
+		const auto end = std::chrono::steady_clock::now();
+		std::lock_guard stats_lock(g_submit_lock_stats.mutex);
+		auto& cp_wait  = g_submit_lock_stats.by_site["SuspendPoint-waitCP"];
+		auto& gpu_wait = g_submit_lock_stats.by_site["SuspendPoint-waitGPU"];
+		cp_wait[0] += static_cast<uint64_t>((prewait_mid - prewait_start).count());
+		cp_wait[2]++;
+		cp_wait[3] = std::max<uint64_t>(cp_wait[3], static_cast<uint64_t>((prewait_mid - prewait_start).count()));
+		gpu_wait[0] += static_cast<uint64_t>((end - prewait_mid).count());
+		gpu_wait[2]++;
+		gpu_wait[3] = std::max<uint64_t>(gpu_wait[3], static_cast<uint64_t>((end - prewait_mid).count()));
+	}
+	GpuMutexLock lock(m_submission_mutex, "SuspendPoint");
 	Submission   submission;
 	submission.type            = SubmissionType::SuspendPoint;
 	submission.queue_id        = 0;
@@ -745,6 +809,68 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+// KYTY_LOCAL_HACK research, KYTY_CP_SPLIT_STATS=1 (live, default 0): every 5 s, the GPU thread's time
+// in graphics-queue submissions, compute-queue submissions and forwarded commands, to size how much
+// work a second processing thread could take.
+namespace {
+struct CpSplitStats {
+	uint64_t ns[3] {};
+	uint64_t calls[3] {};
+	uint64_t compute_queues = 0; // bitmask of compute queues seen
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+CpSplitStats g_cp_split;
+bool CpSplitOn() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_CP_SPLIT_STATS", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+void NoteCpSplit(int kind, std::chrono::steady_clock::time_point start, uint32_t queue_id) {
+	const auto now = std::chrono::steady_clock::now();
+	g_cp_split.ns[kind] += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+	g_cp_split.calls[kind]++;
+	if (kind == 1) {
+		g_cp_split.compute_queues |= uint64_t {1} << (queue_id % 64u);
+	}
+	if (now - g_cp_split.last >= std::chrono::seconds(5)) {
+		::printf("CP split (5 s): graphics %.1f ms/%" PRIu64 ", compute %.1f ms/%" PRIu64
+		         " (%d queues), commands %.1f ms/%" PRIu64 "\n",
+		         static_cast<double>(g_cp_split.ns[0]) / 1e6, g_cp_split.calls[0],
+		         static_cast<double>(g_cp_split.ns[1]) / 1e6, g_cp_split.calls[1],
+		         std::popcount(g_cp_split.compute_queues),
+		         static_cast<double>(g_cp_split.ns[2]) / 1e6, g_cp_split.calls[2]);
+		g_cp_split      = {};
+		g_cp_split.last = now;
+	}
+}
+} // namespace
+
+// KYTY_LOCAL_HACK KYTY_CP_IDLE_STATS=1 (live, research): every 5 s, the time the CP thread slept
+// waiting for submissions (no work) and with every queue blocked on a label wait.
+static bool CpIdleStatsOn() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_CP_IDLE_STATS", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
+static void NoteCpIdle(int kind, std::chrono::steady_clock::time_point start) {
+	if (start == std::chrono::steady_clock::time_point {}) {
+		return;
+	}
+	static uint64_t ns[2]    = {};
+	static uint64_t count[2] = {};
+	static auto     report   = std::chrono::steady_clock::now();
+	const auto      now      = std::chrono::steady_clock::now();
+	ns[kind] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+	count[kind]++;
+	if (now - report >= std::chrono::seconds(5)) {
+		report = now;
+		::printf("CP idle (5 s): no work %.1f ms (%" PRIu64 "), blocked queues %.1f ms (%" PRIu64 ")\n",
+		         static_cast<double>(ns[0]) / 1e6, count[0], static_cast<double>(ns[1]) / 1e6, count[1]);
+		std::fflush(stdout);
+		ns[0] = ns[1] = count[0] = count[1] = 0;
+	}
+}
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -770,7 +896,10 @@ void GuestGpu::ThreadRun(void* data) {
 				KYTY_PROFILER_BLOCK("GuestGpu::WaitForWork");
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				const auto idle_start = CpIdleStatsOn() ? std::chrono::steady_clock::now()
+				                                        : std::chrono::steady_clock::time_point {};
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				NoteCpIdle(0, idle_start);
 			}
 			if (flush_pending) {
 				gpu->m_processing = true;
@@ -800,7 +929,11 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = false;
 					{
 						KYTY_PROFILER_BLOCK("GuestGpu::WaitBlockedQueues");
+						const auto idle_start = CpIdleStatsOn()
+						                            ? std::chrono::steady_clock::now()
+						                            : std::chrono::steady_clock::time_point {};
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						NoteCpIdle(1, idle_start);
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -834,7 +967,11 @@ void GuestGpu::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			{
 				KYTY_PROFILER_BLOCK("GuestGpu::RunCommand");
+				const auto start = std::chrono::steady_clock::now();
 				command();
+				if (CpSplitOn()) {
+					NoteCpSplit(2, start, 0);
+				}
 			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -846,7 +983,12 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const auto process_start = std::chrono::steady_clock::now();
+		const auto queue_id      = submission.queue_id;
+		const bool complete      = gpu->Process(submission);
+		if (CpSplitOn()) {
+			NoteCpSplit(queue_id == 0 ? 0 : 1, process_start, queue_id);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {

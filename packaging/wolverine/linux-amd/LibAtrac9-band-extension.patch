@@ -1,0 +1,30 @@
+diff --git a/C/src/band_extension.c b/C/src/band_extension.c
+index 2847053..2827d4d 100644
+--- a/C/src/band_extension.c
++++ b/C/src/band_extension.c
+@@ -32,6 +32,8 @@ void ApplyBandExtension(Block* block)
+ 
+ static void ApplyBandExtensionChannel(Channel* channel)
+ {
++	/* KytyPS5 local: never index BexGroupInfo (13..20 units) out of range. */
++	if (channel->Block->QuantizationUnitCount < 13 || channel->Block->QuantizationUnitCount > 20) return;
+ 	const int groupAUnit = channel->Block->QuantizationUnitCount;
+ 	int* scaleFactors = channel->ScaleFactors;
+ 	double* spectra = channel->Spectra;
+diff --git a/C/src/unpack.c b/C/src/unpack.c
+index 8b66e49..1f38ce3 100644
+--- a/C/src/unpack.c
++++ b/C/src/unpack.c
+@@ -149,6 +149,12 @@ static At9Status ReadBandParams(Block* block, BitReaderCxt* br)
+ 		}
+ 
+ 		block->ExtensionUnit = BandToQuantUnitCount[block->ExtensionBand];
++		/* KytyPS5 local: BexGroupInfo covers 13..20 quantization units; anything else read
++		   past the table and made the band extension copy outside Spectra (Wolverine crash). */
++		if (block->QuantizationUnitCount < 13 || block->QuantizationUnitCount > 20)
++		{
++			return ERR_UNPACK_BAND_PARAMS_INVALID;
++		}
+ 	}
+ 	else
+ 	{

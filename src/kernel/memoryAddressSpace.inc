@@ -30,6 +30,7 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 
 class GuestBackingStore {
 public:
+	[[nodiscard]] const void* MutexAddress() const { return &m_mutex; }
 	enum class FailureReason {
 		None,
 		BackingUnavailable,
@@ -104,6 +105,7 @@ public:
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
 		m_maps.clear();
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -116,6 +118,7 @@ public:
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
 		m_maps.clear();
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -192,6 +195,23 @@ public:
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return nullptr;
 		}
+		// KYTY_LOCAL_HACK KYTY_FIND_BACKING_CACHE (live, default 1): the last mapping this thread
+		// found, valid while no map or unmap happened since (m_generation), as TryTransferBacking.
+		// The CP's SRT page reads (FindGpuCleanBacking) took m_mutex for every new page.
+		struct CachedFind {
+			const void* owner      = nullptr;
+			uint64_t    generation = 0;
+			MapEntry    entry {};
+		};
+		thread_local CachedFind cached;
+		static auto& use_cache = Common::LiveSwitches::Get("KYTY_FIND_BACKING_CACHE", 1);
+		const bool cache_on = use_cache.load(std::memory_order_relaxed) != 0;
+		if (cache_on && cached.owner == this &&
+		    cached.generation == m_generation.load(std::memory_order_acquire) &&
+		    vaddr >= cached.entry.vaddr && vaddr + size <= cached.entry.vaddr + cached.entry.size) {
+			const auto offset = cached.entry.backing_offset + vaddr - cached.entry.vaddr;
+			return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+		}
 		std::lock_guard lock(m_mutex);
 		auto            mapping = m_maps.upper_bound(vaddr);
 		if (mapping == m_maps.begin()) {
@@ -200,6 +220,9 @@ public:
 		const auto& entry = std::prev(mapping)->second;
 		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) {
 			return nullptr;
+		}
+		if (cache_on) {
+			cached = {this, m_generation.load(std::memory_order_acquire), entry};
 		}
 		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
@@ -270,6 +293,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -281,6 +305,7 @@ public:
 		}
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -365,6 +390,7 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
+			m_generation.fetch_add(1, std::memory_order_acq_rel);
 			auto            next = m_maps.upper_bound(vaddr);
 			if (next != m_maps.begin()) {
 				auto entry = std::prev(next);
@@ -393,6 +419,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				m_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -441,6 +468,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -451,6 +479,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.erase(old.vaddr);
 		if (left_size != 0) {
 			m_maps.emplace(old.vaddr,
@@ -500,6 +529,26 @@ private:
 			return false;
 		}
 
+		// The last mapping this thread transferred through, valid while no map or unmap happened
+		// since (m_generation). Uploads read guest memory tens of thousands of times a second and
+		// queued on m_mutex (~26% of the command processor's time in Wolverine).
+		struct CachedEntry {
+			const void* owner      = nullptr;
+			uint64_t    generation = 0;
+			MapEntry    entry {};
+		};
+		thread_local CachedEntry cached;
+		static auto& use_cache = Common::LiveSwitches::Get("KYTY_BACKING_CACHE", 1);
+		if (use_cache.load(std::memory_order_relaxed) != 0 && cached.owner == this &&
+		    cached.generation == m_generation.load(std::memory_order_acquire) &&
+		    vaddr >= cached.entry.vaddr && vaddr + size <= cached.entry.vaddr + cached.entry.size) {
+			const auto offset = cached.entry.backing_offset + vaddr - cached.entry.vaddr;
+			if (RangeOk(offset, size)) {
+				transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
+				return true;
+			}
+		}
+
 		std::lock_guard lock(m_mutex);
 		const auto      end     = vaddr + size;
 		auto            current = vaddr;
@@ -507,6 +556,9 @@ private:
 			MapEntry entry {};
 			if (!FindContainingUnlocked(current, 1, &entry)) {
 				return false;
+			}
+			if (current == vaddr) {
+				cached = {this, m_generation.load(std::memory_order_acquire), entry};
 			}
 			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
 			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
@@ -662,6 +714,8 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Bumped by every change of m_maps (TryTransferBacking's per-thread entry cache).
+	std::atomic<uint64_t>        m_generation {0};
 };
 
 class GuestAddressSpace {
@@ -721,6 +775,9 @@ public:
 
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
+	// KYTY_LOCAL_HACK research: lock addresses, to match strace futex lines.
+	[[nodiscard]] const void* MutexAddress() const { return &m_mutex; }
+	[[nodiscard]] const void* BackingMutexAddress() const { return m_backing->MutexAddress(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
@@ -792,6 +849,15 @@ public:
 			return false;
 		}
 
+		// KYTY_LOCAL_HACK KYTY_AS_SHARED_PROTECT (live, default 1): the tracker's protections
+		// only read m_mapped, so they share the lock; the PageManager region lock already
+		// orders protections of one page. Map/unmap stay exclusive. The CP queued here behind
+		// game-thread fault handlers' mprotect calls (~1.2k futex waits/s).
+		static auto& shared = Common::LiveSwitches::Get("KYTY_AS_SHARED_PROTECT", 1);
+		if (shared.load(std::memory_order_relaxed) != 0) {
+			std::shared_lock lock(m_mutex);
+			return ProtectMappedUnlocked(vaddr, size, mode);
+		}
 		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
@@ -1390,7 +1456,7 @@ private:
 #endif
 	}
 
-	std::mutex                                 m_mutex;
+	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

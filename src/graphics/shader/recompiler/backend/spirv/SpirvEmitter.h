@@ -20,6 +20,12 @@ struct HostImageFeatures {
 
 void              SetHostImageFeatures(const HostImageFeatures& features);
 HostImageFeatures GetHostImageFeatures();
+// Device-clock ticks per tick of the PS5's 100 MHz S_MEMREALTIME clock (8 by default).
+void SetShaderClockDivisor(uint32_t divisor);
+// Added to the rescaled device clock so shaders and the CPU-side reference clock share an epoch.
+void SetShaderClockOffset(uint64_t offset);
+// KYTY_LOCAL_HACK (debug probe): where DebugProbe records go (0 disables them).
+void SetDebugProbeAddress(uint64_t address);
 
 // Why a mesh program cannot run in passes (ShaderMeshInputInfo::passes), or nullptr.
 [[nodiscard]] const char* MeshPassesUnsupported(const IR::Program& program);

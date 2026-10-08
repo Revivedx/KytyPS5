@@ -75,6 +75,11 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	// KYTY_LOCAL_HACK research (KYTY_DRAW_RECORDS): hash of the shader base and the user data
+	// dwords the resource plan reads, set by ProgramCache after materialization.
+	uint64_t                    record_key = 0;
+	// The same without user data pairs that look like 48-bit guest pointers (relocation).
+	uint64_t                    record_key_reloc = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

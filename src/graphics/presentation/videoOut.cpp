@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "common/liveSwitches.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -541,6 +542,13 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 }
 
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
+	// KYTY_LOCAL_HACK research: the game's output buffer size, printed when it changes.
+	static std::atomic<uint64_t> last_size {0};
+	const uint64_t size = (uint64_t {attribute.width} << 32u) | attribute.height;
+	if (last_size.exchange(size, std::memory_order_relaxed) != size) {
+		::printf("VideoOut buffer: %ux%u\n", attribute.width, attribute.height);
+		std::fflush(stdout);
+	}
 	const auto compression = Graphics::ClassifyVideoOutCompression(
 	    category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, buffer.metadata_address,
 	    attribute.dcc_control, attribute.dcc_cb_register_clear_color);
@@ -871,7 +879,12 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
 		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		// KYTY_LOCAL_HACK KYTY_VBLANK_HZ (live, default 0 = config): tick rate of the virtual vblank only;
+		// the refresh rate reported to the game stays the configured one. Research: flips wait less.
+		static auto& vblank_hz = Common::LiveSwitches::Get("KYTY_VBLANK_HZ", 0);
+		const auto   hz_live   = vblank_hz.load(std::memory_order_relaxed);
+		const auto   refresh   = hz_live >= 30 && hz_live <= 1000 ? static_cast<uint32_t>(hz_live)
+		                                                            : std::max(Config::GetVblankFrequency(), 1u);
 		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
@@ -1801,6 +1814,12 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	// KYTY_LOCAL_HACK KYTY_VIDEO_1080P=1 (live, default 0): report a 1080p display, so the game
+	// sizes its output (and its dynamic render resolution) for 1080p instead of 4K.
+	static auto& force_1080p = Common::LiveSwitches::Get("KYTY_VIDEO_1080P", 0);
+	if (force_1080p.load(std::memory_order_relaxed) != 0) {
+		status->resolution = 1u;
+	}
 	status->dynamicRange = 1;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

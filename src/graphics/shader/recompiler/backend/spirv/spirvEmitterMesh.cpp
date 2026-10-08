@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -99,8 +100,20 @@ void MarkZeroPosition(EmitterState& state, uint32_t position, uint32_t vertex) {
 	const auto equal = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal, position,
 	                          state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4)));
-	const auto zero = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAll, TypeBool(state), zero, equal);
+	const auto all_zero = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAll, TypeBool(state), all_zero, equal);
+	// Non-finite positions are guest vertex kills too (see the vertex-shader clip guard).
+	const auto inf     = state.builder.AllocateId();
+	const auto nan     = state.builder.AllocateId();
+	const auto any_inf = state.builder.AllocateId();
+	const auto any_nan = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsInf, TypeBoolVector(state, 4), inf, position);
+	state.builder.AddFunction(spv::OpIsNan, TypeBoolVector(state, 4), nan, position);
+	state.builder.AddFunction(spv::OpAny, TypeBool(state), any_inf, inf);
+	state.builder.AddFunction(spv::OpAny, TypeBool(state), any_nan, nan);
+	const auto zero =
+	    Binary(state, spv::OpLogicalOr, TypeBool(state), all_zero,
+	           Binary(state, spv::OpLogicalOr, TypeBool(state), any_inf, any_nan));
 	EmitIfCondition(state, zero, [&] {
 		const auto bit = Binary(
 		    state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
@@ -307,6 +320,50 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	EmitLabel(state, state.builder.AllocateId());
 	state.lane_half = 0;
 	SelectMeshPass(state, 0);
+	{
+		// Workgroup memory starts undefined. Guest mesh shaders skip GS_ALLOC_REQ when a
+		// meshlet keeps no primitive (Wolverine: S_CMP_EQ_U32 s62, 0; S_CBRANCH_SCC1 over
+		// S_SENDMSG), which outputs nothing on hardware; without this clear the stale
+		// allocation emits garbage primitives (screen-wide wedges). EmitMeshAllocate writes
+		// from this same invocation, so program order keeps the guest's counts.
+		const auto first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first,
+		                          EmitLocalInvocationIndex(state), ConstantU32(state, 0));
+		EmitIfCondition(state, first, [&] {
+			for (uint32_t field = 0; field < 2; field++) {
+				state.builder.AddFunction(
+				    spv::OpStore,
+				    MeshElement(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+				                TypeU32(state), ConstantU32(state, field)),
+				    ConstantU32(state, 0));
+			}
+		});
+	}
+	{
+		// Per-lane export slots start as a killed vertex (NaN position, culled by the mask
+		// below) and a null primitive: a guest lane that exports nothing has no vertex or
+		// primitive on hardware, but its Private slot would be copied out undefined.
+		const auto nan       = ConstantF32Value(state, std::numeric_limits<float>::quiet_NaN());
+		const auto nan_vec   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), nan_vec, nan,
+		                          nan, nan, nan);
+		for (uint32_t slot = 0; slot < state.lane_count * state.mesh_passes; slot++) {
+			for (const auto& output: state.outputs) {
+				if (output.kind == IR::StageOutputKind::Position) {
+					state.builder.AddFunction(
+					    spv::OpStore,
+					    MeshElement(state, output.mesh_data_variable, spv::StorageClassPrivate,
+					                TypeF32Vector(state, 4), ConstantU32(state, slot)),
+					    nan_vec);
+				}
+			}
+			state.builder.AddFunction(
+			    spv::OpStore,
+			    MeshElement(state, state.mesh_primitive_data, spv::StorageClassPrivate,
+			                TypeU32(state), ConstantU32(state, slot)),
+			    ConstantU32(state, 0x80000000u));
+		}
+	}
 	if (state.mesh_zero_position_mask != 0) {
 		// Cleared before the guest code: the barrier after it orders the clear before the marks.
 		const auto first = state.builder.AllocateId();
@@ -405,6 +462,14 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			auto culled = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), culled, null_bit,
 			                          ConstantU32(state, 0));
+			// KYTY_LOCAL_HACK (research): KYTY_MESH_IGNORE_NULL=1 draws guest-culled primitives.
+			static const bool ignore_null = [] {
+				const char* value = std::getenv("KYTY_MESH_IGNORE_NULL");
+				return value != nullptr && value[0] == '1';
+			}();
+			if (ignore_null) {
+				culled = ConstantBool(state, false);
+			}
 			if (state.mesh_zero_position_mask != 0) {
 				for (const auto component: vertex) {
 					culled = Binary(state, spv::OpLogicalOr, TypeBool(state), culled,

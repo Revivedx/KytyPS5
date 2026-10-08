@@ -143,6 +143,18 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
+	// KYTY_LOCAL_HACK (BC storage shadow, KYTY_BC_STORAGE_SHADOW, default 1): RADV has no
+	// block-texel views of 3D images with 16-byte blocks (BC5/BC6H/BC7), so guest compute writes
+	// into such a volume through an R32G32B32A32 view were undefined (rainbow sparkles on lit
+	// particles). Their storage views use an uncompressed image of the blocks instead: the volume
+	// is copied into it before the dispatch and back after it.
+	[[nodiscard]] bool HasStorageShadow() const { return storage_shadow.image != nullptr; }
+	void               ShadowPreCopy(const CommandRecorder& recorder);
+	void               ShadowWriteBack(const CommandRecorder& recorder);
+	VulkanImage                  storage_shadow;
+	vk::ImageLayout              storage_shadow_layout = vk::ImageLayout::eUndefined;
+	std::vector<CachedImageView> storage_shadow_views;
+
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -161,6 +173,13 @@ public:
 
 private:
 	friend struct ImageTestAccess;
+
+	[[nodiscard]] vk::ImageView FindShadowView(const ImageViewInfo& normalized);
+	struct ShadowCopy {
+		std::array<vk::ImageCopy, 16> regions {};
+		uint32_t                      count = 0;
+	};
+	[[nodiscard]] ShadowCopy ShadowRegions(bool to_shadow) const;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,

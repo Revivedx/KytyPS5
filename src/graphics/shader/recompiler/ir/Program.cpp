@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/liveSwitches.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <fmt/format.h>
@@ -207,6 +208,12 @@ bool HasShaderMemoryWrites(const Program& program) {
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {
+	// KYTY_LOCAL_HACK: KYTY_IR_VALIDATE=0 (live, default 1) skips this debug check; in gameplay it is
+	// ~9% of the GPU thread while new shaders compile (two runs per program).
+	static auto& validate = Common::LiveSwitches::Get("KYTY_IR_VALIDATE", 1);
+	if (validate.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
 	if (program.blocks.size() != program.block_info.size() ||
 	    program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");

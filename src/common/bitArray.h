@@ -155,6 +155,14 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	// Whether any / every bit in [start, end) is set, word by word (no copy of the array).
+	[[nodiscard]] constexpr bool AnyInRange(size_t start, size_t end) const {
+		return CheckRange<false>(start, end);
+	}
+	[[nodiscard]] constexpr bool AllInRange(size_t start, size_t end) const {
+		return CheckRange<true>(start, end);
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};
@@ -249,6 +257,32 @@ public:
 			word = ~word;
 		}
 		return result;
+	}
+
+	template <bool all>
+	[[nodiscard]] constexpr bool CheckRange(size_t start, size_t end) const {
+		if (start >= end || end > N) {
+			return all;
+		}
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto start_bit  = start % BITS_PER_WORD;
+		const auto end_bit    = (end - 1) % BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << start_bit;
+		const auto end_mask =
+		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+		for (auto word = first_word; word <= last_word; word++) {
+			auto mask = ~uint64_t {0};
+			if (word == first_word) mask &= start_mask;
+			if (word == last_word) mask &= end_mask;
+			const auto bits = m_data[word] & mask;
+			if constexpr (all) {
+				if (bits != mask) return false;
+			} else {
+				if (bits != 0) return true;
+			}
+		}
+		return all;
 	}
 
 private:

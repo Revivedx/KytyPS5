@@ -48,6 +48,29 @@ public:
 			}
 		});
 	}
+	// Marks a range CPU-modified, lifting its write protection, except the pages the GPU holds
+	// newer data for: those stay protected and nothing is read back. For write faults that
+	// continue a sequential stream (KYTY_FAULT_AHEAD); marking unwritten pages only costs uploads.
+	void InvalidateRegionAhead(uint64_t vaddr, uint64_t size) noexcept {
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			uint64_t         run   = offset;
+			const auto       flush = [&](uint64_t end) {
+                if (end > run) {
+                    manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + run,
+				                                                       end - run);
+                }
+			};
+			for (uint64_t page = offset; page < offset + bytes; page += TRACKER_PAGE_SIZE) {
+				if (manager->IsModified<DirtySource::Gpu>(page, TRACKER_PAGE_SIZE)) {
+					flush(page);
+					run = page + TRACKER_PAGE_SIZE;
+				}
+			}
+			flush(offset + bytes);
+		});
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -105,7 +128,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+		EnsureRegions(vaddr, size);
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		const auto  upload_region = [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
             manager->lock.lock();
@@ -230,8 +253,36 @@ private:
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
+	// KYTY_LOCAL_HACK KYTY_CREATED_BITMAP (live, default 1): ForEachUploadRange made sure every
+	// region of the range exists by loading each m_regions entry; read syncs average ~500 MiB
+	// (~125 regions, ~280k syncs/s in Wolverine) -> ~11% of the CP (pf2 perf 2026-10-06). One bit per
+	// created region (set after the manager is published) checks 64 regions per word instead.
+	static bool UseCreatedBitmap();
+	void        EnsureRegions(uint64_t vaddr, uint64_t size) {
+        if (!UseCreatedBitmap()) {
+            Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+            return;
+        }
+        ValidateRange(vaddr, size);
+        const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+        const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+        for (uint64_t word = first / 64; word <= last / 64; word++) {
+            const uint64_t lo   = word == first / 64 ? first % 64 : 0;
+            const uint64_t hi   = word == last / 64 ? last % 64 : 63;
+            const uint64_t span = hi - lo + 1;
+            const uint64_t mask = span == 64 ? ~uint64_t {0} : ((uint64_t {1} << span) - 1) << lo;
+            uint64_t missing = mask & ~m_created_bits[word].load(std::memory_order_acquire);
+            while (missing != 0) {
+                (void)GetOrCreateRegion(word * 64 + static_cast<uint64_t>(std::countr_zero(missing)));
+                missing &= missing - 1;
+            }
+        }
+	}
+
+
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_summary_bits;
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_created_bits;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

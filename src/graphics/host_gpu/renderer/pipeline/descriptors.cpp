@@ -33,7 +33,9 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
+#include <unordered_map>
 #include <unordered_set>
+#include <xxhash.h>
 #include <mutex>
 #include <algorithm>
 #include <cinttypes>
@@ -594,6 +596,62 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
+namespace {
+
+// KYTY_LOCAL_HACK port of Senaxx 50a04054: ResolveTexture's description of a texture (tiling,
+// sizes, mip layout, view) depends only on the T# and on how the shader uses the image; it was
+// computed again for every bound image of every draw. The texture cache lookup that follows still
+// runs every time, on a copy. KYTY_TEXTURE_DESC_CACHE (live, default 1) turns it off with 0.
+struct TextureDescKey {
+	std::array<uint32_t, 8> dwords {};
+	uint32_t                resource_class = 0;
+	uint32_t                numeric_class  = 0;
+	uint32_t                dimension      = 0;
+	uint32_t                mip_mode       = 0;
+	uint32_t                mip_count      = 0;
+	uint32_t                conversion     = 0;
+	uint32_t                swizzle        = 0;
+	uint32_t                flags          = 0;
+
+	bool operator==(const TextureDescKey&) const = default;
+};
+static_assert(sizeof(TextureDescKey) == 64);
+
+struct TextureDescKeyHash {
+	size_t operator()(const TextureDescKey& key) const noexcept {
+		return static_cast<size_t>(XXH3_64bits(&key, sizeof(key)));
+	}
+};
+
+struct TextureDescEntry {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint32_t                size              = 0;
+	bool                    shader_conversion = false;
+};
+
+TextureDescKey MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                  const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureDescKey key;
+	std::copy_n(value.dwords.begin(), 8, key.dwords.begin());
+	key.resource_class = static_cast<uint32_t>(resource.resource_class);
+	key.numeric_class  = static_cast<uint32_t>(resource.numeric_class);
+	key.dimension      = static_cast<uint32_t>(resource.dimension);
+	key.mip_mode       = static_cast<uint32_t>(resource.mip_mode);
+	key.mip_count      = resource.mip_count;
+	key.conversion     = static_cast<uint32_t>(resource.conversion_format);
+	key.swizzle        = resource.shader_swizzle;
+	key.flags = (resource.read ? 1u : 0u) | (resource.written ? 2u : 0u) |
+	            (resource.atomic ? 4u : 0u) | (resource.depth_compare ? 8u : 0u) |
+	            (resource.cube ? 16u : 0u) | (resource.r128 ? 32u : 0u) |
+	            (resource.bindless ? 64u : 0u) | (resource.atomic64 ? 128u : 0u) |
+	            (value.dword_count << 8u);
+	return key;
+}
+
+} // namespace
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -611,6 +669,18 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
+	}
+
+	thread_local std::unordered_map<TextureDescKey, TextureDescEntry, TextureDescKeyHash> desc_cache;
+	static auto& desc_cache_switch = Common::LiveSwitches::Get("KYTY_TEXTURE_DESC_CACHE", 1);
+	const bool   use_desc_cache    = desc_cache_switch.load(std::memory_order_relaxed) != 0;
+	const auto   desc_key          = use_desc_cache ? MakeTextureDescKey(resource, value) : TextureDescKey {};
+	if (use_desc_cache) {
+		if (const auto it = desc_cache.find(desc_key); it != desc_cache.end()) {
+			return FindResolvedTexture(resource, descriptor, it->second.desc,
+			                           it->second.shader_conversion, it->second.pixel_format,
+			                           it->second.view_format, it->second.size);
+		}
 	}
 
 	const auto address         = descriptor.Base40();
@@ -752,6 +822,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
+	if (use_desc_cache) {
+		if (desc_cache.size() >= 65536) {
+			desc_cache.clear();
+		}
+		desc_cache.emplace(desc_key, TextureDescEntry {desc, pixel_format, view_format, size.size,
+		                                               shader_conversion});
+	}
+	return FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
+	                           pixel_format, view_format, size.size);
+}
+
+// ResolveTexture's texture cache lookup for a description (FindImage may adjust it).
+TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                                   const ShaderTextureResource&               descriptor,
+                                                   TextureCache::ImageDesc desc,
+                                                   bool shader_conversion, vk::Format pixel_format,
+                                                   vk::Format view_format, uint32_t size) {
+	auto&      texture_cache       = m_context.GetTextureCache();
+	const bool storage             = resource.written;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -762,8 +851,22 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
 	} else if (storage) {
+		if (image->info.IsBlock()) {
+			// KYTY_LOCAL_HACK: report guest writes into block-compressed images once per format pair.
+			static std::mutex                              bc_mutex;
+			static std::vector<std::pair<int, int>>        bc_seen;
+			const std::pair<int, int> key {static_cast<int>(image->info.pixel_format),
+			                               static_cast<int>(view_format)};
+			std::lock_guard bc_lock(bc_mutex);
+			if (std::find(bc_seen.begin(), bc_seen.end(), key) == bc_seen.end()) {
+				bc_seen.push_back(key);
+				printf("BCSTORE: storage bind of %s image %ux%u as %s\n",
+				       vk::to_string(image->info.pixel_format).c_str(), image->info.extent.width,
+				       image->info.extent.height, vk::to_string(view_format).c_str());
+			}
+		}
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
@@ -1144,6 +1247,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	const bool phases      = DrawRecordCensus::PhasesOn();
+	uint64_t   phase_start = phases ? DrawRecordCensus::NowNs() : 0;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
@@ -1151,6 +1256,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
+	if (phases) DrawRecordCensus::Phase(8, phase_start);
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
@@ -1165,6 +1271,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
+	if (phases) DrawRecordCensus::Phase(9, phase_start);
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
@@ -1402,6 +1509,18 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// KYTY_LOCAL_HACK (BC storage shadow): copy what the dispatch wrote into the shadows back into
+// their block-compressed images (Image::ShadowWriteBack).
+void RenderExecutor::FlushShadowWritebacks(const CommandRecorder& recorder) {
+	for (const auto id: m_shadow_writebacks) {
+		auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+		if (image != nullptr && image->HasStorageShadow()) {
+			image->ShadowWriteBack(recorder);
+		}
+	}
+	m_shadow_writebacks.clear();
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1451,9 +1570,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			     what, reader_hash, address, size, writer_hash, written_address, written_size);
 		}
 	};
+	// The check only reports; KYTY_OVERLAP_CHECK=0 (live) skips it, for same-process A/B of its cost.
+	static auto& overlap_check = Common::LiveSwitches::Get("KYTY_OVERLAP_CHECK", 1);
+	const bool   check_overlap = overlap_check.load(std::memory_order_relaxed) != 0;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
-		if (reads.empty()) continue;
+		if (!check_overlap || reads.empty()) continue;
 		const auto reader_hash = reader->runtime->program->shader_hash;
 		for (const auto* writer: prepared_bindings) {
 			if (writer->runtime->program->has_address_writes) {
@@ -1576,6 +1698,22 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+			if (storage && image.HasStorageShadow()) {
+				if (pipeline_bind_point == vk::PipelineBindPoint::eCompute) {
+					image.ShadowPreCopy(vk_buffer);
+					if (std::ranges::find(m_shadow_writebacks, descriptors.images[i].image_id) ==
+					    m_shadow_writebacks.end()) {
+						m_shadow_writebacks.push_back(descriptors.images[i].image_id);
+					}
+				} else {
+					static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+					if (!warned.test_and_set()) {
+						std::printf("BC storage shadow: graphics storage write not copied back\n");
+					}
+				}
+				binding.layout = vk::ImageLayout::eGeneral;
+				continue;
+			}
 			if (image.info.data.Empty()) {
 				image.Transit(vk::ImageLayout::eGeneral,
 				              storage ? vk::AccessFlagBits2::eShaderRead |

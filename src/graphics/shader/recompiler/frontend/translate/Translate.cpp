@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -1167,13 +1169,25 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto group = builtin(IR::StageInputKind::WorkgroupId, 0);
+			// Hosts cap each mesh dimension (65535 on RADV); larger draws continue along Z. CPU-side
+			// fast launch issues a draw per 65535 groups instead (see ExecutePreparedDrawResolved).
+			const bool z_slices = !mesh.fast_launch || mesh.draw_data_indirect;
+			const auto group = !z_slices
+			                       ? builtin(IR::StageInputKind::WorkgroupId, 0)
+			                       : entry_ir.IAdd(builtin(IR::StageInputKind::WorkgroupId, 0),
+			                                       entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 2),
+			                                                     u32(MeshGroupSplitStride)));
 			const auto primitive_chunk = mesh.fast_launch ? group :
 			    entry_ir.IMul(group, u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
 			const auto chunk = mesh.fast_launch ? group : entry_ir.IMul(primitive_chunk, step);
-			const auto vertices = mesh.fast_launch ? u32(mesh.vertices_per_group) :
+			// GPU-converted fast launch: draw(3) holds the group count (MeshIndirectDraw); groups of
+			// the last Z slice past it emit nothing.
+			const auto vertices = mesh.fast_launch && mesh.draw_data_indirect
+			                          ? entry_ir.Select(entry_ir.ULessThan(group, draw(3)),
+			                                            u32(mesh.vertices_per_group), u32(0))
+			                      : mesh.fast_launch ? u32(mesh.vertices_per_group) :
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
 			const auto primitives = entry_ir.Select(
 			    entry_ir.ULessThan(vertices, size), u32(0),
@@ -1366,6 +1380,89 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			translator.TranslateInstruction(instruction);
+			// KYTY_LOCAL_HACK (debug probe): KYTY_PROBE_HASH=<hex> KYTY_PROBE_PC=<hex>
+			// KYTY_PROBE_VGPRS=<n,n,...> records those VGPRs after the instruction at that pc.
+			static const auto probe = [] {
+				struct Probe {
+					uint64_t                hash = 0;
+					uint32_t                pc   = UINT32_MAX;
+					std::array<uint32_t, 7> vgprs {};
+				} result;
+				result.vgprs.fill(UINT32_MAX);
+				const char* hash = std::getenv("KYTY_PROBE_HASH");
+				const char* pc   = std::getenv("KYTY_PROBE_PC");
+				const char* regs = std::getenv("KYTY_PROBE_VGPRS");
+				if (hash == nullptr || pc == nullptr || regs == nullptr) {
+					return result;
+				}
+				result.hash = std::strtoull(hash, nullptr, 16);
+				result.pc   = static_cast<uint32_t>(std::strtoul(pc, nullptr, 16));
+				const char* cursor = regs;
+				for (auto& reg: result.vgprs) {
+					char* end = nullptr;
+					const auto value = std::strtoul(cursor, &end, 10);
+					if (end == cursor) {
+						break;
+					}
+					reg    = static_cast<uint32_t>(value);
+					cursor = *end == ',' ? end + 1 : end;
+				}
+				return result;
+			}();
+			if (probe.hash != 0 && probe.hash == options.shader_hash &&
+			    probe.pc == instruction.pc) {
+				translator.EmitDebugProbe(instruction.pc, probe.vgprs);
+			}
+			// KYTY_PROBE_STASH_PC=<hex> KYTY_PROBE_STASH_VGPRS=<n,n,n>: copied to v253..v255
+			// after that instruction, so the probe can record them as 253,254,255.
+			static const auto stash = [] {
+				std::pair<uint32_t, std::array<uint32_t, 3>> result {UINT32_MAX, {}};
+				result.second.fill(UINT32_MAX);
+				const char* pc   = std::getenv("KYTY_PROBE_STASH_PC");
+				const char* regs = std::getenv("KYTY_PROBE_STASH_VGPRS");
+				if (pc == nullptr || regs == nullptr) {
+					return result;
+				}
+				result.first       = static_cast<uint32_t>(std::strtoul(pc, nullptr, 16));
+				const char* cursor = regs;
+				for (auto& reg: result.second) {
+					char* end = nullptr;
+					const auto value = std::strtoul(cursor, &end, 10);
+					if (end == cursor) {
+						break;
+					}
+					reg    = static_cast<uint32_t>(value);
+					cursor = *end == ',' ? end + 1 : end;
+				}
+				return result;
+			}();
+			if (probe.hash != 0 && probe.hash == options.shader_hash &&
+			    stash.first == instruction.pc) {
+				translator.StashDebugProbe(stash.second);
+			}
+			// KYTY_PROBE_SET=<hash hex>:<pc hex>:<vgpr>:<value hex>[;...]: overwrite a VGPR of that
+			// shader after the instruction at that pc.
+			static const auto overrides = [] {
+				std::vector<std::array<uint64_t, 4>> result;
+				const char* value = std::getenv("KYTY_PROBE_SET");
+				while (value != nullptr && *value != 0) {
+					std::array<uint64_t, 4> entry {};
+					char* end = nullptr;
+					entry[0] = std::strtoull(value, &end, 16);
+					entry[1] = std::strtoull(end + 1, &end, 16);
+					entry[2] = std::strtoull(end + 1, &end, 10);
+					entry[3] = std::strtoull(end + 1, &end, 16);
+					result.push_back(entry);
+					value = *end == ';' ? end + 1 : nullptr;
+				}
+				return result;
+			}();
+			for (const auto& entry: overrides) {
+				if (entry[0] == options.shader_hash && entry[1] == instruction.pc) {
+					translator.OverrideDebugVgpr(static_cast<uint32_t>(entry[2]),
+					                             static_cast<uint32_t>(entry[3]));
+				}
+			}
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
 	}

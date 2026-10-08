@@ -15,6 +15,13 @@
 #include <cinttypes>
 #include <cstdio>
 #include <deque>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <map>
+#include <mutex>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -209,8 +216,226 @@ struct CommandScheduler::GpuTimer {
 	std::chrono::steady_clock::time_point report   = std::chrono::steady_clock::now();
 };
 
+namespace {
+std::mutex                                                     g_caller_mutex;
+std::map<std::tuple<uint32_t, uintptr_t, uintptr_t>, uint64_t> g_callers;
+} // namespace
+
+void NoteRecorderCaller(uint32_t what) {
+	std::array<void*, 4> frames {};
+	const int            count = backtrace(frames.data(), static_cast<int>(frames.size()));
+	Dl_info              info {};
+	const auto base = dladdr(reinterpret_cast<void*>(&NoteRecorderCaller), &info) != 0
+	                      ? reinterpret_cast<uintptr_t>(info.dli_fbase)
+	                      : 0;
+	const auto offset = [&](int index) {
+		return index < count ? reinterpret_cast<uintptr_t>(frames[index]) - base : 0;
+	};
+	std::lock_guard lock(g_caller_mutex);
+	g_callers[{what, offset(1), offset(2)}]++;
+}
+
+static void ReportRecorderCallers(double elapsed) {
+	std::vector<std::pair<std::tuple<uint32_t, uintptr_t, uintptr_t>, uint64_t>> sorted;
+	{
+		std::lock_guard lock(g_caller_mutex);
+		sorted.assign(g_callers.begin(), g_callers.end());
+		g_callers.clear();
+	}
+	std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+	for (size_t i = 0; i < std::min<size_t>(sorted.size(), 24); i++) {
+		const auto& [key, n] = sorted[i];
+		::printf("  GPU profile caller: what %u per s %.0f at 0x%zx < 0x%zx\n", std::get<0>(key),
+		         static_cast<double>(n) / elapsed, std::get<1>(key), std::get<2>(key));
+	}
+}
+
+// KYTY_LOCAL_HACK (research): KYTY_GPU_PROFILE=1 (live). Each command buffer takes one of
+// Regions regions of the query pool, reset when it begins; a timestamp at its start and after
+// every profiled draw or dispatch (all earlier work complete) gives each operation the GPU time
+// since the previous mark, its barriers included. Collected when the tick completes.
+struct CommandScheduler::GpuProfiler {
+	static constexpr uint32_t Regions     = 8;
+	static constexpr uint32_t RegionSlots = 4096;
+
+	struct Mark {
+		uint32_t kind   = 0;
+		uint64_t shader = 0;
+		uint64_t pixel  = 0;
+	};
+	struct Key {
+		uint32_t kind;
+		uint64_t shader;
+		uint64_t pixel;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const noexcept {
+			return std::hash<uint64_t>()(key.shader * 31u + key.pixel * 7u + key.kind);
+		}
+	};
+	struct Stats {
+		double   ns    = 0;
+		uint64_t count = 0;
+	};
+	struct Pending {
+		uint64_t tick   = 0;
+		uint32_t region = 0;
+		uint32_t used   = 0;
+	};
+
+	explicit GpuProfiler(GraphicContext& graphics): graphics(graphics) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = Regions * RegionSlots;
+		if (graphics.device.createQueryPool(&info, nullptr, &pool) != vk::Result::eSuccess) {
+			pool = nullptr;
+		}
+		period_ns = graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+		for (auto& region: marks) {
+			region.resize(RegionSlots);
+		}
+	}
+	~GpuProfiler() {
+		if (pool) {
+			graphics.device.destroyQueryPool(pool, nullptr);
+		}
+	}
+	KYTY_CLASS_NO_COPY(GpuProfiler);
+
+	static bool Enabled() {
+		static auto& enabled = Common::LiveSwitches::Get("KYTY_GPU_PROFILE", 0);
+		return enabled.load(std::memory_order_relaxed) != 0;
+	}
+
+	void Begin(vk::CommandBuffer command) {
+		open_region = UINT32_MAX;
+		if (!pool || !Enabled() || pending.size() >= Regions) {
+			return;
+		}
+		open_region = next_region++ % Regions;
+		used        = 0;
+		command.resetQueryPool(pool, open_region * RegionSlots, RegionSlots);
+		Write(command, {UINT32_MAX, 0, 0});
+	}
+	void Write(vk::CommandBuffer command, const Mark& mark) {
+		if (open_region == UINT32_MAX || used >= RegionSlots) {
+			return;
+		}
+		marks[open_region][used] = mark;
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool,
+		                        open_region * RegionSlots + used);
+		used++;
+	}
+	void Submitted(uint64_t tick) {
+		if (open_region != UINT32_MAX) {
+			pending.push_back({tick, open_region, used});
+			open_region = UINT32_MAX;
+		}
+	}
+
+	template <typename IsFree>
+	void Collect(IsFree&& is_free) {
+		while (!pending.empty() && is_free(pending.front().tick)) {
+			const auto entry = pending.front();
+			pending.pop_front();
+			if (entry.used < 2) {
+				continue;
+			}
+			stamps.resize(entry.used);
+			if (graphics.device.getQueryPoolResults(
+			        pool, entry.region * RegionSlots, entry.used, entry.used * sizeof(uint64_t),
+			        stamps.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64) !=
+			    vk::Result::eSuccess) {
+				continue;
+			}
+			for (uint32_t i = 1; i < entry.used; i++) {
+				if (stamps[i] < stamps[i - 1]) {
+					continue;
+				}
+				const auto& mark  = marks[entry.region][i];
+				auto&       stats = by_key[{mark.kind, mark.shader, mark.pixel}];
+				const auto  ns    = static_cast<double>(stamps[i] - stamps[i - 1]) * period_ns;
+				stats.ns += ns;
+				stats.count++;
+				total_ns += ns;
+			}
+			buffers++;
+		}
+		const auto now     = std::chrono::steady_clock::now();
+		const auto elapsed = std::chrono::duration<double>(now - report).count();
+		if (elapsed < 5.0 || buffers == 0) {
+			return;
+		}
+		std::vector<std::pair<Key, Stats>> sorted(by_key.begin(), by_key.end());
+		std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+		std::array<double, 5>   kind_ns {};
+		std::array<uint64_t, 5> kind_count {};
+		for (const auto& [key, stats]: sorted) {
+			if (key.kind < kind_ns.size()) {
+				kind_ns[key.kind] += stats.ns;
+				kind_count[key.kind] += stats.count;
+			}
+		}
+		::printf("GPU profile (%.1f s): %.1f ms/s in %" PRIu64 " command buffers; by kind ms/s (ops):"
+		         " cs %.1f (%" PRIu64 ") cs-ind %.1f (%" PRIu64 ") draw %.1f (%" PRIu64
+		         ") mesh %.1f (%" PRIu64 ") mesh-ind %.1f (%" PRIu64 ")\n",
+		         elapsed, total_ns / 1e6 / elapsed, buffers, kind_ns[0] / 1e6 / elapsed,
+		         kind_count[0], kind_ns[1] / 1e6 / elapsed, kind_count[1],
+		         kind_ns[2] / 1e6 / elapsed, kind_count[2], kind_ns[3] / 1e6 / elapsed,
+		         kind_count[3], kind_ns[4] / 1e6 / elapsed, kind_count[4]);
+		::printf("GPU profile recorded per s: %.0f barriers, %.0f barriers2, %.0f render pass begins, "
+		         "%.0f ends\n",
+		         g_recorder_counts[0].exchange(0) / elapsed, g_recorder_counts[1].exchange(0) / elapsed,
+		         g_recorder_counts[2].exchange(0) / elapsed, g_recorder_counts[3].exchange(0) / elapsed);
+		static auto& callers = Common::LiveSwitches::Get("KYTY_GPU_PROFILE_CALLERS", 0);
+		g_recorder_callers.store(callers.load(std::memory_order_relaxed) != 0,
+		                         std::memory_order_relaxed);
+		ReportRecorderCallers(elapsed);
+		for (size_t i = 0; i < std::min<size_t>(sorted.size(), 30); i++) {
+			const auto& [key, stats] = sorted[i];
+			::printf("  GPU profile top %2zu: kind %u shader %016" PRIx64 " ps %016" PRIx64
+			         " %.2f ms/s, %" PRIu64 " ops, %.1f us each\n",
+			         i, key.kind, key.shader, key.pixel, stats.ns / 1e6 / elapsed, stats.count,
+			         stats.ns / 1e3 / static_cast<double>(stats.count));
+		}
+		std::fflush(stdout);
+		by_key.clear();
+		total_ns = 0;
+		buffers  = 0;
+		report   = now;
+	}
+
+	GraphicContext&                                         graphics;
+	vk::QueryPool                                           pool        = nullptr;
+	float                                                   period_ns   = 1.0f;
+	uint32_t                                                next_region = 0;
+	uint32_t                                                open_region = UINT32_MAX;
+	uint32_t                                                used        = 0;
+	std::array<std::vector<Mark>, Regions>                  marks;
+	std::deque<Pending>                                     pending;
+	std::vector<uint64_t>                                   stamps;
+	std::unordered_map<Key, Stats, KeyHash>                 by_key;
+	double                                                  total_ns = 0;
+	uint64_t                                                buffers  = 0;
+	std::chrono::steady_clock::time_point                   report   = std::chrono::steady_clock::now();
+};
+
+void CommandScheduler::ProfileMark(uint32_t kind, uint64_t shader, uint64_t pixel_shader) {
+	if (!GpuProfiler::Enabled()) {
+		return;
+	}
+	const GpuProfiler::Mark mark {kind, shader, pixel_shader};
+	if (m_threaded) {
+		Record([this, mark](vk::CommandBuffer command) { m_gpu_profiler->Write(command, mark); });
+	} else if (m_command.m_buffer) {
+		m_gpu_profiler->Write(m_command.m_buffer, mark);
+	}
+}
+
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
-    : m_gpu_timer(std::make_unique<GpuTimer>(graphics)), m_master(graphics), m_context(context),
+    : m_gpu_timer(std::make_unique<GpuTimer>(graphics)),
+      m_gpu_profiler(std::make_unique<GpuProfiler>(graphics)), m_master(graphics), m_context(context),
       m_graphics(graphics), m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
@@ -329,7 +554,35 @@ void CommandScheduler::Wait(uint64_t tick) {
 
 void CommandScheduler::PopPendingOperations() {
 	KYTY_PROFILER_FUNCTION();
-	m_master.Refresh();
+	// KYTY_LOCAL_HACK KYTY_LAZY_POP (live, default 1): this runs for every draw and dispatch and
+	// asked the driver for the timeline value each time (~2.7k DRM_IOCTL_SYNCOBJ_QUERY per frame,
+	// tp1 2026-10-06). Ask only when the oldest pending operation's tick is already submitted
+	// (a tick still being recorded cannot be done) and not known done, at most every 50 us.
+	static auto& lazy_pop = Common::LiveSwitches::Get("KYTY_LAZY_POP", 1);
+	if (lazy_pop.load(std::memory_order_relaxed) == 0) {
+		m_master.Refresh();
+	} else {
+		uint64_t front_tick = 0;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			if (m_pending_operations.empty()) {
+				return;
+			}
+			front_tick = m_pending_operations.front().tick;
+		}
+		if (!m_master.IsFree(front_tick)) {
+			if (front_tick >= CurrentTick()) {
+				return;
+			}
+			static thread_local auto last_query = std::chrono::steady_clock::time_point {};
+			const auto               now        = std::chrono::steady_clock::now();
+			if (now - last_query < std::chrono::microseconds(50)) {
+				return;
+			}
+			last_query = now;
+			m_master.Refresh();
+		}
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -433,6 +686,11 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	});
 }
 
+bool CommandScheduler::HasPendingPriorityOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_priority_operations.empty() || m_priority_active;
+}
+
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	auto* previous                = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;
@@ -478,6 +736,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.Begin();
 	m_gpu_timer->Collect([this](uint64_t tick) { return IsFree(tick); });
 	m_gpu_timer->Begin(m_command.m_buffer);
+	m_gpu_profiler->Collect([this](uint64_t tick) { return IsFree(tick); });
+	m_gpu_profiler->Begin(m_command.m_buffer);
 	return m_command;
 }
 
@@ -526,6 +786,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	m_gpu_timer->Submitted(tick);
+	m_gpu_profiler->Submitted(tick);
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
@@ -606,6 +867,8 @@ void CommandScheduler::BeginThreadedCommand() {
 		EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
 		m_gpu_timer->Collect([this](uint64_t done) { return IsFree(done); });
 		m_gpu_timer->Begin(m_worker_buffer);
+		m_gpu_profiler->Collect([this](uint64_t done) { return IsFree(done); });
+		m_gpu_profiler->Begin(m_worker_buffer);
 	});
 }
 

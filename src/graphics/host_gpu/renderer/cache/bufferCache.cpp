@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -272,6 +273,7 @@ private:
 public:
 	// GPU thread: set while a guest thread's fault is handled (BufferCache::ReadMemory).
 	inline static thread_local bool s_forwarded = false;
+	[[nodiscard]] static uint64_t CurrentShader() { return s_shader; }
 
 private:
 	std::unordered_map<uint64_t, Entry>   m_entries;
@@ -284,10 +286,59 @@ private:
 	inline static std::atomic<uint64_t> s_compared_bytes {0};
 };
 
-bool DirectReadbackEnabled() {
-	static auto& enabled = Common::LiveSwitches::Get("KYTY_DIRECT_READBACK", 0);
-	return enabled.load(std::memory_order_relaxed) != 0;
+// KYTY_LOCAL_HACK research (printed with KYTY_READBACK_STATS): where the GPU thread's time in the
+// asynchronous readback goes: 0 lookup/unmark, 1 recording the download, 2 the submission (Flush),
+// 3 FinishWriteReadback, 4 the synchronous read of an unregistered region. Only the GPU thread writes.
+struct ReadbackPhases {
+	uint64_t ns[9] {};
+	uint64_t calls[9] {};
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+ReadbackPhases g_rb_phases;
+// 5 sync branch of ReadMemory, 6 BeginWriteReadback, 7 FinishWriteReadback, 8 other callers.
+int g_rb_caller = 8;
+// GPU thread: the readback being served is the GPU thread's own fault, not a guest thread's.
+bool g_rb_own_fault = false;
+// Research: GPU-thread own faults per (program being evaluated, page): ns and count.
+std::map<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>> g_rb_readers;
+struct ReadbackCaller {
+	int previous;
+	explicit ReadbackCaller(int tag): previous(g_rb_caller) { g_rb_caller = tag; }
+	~ReadbackCaller() { g_rb_caller = previous; }
+};
+void NoteReadbackPhase(int phase, std::chrono::steady_clock::time_point start) {
+	const auto now = std::chrono::steady_clock::now();
+	g_rb_phases.ns[phase] += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+	g_rb_phases.calls[phase]++;
+	if (now - g_rb_phases.last >= std::chrono::seconds(5)) {
+		::printf("Readback phases (5 s): lookup %.1f ms/%" PRIu64 ", record %.1f ms/%" PRIu64
+		         ", flush %.1f ms/%" PRIu64 ", finish %.1f ms/%" PRIu64 ", unregistered sync %.1f ms/%" PRIu64
+		         "; ReadMemoryOnGpu by caller: sync-branch %.1f ms/%" PRIu64 ", begin %.1f ms/%" PRIu64
+		         ", finish %.1f ms/%" PRIu64 ", other %.1f ms/%" PRIu64 "\n",
+		         static_cast<double>(g_rb_phases.ns[0]) / 1e6, g_rb_phases.calls[0],
+		         static_cast<double>(g_rb_phases.ns[1]) / 1e6, g_rb_phases.calls[1],
+		         static_cast<double>(g_rb_phases.ns[2]) / 1e6, g_rb_phases.calls[2],
+		         static_cast<double>(g_rb_phases.ns[3]) / 1e6, g_rb_phases.calls[3],
+		         static_cast<double>(g_rb_phases.ns[4]) / 1e6, g_rb_phases.calls[4],
+		         static_cast<double>(g_rb_phases.ns[5]) / 1e6, g_rb_phases.calls[5],
+		         static_cast<double>(g_rb_phases.ns[6]) / 1e6, g_rb_phases.calls[6],
+		         static_cast<double>(g_rb_phases.ns[7]) / 1e6, g_rb_phases.calls[7],
+		         static_cast<double>(g_rb_phases.ns[8]) / 1e6, g_rb_phases.calls[8]);
+		std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>>> top(
+		    g_rb_readers.begin(), g_rb_readers.end());
+		std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+		for (size_t i = 0; i < std::min<size_t>(top.size(), 6); i++) {
+			::printf("  own fault: program 0x%016" PRIx64 " page 0x%" PRIx64 ": %.1f ms / %" PRIu64 "\n",
+			         top[i].first.first, top[i].first.second,
+			         static_cast<double>(top[i].second.first) / 1e6, top[i].second.second);
+		}
+		g_rb_readers.clear();
+		g_rb_phases = {};
+		g_rb_phases.last = now;
+	}
 }
+
 
 bool AsyncWriteReadbackEnabled() {
 	static auto& enabled = Common::LiveSwitches::Get("KYTY_ASYNC_WRITE_READBACK", 0);
@@ -595,7 +646,9 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
 	                                    copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		if (ReadbackStats::On()) {
+		// KYTY_READBACK_COMPARE (live, default 1): the stats' byte comparison of every download.
+		static auto& compare = Common::LiveSwitches::Get("KYTY_READBACK_COMPARE", 1);
+		if (ReadbackStats::On() && compare.load(std::memory_order_relaxed) != 0) {
 			uint64_t             changed = 0;
 			uint64_t             total   = 0;
 			std::vector<uint8_t> current;
@@ -688,6 +741,13 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateMemoryAhead(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
+	if (GuestRange {vaddr, size}.Valid()) {
+		m_memory_tracker.InvalidateRegionAhead(vaddr, size);
+	}
+}
+
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
@@ -763,15 +823,38 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		return;
 	}
-	gpu.SendCommandSync([this, vaddr, size, is_write] {
+	const bool own_fault = GuestGpu::IsGpuThread();
+	gpu.SendCommandSync([this, vaddr, size, is_write, own_fault] {
 		ReadbackStats::s_forwarded = true;
+		ReadbackCaller caller(5);
+		const bool previous_own = std::exchange(g_rb_own_fault, own_fault);
+		const auto own_start    = std::chrono::steady_clock::now();
 		ReadMemoryOnGpu(vaddr, size, is_write);
+		g_rb_own_fault = previous_own;
+		if (own_fault && ReadbackStats::On()) {
+			// Research: which program the GPU thread was evaluating, and the faulting page.
+			const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                          std::chrono::steady_clock::now() - own_start)
+			                                          .count());
+			auto& e = g_rb_readers[{ReadbackStats::CurrentShader(), vaddr & ~uint64_t {0xfff}}];
+			e.first += ns;
+			e.second++;
+		}
 		ReadbackStats::s_forwarded = false;
 	});
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_BLOCK("BufferCache::ReadMemory(GPU thread)");
+	struct CallerPhase {
+		int                                   tag   = g_rb_caller;
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		~CallerPhase() {
+			if (ReadbackStats::On()) {
+				NoteReadbackPhase(tag, start);
+			}
+		}
+	} caller_phase;
 	ReadbackStats::Scope stats(vaddr, is_write);
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
@@ -805,7 +888,18 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 
 	// Widen nearby CPU reads so they share one GPU drain.
-	const uint64_t WindowSize   = ReadbackWindowSize();
+	uint64_t WindowSize = ReadbackWindowSize();
+	// KYTY_LOCAL_HACK KYTY_READBACK_GPU_WINDOW_KB (live, default 0 = the same window): the GPU
+	// thread's own faults (resource materialization reading GPU-written dwords) download a
+	// smaller window. Wolverine 10-05 rp2: ~290 such faults per 5 s, 2 MiB each, ~1.1 ms apiece.
+	static auto& gpu_window_kb = Common::LiveSwitches::Get("KYTY_READBACK_GPU_WINDOW_KB", 0);
+	if (const auto kb = gpu_window_kb.load(std::memory_order_relaxed);
+	    kb > 0 && g_rb_own_fault) {
+		const auto bytes = std::max<uint64_t>(static_cast<uint64_t>(kb) * 1024, TRACKER_PAGE_SIZE);
+		if ((bytes & (bytes - 1)) == 0) {
+			WindowSize = std::min(WindowSize, bytes);
+		}
+	}
 	const auto     buffer_begin = buffer.CpuAddress();
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
@@ -841,10 +935,26 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 // device memory and every GPU write recorded into it has completed, the faulting pages' GPU-written
 // bytes are copied straight from the mapping into guest memory: no GPU copy, submission or drain.
 // Submissions end with a device-to-host barrier while such buffers exist (CommandScheduler).
+// KYTY_LOCAL_HACK KYTY_DIRECT_READBACK=2: also when the writer has not finished, the GPU thread
+// waits for the writer's tick only (submitting the open command buffer if the writer is in it)
+// instead of downloading the window and draining everything recorded. RADV has no second queue in
+// the graphics family, so the copy-queue readback never runs there (Wolverine 10-05 rg1: ~300 GPU
+// thread faults per 5 s, ~0.75 ms each, all full drains).
 bool BufferCache::TryDirectReadback(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_write) {
-	if (!DirectReadbackEnabled() || buffer.Mapped().empty() ||
-	    !m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
+	static auto& mode = Common::LiveSwitches::Get("KYTY_DIRECT_READBACK", 0);
+	const auto   direct = mode.load(std::memory_order_relaxed);
+	if (direct == 0 || buffer.Mapped().empty()) {
 		return false;
+	}
+	if (!m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
+		if (direct < 2) {
+			return false;
+		}
+		KYTY_PROFILER_BLOCK("BufferCache::DirectReadbackWait");
+		// Wait() submits the open command buffer when the writer is in it.
+		m_scheduler.Wait(buffer.last_gpu_write_tick);
+		m_scheduler.WaitPriorityOperations(buffer.last_gpu_write_tick);
+		m_direct_waits++;
 	}
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
@@ -952,7 +1062,7 @@ bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, ui
 	if (state.pool == nullptr) {
 		vk::CommandPoolCreateInfo pool_info {};
 		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		pool_info.queueFamilyIndex = m_graphics.readback_queue_family;
 		RequireVulkanSuccess(device.createCommandPool(&pool_info, nullptr, &state.pool),
 		                     "create readback command pool");
 		vk::CommandBufferAllocateInfo allocate {};
@@ -1027,10 +1137,16 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	KYTY_PROFILER_FUNCTION();
 	if (!is_write && !IsRegionRegistered(vaddr, size)) {
 		// A read of an unregistered region: the synchronous path finds its buffer.
+		const auto     sync_start = std::chrono::steady_clock::now();
+		ReadbackCaller caller(6);
 		ReadMemoryOnGpu(vaddr, size, false);
+		if (ReadbackStats::On()) {
+			NoteReadbackPhase(4, sync_start);
+		}
 		return 0;
 	}
 	ReadbackStats::Scope stats(vaddr, is_write);
+	const auto           phase_begin = std::chrono::steady_clock::now();
 	if (!IsRegionRegistered(vaddr, size)) {
 		return 0;
 	}
@@ -1071,6 +1187,11 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 		window_begin = std::max(page_begin, buffer_begin);
 		window_end   = std::min(page_end, buffer_end);
 	}
+	const bool phases     = ReadbackStats::On();
+	auto       phase_time = std::chrono::steady_clock::now();
+	if (phases) {
+		NoteReadbackPhase(0, phase_begin);
+	}
 	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
 		if (is_write) {
@@ -1079,8 +1200,15 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 		return 0;
 	}
 	stats.SetOutcome(ReadbackStats::Downloaded);
+	if (phases) {
+		NoteReadbackPhase(1, phase_time);
+		phase_time = std::chrono::steady_clock::now();
+	}
 	const auto tick = m_scheduler.CurrentTick();
 	m_scheduler.Flush();
+	if (phases) {
+		NoteReadbackPhase(2, phase_time);
+	}
 	m_pending_write_readbacks.push_back({window_begin, window_end, tick});
 	return tick;
 }
@@ -1090,6 +1218,14 @@ bool BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_wri
                                       uint64_t window_begin, uint64_t window_end, uint64_t tick,
                                       bool snapshot) {
 	KYTY_PROFILER_FUNCTION();
+	struct FinishPhase {
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		~FinishPhase() {
+			if (ReadbackStats::On()) {
+				NoteReadbackPhase(3, start);
+			}
+		}
+	} finish_phase;
 	for (size_t i = 0; i < m_pending_write_readbacks.size(); i++) {
 		const auto& pending = m_pending_write_readbacks[i];
 		if (pending.begin == window_begin && pending.end == window_end && pending.tick == tick) {
@@ -1112,6 +1248,7 @@ bool BufferCache::FinishWriteReadback(uint64_t vaddr, uint64_t size, bool is_wri
 		}
 		// The GPU wrote the window again while the download was landing, or another readback
 		// still covers the page: resolve this fault the synchronous way.
+		ReadbackCaller caller(7);
 		ReadMemoryOnGpu(vaddr, size, is_write);
 		return true;
 	}
@@ -1230,6 +1367,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	new_buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
+	new_buffer.last_gpu_copy_tick  = m_scheduler.CurrentTick();
 	DeleteBuffer(overlap_id);
 }
 
@@ -1267,6 +1405,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t size);
+// Bytes uploaded through staging copies [0] and direct writes [1] (KYTY_SYNC_STATS).
+static std::array<std::atomic<uint64_t>, 2> g_upload_bytes {};
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	// KYTY_SYNC_STATS=1 (live): every 5 s, synchronizations and the bytes they walked, split by
@@ -1287,6 +1429,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		if (now - report >= std::chrono::seconds(5)) {
 			report               = now;
 			constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+			::printf("Buffer upload (5 s): copied %.1f MiB, direct %.1f MiB\n",
+			         static_cast<double>(g_upload_bytes[0].exchange(0)) / 1048576.0,
+			         static_cast<double>(g_upload_bytes[1].exchange(0)) / 1048576.0);
 			::printf("Buffer sync (5 s): read %" PRIu64 " calls %.1f GiB (largest %.1f MiB), "
 			         "written %" PRIu64 " calls %.1f GiB (largest %.1f MiB)\n",
 			         calls[0], static_cast<double>(bytes[0]) / GiB,
@@ -1300,14 +1445,48 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	// KYTY_DIRECT_UPLOAD=1 (live, default 0; needs KYTY_MAPPED_DEVICE_BUFFERS=1): a buffer in
+	// host-visible device memory with no GPU copy into it in flight gets the guest's bytes written
+	// through its mapping, instead of a staging copy between two full barriers that also ends the
+	// render pass (Wolverine: ~37,000 a second, ~7 a draw). As on the console, the guest only
+	// changes bytes no pending GPU command reads (labels are published after the host GPU); the
+	// other bytes of the uploaded pages are rewritten with their current values.
+	static auto& direct_upload = Common::LiveSwitches::Get("KYTY_DIRECT_UPLOAD", 0);
+	// KYTY_LOCAL_HACK KYTY_LAZY_DIRECT (live, default 1): the GPU-copy check is only needed when
+	// there is something to upload; most of the ~280k syncs per second upload nothing, and the
+	// check asked the driver for the timeline value (DRM_IOCTL_SYNCOBJ_QUERY, ~2k per frame,
+	// st1 strace 2026-10-06) whenever the buffer's last copy was recent.
+	static auto& lazy_direct  = Common::LiveSwitches::Get("KYTY_LAZY_DIRECT", 1);
+	const bool   lazy         = lazy_direct.load(std::memory_order_relaxed) != 0;
+	const bool   direct_wanted = direct_upload.load(std::memory_order_relaxed) != 0 &&
+	                           !buffer.Mapped().empty();
+	bool direct = direct_wanted && !lazy && m_scheduler.IsFree(buffer.last_gpu_copy_tick);
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    if (lazy && direct_wanted && !copies.empty()) {
+			    direct = m_scheduler.IsFree(buffer.last_gpu_copy_tick);
+		    }
+		    if (!direct) {
+			    g_upload_bytes[0].fetch_add(total_size, std::memory_order_relaxed);
+			    source = UploadCopies(buffer, copies, total_size);
+			    return;
+		    }
+		    for (const auto& copy: copies) {
+			    g_upload_bytes[1].fetch_add(copy.size, std::memory_order_relaxed);
+			    ReadGuestForUpload(buffer.Mapped().data() + copy.dstOffset,
+			                       buffer.CpuAddress() + copy.dstOffset, copy.size);
+			    if (!buffer.IsCoherent()) {
+				    buffer.Flush(copy.dstOffset, copy.size);
+			    }
+		    }
+	    });
 	if (source) {
+		buffer.last_gpu_copy_tick = m_scheduler.CurrentTick();
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto              native = command.Recorder();

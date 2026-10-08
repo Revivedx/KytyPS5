@@ -317,8 +317,13 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	if (m_image_page_bits.empty()) {
+		m_image_page_bits.assign(ImagePageTable::kPageCount / 64u + 1u, 0);
+	}
+	m_image_set_epoch++;
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		m_image_page_bits[page / 64u] |= uint64_t {1} << (page % 64u);
 	});
 	image.registered = true;
 	NoteBindlessStateChange(image);
@@ -339,6 +344,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		}
 	}
 	UntrackImage(id);
+	m_image_set_epoch++;
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
@@ -347,6 +353,9 @@ void TextureCache::UnregisterImage(ImageId id) {
 		auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
+		}
+		if (owners->empty()) {
+			m_image_page_bits[page / 64u] &= ~(uint64_t {1} << (page % 64u));
 		}
 	});
 	m_lru_cache.Free(image.lru_id);
@@ -563,7 +572,7 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 	}
 
 	ImageIds result;
-	ForEachPage(address, size, [&](uint64_t page) {
+	const auto visit = [&](uint64_t page) {
 		const auto* owners = m_image_page_table.Find(page);
 		if (owners == nullptr) {
 			return;
@@ -581,7 +590,27 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 				result.push_back(id);
 			}
 		});
-	});
+	};
+	static auto& page_bits = Common::LiveSwitches::Get("KYTY_IMAGE_PAGE_BITS", 0);
+	if (page_bits.load(std::memory_order_relaxed) == 0 || m_image_page_bits.empty()) {
+		ForEachPage(address, size, visit);
+		return result;
+	}
+	const uint64_t last = (address + size - 1) >> ImagePageTable::kPageBits;
+	for (uint64_t page = address >> ImagePageTable::kPageBits; page <= last;) {
+		const auto word = page / 64u;
+		const auto bits = m_image_page_bits[word] >> (page % 64u);
+		if (bits == 0) {
+			page = (word + 1u) * 64u;
+			continue;
+		}
+		page += static_cast<uint64_t>(std::countr_zero(bits));
+		if (page > last) {
+			break;
+		}
+		visit(page);
+		page++;
+	}
 	return result;
 }
 
@@ -1357,14 +1386,51 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		// KYTY_LOCAL_HACK KYTY_FIND_IMAGE_MEMO: a request whose exact-backing image was found while
+		// the registered image set is unchanged finds the same one (the candidates and their order
+		// only change with registrations); the hit is checked against SameBacking again.
+		static auto& memo_switch = Common::LiveSwitches::Get("KYTY_FIND_IMAGE_MEMO", 1);
+		const bool   use_memo    = memo_switch.load(std::memory_order_relaxed) != 0;
+		const auto&  req         = desc.info;
+		const uint64_t memo_key =
+		    (static_cast<uint64_t>(req.extent.width) << 48u) ^
+		    (static_cast<uint64_t>(req.extent.height) << 32u) ^
+		    (static_cast<uint64_t>(req.extent.depth) << 24u) ^
+		    (static_cast<uint64_t>(req.resources.levels) << 16u) ^
+		    (static_cast<uint64_t>(req.resources.layers) << 4u) ^
+		    (static_cast<uint64_t>(static_cast<uint32_t>(req.pixel_format)) * 0x9e3779b97f4a7c15ull) ^
+		    (static_cast<uint64_t>(req.samples) << 60u) ^
+		    (static_cast<uint64_t>(req.bytes_per_block) << 40u) ^
+		    (static_cast<uint64_t>(static_cast<uint32_t>(req.tile_mode)) << 8u) ^
+		    (static_cast<uint64_t>(static_cast<uint32_t>(req.type)) << 12u) ^
+		    (exact_format ? 0x5555000000000000ull : 0u);
+		auto& memo = m_find_image_memo[((req.data.address >> 8u) ^ (memo_key >> 7u) ^ memo_key) &
+		                               (m_find_image_memo.size() - 1u)];
+		bool memo_hit = false;
+		if (use_memo && memo.epoch == m_image_set_epoch && memo.address == req.data.address &&
+		    memo.size == req.data.size && memo.key == memo_key) {
+			const auto* cached = m_slot_images.try_get(memo.result);
+			if (cached != nullptr && cached->registered &&
+			    SameBacking(cached->info, desc.info, exact_format)) {
+				result   = memo.result;
+				memo_hit = true;
+			}
+		}
+		const auto candidates =
+		    memo_hit ? ImageIds {} : FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
 			}
+		}
+		if (use_memo && !memo_hit && result) {
+			memo = {.address = req.data.address,
+			        .size    = req.data.size,
+			        .key     = memo_key,
+			        .epoch   = m_image_set_epoch,
+			        .result  = result};
 		}
 
 		int32_t view_mip   = -1;
@@ -1897,6 +1963,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, std::move(transfer));
 	buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
+	buffer.last_gpu_copy_tick  = m_scheduler.CurrentTick();
 	return true;
 }
 
@@ -2061,6 +2128,11 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 		found->second.clear_mask &= ~(1u << slice);
 	}
 	return true;
+}
+
+bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return !FindImagesInRegion(address, size, false).empty();
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {

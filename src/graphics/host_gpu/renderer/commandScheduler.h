@@ -46,6 +46,8 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// KYTY_LOCAL_HACK (upstream e6fce45d): queued or running guest-memory completions.
+	[[nodiscard]] bool        HasPendingPriorityOperations();
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
@@ -162,6 +164,16 @@ private:
 	// KYTY_GPU_TIME (see commandScheduler.cpp).
 	struct GpuTimer;
 	std::unique_ptr<GpuTimer> m_gpu_timer;
+	struct GpuProfiler;
+	std::unique_ptr<GpuProfiler> m_gpu_profiler;
+
+public:
+	// KYTY_LOCAL_HACK (research): KYTY_GPU_PROFILE=1 (live) records a GPU timestamp after the
+	// draw or dispatch just recorded; per 5 s the log lists the GPU time by operation kind and
+	// shader (kind: 0 dispatch, 1 indirect dispatch, 2 draw, 3 mesh draw, 4 indirect mesh draw).
+	void ProfileMark(uint32_t kind, uint64_t shader, uint64_t pixel_shader);
+
+private:
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

@@ -943,6 +943,19 @@ std::unique_ptr<SrtNativeCode> SrtNativeCode::Compile(const ResourcePlan& progra
 	};
 	for (const auto& read: program.srt_reads) {
 		code->m_flat_reads.push_back(resolve(read.value));
+		const auto& value = code->m_flat_reads.back();
+		FlatOp      op;
+		op.flat_offset = read.flat_offset;
+		op.kind        = static_cast<uint8_t>(value.kind);
+		op.clean       = read.flat_offset < program.clean_flat_slots.size() &&
+		                 program.clean_flat_slots[read.flat_offset] != 0u;
+		op.immediate   = value.immediate;
+		if (value.kind == SrtNativeValue::Routine) {
+			for (uint32_t mode = 0; mode < 2; mode++) {
+				op.routine[mode] = code->m_routines[mode][value.index];
+			}
+		}
+		code->m_flat_ops.push_back(op);
 	}
 	for (const auto& block: program.control_flow) {
 		code->m_conditions.push_back(block.condition.IsEmpty() ? SrtNativeValue {}

@@ -65,6 +65,8 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Lifts write protection ahead of a sequential write stream; see InvalidateRegionAhead.
+	void                   InvalidateMemoryAhead(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
@@ -255,6 +257,7 @@ private:
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	std::vector<PendingWriteReadback>                  m_pending_write_readbacks;
 	uint64_t                                           m_direct_readbacks = 0;
+	uint64_t                                           m_direct_waits     = 0;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
 	StreamBuffer                                       m_stream_buffer;

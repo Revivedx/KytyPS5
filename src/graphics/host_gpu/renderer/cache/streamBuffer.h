@@ -86,6 +86,9 @@ public:
 	// BufferCache state lives directly on the resource.
 	// Tick of the last recorded GPU write into the buffer (BufferCache direct readback).
 	uint64_t last_gpu_write_tick = 0;
+	// Tick of the last GPU copy into this buffer (merge, image download, upload copy): a direct
+	// host write (KYTY_DIRECT_UPLOAD) must not land before such a copy, which would overwrite it.
+	uint64_t last_gpu_copy_tick = 0;
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;

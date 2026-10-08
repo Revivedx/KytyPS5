@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -189,6 +190,24 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			output.id    = touch.id;
 		}
 	}
+	// KYTY_LOCAL_HACK: KYTY_PAD_INJECT (live switch) ORs a button mask into the pad, for scripted runs.
+	static auto& inject = Common::LiveSwitches::Get("KYTY_PAD_INJECT", 0);
+	if (const auto mask = inject.load(std::memory_order_relaxed); mask != 0) {
+		data->buttons |= static_cast<uint32_t>(mask);
+		connected       = true;
+		connected_count = std::max(connected_count, 1);
+	}
+	// KYTY_LOCAL_HACK: KYTY_PAD_STICKS (live) = lx | ly << 8 | rx << 16 | ry << 24 (0-255, 128 is
+	// the center) overrides both sticks; 0 leaves them alone.
+	static auto& sticks = Common::LiveSwitches::Get("KYTY_PAD_STICKS", 0);
+	if (const auto value = static_cast<uint32_t>(sticks.load(std::memory_order_relaxed)); value != 0) {
+		data->left_stick_x  = static_cast<uint8_t>(value);
+		data->left_stick_y  = static_cast<uint8_t>(value >> 8u);
+		data->right_stick_x = static_cast<uint8_t>(value >> 16u);
+		data->right_stick_y = static_cast<uint8_t>(value >> 24u);
+		connected           = true;
+		connected_count     = std::max(connected_count, 1);
+	}
 	data->connected              = connected;
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
@@ -222,6 +241,12 @@ void GameController::CycleSetting(Setting setting) {
 }
 
 float GameController::GetSettingScale(Setting setting) const {
+	// KYTY_LOCAL_HACK: KYTY_NO_RUMBLE (live switch) mutes rumble, haptics and trigger effects for test
+	// runs; the next game request applies it.
+	static auto& no_rumble = Common::LiveSwitches::Get("KYTY_NO_RUMBLE", 0);
+	if (setting != Setting::SpeakerVolume && no_rumble.load(std::memory_order_relaxed) != 0) {
+		return 0.0f;
+	}
 	const auto step = m_setting_steps[static_cast<size_t>(setting)].load(std::memory_order_relaxed);
 	return setting == Setting::SpeakerVolume ? SPEAKER_VOLUME[step] : INTENSITY[step];
 }
