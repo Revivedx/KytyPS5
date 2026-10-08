@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/liveSwitches.h"
+#include "graphics/host_gpu/pipelineStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1042,8 +1043,11 @@ void GuestGpu::FlushPendingSlices() {
 	}
 }
 
+static uint32_t g_stats_queue = 0; // KYTY_PIPELINE_STATS: queue of the submission being processed
+
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
+	g_stats_queue          = submission.queue_id;
 	auto& cp = GetProcessor(submission.queue_id);
 
 	if (first_slice) {
@@ -1182,6 +1186,296 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	g_current_execution->m_chain       = chain;
 }
 
+// KYTY_LOCAL_HACK KYTY_PIPELINE_STATS=1 (live, research; pipelineStats.h): packets by class for a
+// pipelined command processor, the runs of draws/dispatches between sync packets, and the read-
+// after-GPU-write hazards inside an 8-op window. Classes: 0 op (draw, dispatch), 1 state (register
+// writes, index state, call into another command buffer, markers), 2 ordered (barriers, cache
+// actions, end-of-pipe labels, CP writes and DMA, flips: a back thread can run them in order),
+// 3 sync (waits on memory, conditional execution, anything unknown: the front thread drains).
+static void PipelineStatsPacket(uint32_t opcode, uint32_t header, uint32_t queue) {
+	static auto& on = Common::LiveSwitches::Get("KYTY_PIPELINE_STATS", 0);
+	PipelineStats::g_on = on.load(std::memory_order_relaxed) != 0;
+	if (!PipelineStats::g_on) return;
+	int cls = 3;
+	switch (opcode) {
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DRAW: cls = 0; break;
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+		case Pm4::IT_SET_CONFIG_REG:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_QUEUE_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_CONTEXT_CONTROL:
+		case Pm4::IT_CLEAR_STATE:
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_INDIRECT_BUFFER_CNST:
+		case Pm4::IT_PFP_SYNC_ME: cls = 1; break;
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_RELEASE_MEM:
+		case Pm4::IT_ACQUIRE_MEM:
+		case Pm4::IT_WRITE_DATA:
+		case Pm4::IT_DMA_DATA: cls = 2; break;
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(header);
+			cls = (r == Pm4::R_ZERO || r == Pm4::R_PUSH_MARKER || r == Pm4::R_POP_MARKER ||
+			       r == Pm4::R_DRAW_RESET || r == Pm4::R_DISPATCH_RESET || r == Pm4::R_CONTEXT_STATE)
+			          ? 1
+			      : (r == Pm4::R_ACQUIRE_MEM || r == Pm4::R_RELEASE_MEM || r == Pm4::R_WRITE_DATA ||
+			         r == Pm4::R_DMA_DATA || r == Pm4::R_FLIP)
+			          ? 2
+			          : 3;
+			break;
+		}
+		default: cls = 3; break;
+	}
+	static uint64_t counts[4] {};
+	static uint64_t sync_by_op[512] {};
+	static uint64_t run_ops = 0;          // ops since the last sync packet
+	static uint64_t runs_hist[6] {};      // ops in runs of 1, 2-3, 4-7, 8-15, 16-63, 64+
+	static uint64_t queue_ops[2] {};      // graphics, compute
+	static auto     report = std::chrono::steady_clock::now();
+	counts[cls]++;
+	if (cls == 0) {
+		PipelineStats::g_op++;
+		run_ops++;
+		queue_ops[queue == 0 ? 0 : 1]++;
+	} else if (cls == 3) {
+		sync_by_op[opcode == Pm4::IT_NOP ? 256u + KYTY_PM4_R(header) : opcode]++;
+		if (run_ops != 0) {
+			const int b = run_ops < 2 ? 0 : run_ops < 4 ? 1 : run_ops < 8 ? 2 : run_ops < 16 ? 3 : run_ops < 64 ? 4 : 5;
+			runs_hist[b] += run_ops;
+		}
+		run_ops = 0;
+		PipelineStats::g_sync_op = PipelineStats::g_op;
+	}
+	if (const auto now = std::chrono::steady_clock::now(); now - report > std::chrono::seconds(5)) {
+		std::string sync;
+		for (size_t i = 0; i < 512; i++) {
+			if (sync_by_op[i] != 0) sync += fmt::format(" {}{:02x}={}", i >= 256 ? "R" : "", i & 255u, sync_by_op[i]);
+		}
+		std::printf("Pipeline stats (5 s): ops %llu (graphics %llu, compute %llu), state %llu, ordered %llu, "
+		            "sync %llu; ops in runs 1/2-3/4-7/8-15/16-63/64+: %llu/%llu/%llu/%llu/%llu/%llu; "
+		            "hazard reads %llu in %llu ops; sync:%s\n",
+		            (unsigned long long)counts[0], (unsigned long long)queue_ops[0],
+		            (unsigned long long)queue_ops[1], (unsigned long long)counts[1],
+		            (unsigned long long)counts[2], (unsigned long long)counts[3],
+		            (unsigned long long)runs_hist[0], (unsigned long long)runs_hist[1],
+		            (unsigned long long)runs_hist[2], (unsigned long long)runs_hist[3],
+		            (unsigned long long)runs_hist[4], (unsigned long long)runs_hist[5],
+		            (unsigned long long)PipelineStats::g_hazard_reads,
+		            (unsigned long long)PipelineStats::g_hazard_ops, sync.c_str());
+		std::fflush(stdout);
+		for (auto& c: counts) c = 0;
+		for (auto& c: sync_by_op) c = 0;
+		for (auto& c: runs_hist) c = 0;
+		queue_ops[0] = queue_ops[1] = 0;
+		PipelineStats::g_hazard_reads = PipelineStats::g_hazard_ops = 0;
+		report = now;
+	}
+}
+
+// KYTY_LOCAL_HACK KYTY_LOOKAHEAD_STATS=1 (live, research): after a draw, the shader registers the
+// next draw will see are predicted by running the SET_SH_REG packets up to it on a saved copy of
+// the state (other register writes, index state and markers are skipped; anything else ends the
+// prediction), then compared at that draw with the real ones: how often a thread could prepare
+// the next draw's shader resources while this one is still bound and recorded.
+static bool LookaheadStatsOn() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_LOOKAHEAD_STATS", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_LOCAL_HACK KYTY_LOOKAHEAD (live): the prediction is published (Lookahead::g_next) while
+// the draw runs, when it is safe to prepare programs from: no context or user config register
+// write was skipped, or the draw's shaders stay the same.
+static bool LookaheadOn() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_LOOKAHEAD", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
+namespace {
+struct LookaheadState {
+	bool        valid = false;
+	HW::Shader  predicted;
+	bool        safe  = false;
+	bool        trusted = false; // no skipped packet writes memory (RELEASE_MEM, EVENT_WRITE)
+	uint64_t    published = 0;
+	uint64_t    draws = 0, predicted_draws = 0, exact = 0, stopped = 0, distance = 0;
+	std::array<uint64_t, 512> stops {};
+	std::chrono::steady_clock::time_point report = std::chrono::steady_clock::now();
+};
+LookaheadState g_lookahead;
+} // namespace
+
+void CommandProcessor::LookaheadCheck() {
+	auto& la = g_lookahead;
+	la.draws++;
+	if (la.valid) {
+		la.predicted_draws++;
+		if (std::memcmp(&la.predicted, &m_sh_ctx, sizeof(HW::Shader)) == 0) {
+			la.exact++;
+		}
+	}
+	la.valid = false;
+	if (const auto now = std::chrono::steady_clock::now(); now - la.report > std::chrono::seconds(5)) {
+		std::string stops;
+		for (size_t i = 0; i < la.stops.size(); i++) {
+			if (la.stops[i] != 0) stops += fmt::format(" {}{:02x}={}", i >= 256 ? "R" : "", i & 255u, la.stops[i]);
+		}
+		std::printf("Lookahead (5 s): draws %llu, predicted %llu, exact %llu, stopped %llu, avg packets %.1f "
+		            "(sizeof Shader %zu, Context %zu), published %llu; stops:%s\n",
+		            (unsigned long long)la.draws, (unsigned long long)la.predicted_draws,
+		            (unsigned long long)la.exact, (unsigned long long)la.stopped,
+		            la.predicted_draws != 0 ? double(la.distance) / double(la.predicted_draws) : 0.0,
+		            sizeof(HW::Shader), sizeof(HW::Context), (unsigned long long)la.published, stops.c_str());
+		std::fflush(stdout);
+		const auto keep = std::move(la.predicted);
+		la = {};
+		la.predicted = keep;
+		la.report = now;
+	}
+}
+
+// The user config registers an indirect write may set while predicting: their handlers only set
+// m_ucfg or the index type (both restored), or ignore the value.
+static bool LookaheadUcRegisterPure(uint32_t offset) {
+	switch (offset) {
+		case Pm4::UC_NOP:
+		case Pm4::VGT_PRIMITIVE_TYPE:
+		case Pm4::VGT_INDEX_TYPE:
+		case Pm4::VGT_OBJECT_ID:
+		case Pm4::GE_MULTI_PRIM_IB_RESET_EN:
+		case Pm4::IA_MULTI_VGT_PARAM:
+		case Pm4::GE_CNTL:
+		case Pm4::UC_PARAMETER_OVERSUBSCRIPTION:
+		case Pm4::GE_USER_VGPR_EN:
+		case Pm4::TEXTURE_GRADIENT_FACTORS:
+		case Pm4::TEXTURE_GRADIENT_CONTROL: return true;
+		default:
+			return (offset >= Pm4::FSR_WINDOW_LEFT && offset < Pm4::FSR_WINDOW_LEFT + 2) ||
+			       (offset >= Pm4::FSR_CONTROL_POINTS_LEFT_X && offset < Pm4::FSR_CONTROL_POINTS_LEFT_X + 4) ||
+			       (offset >= Pm4::FSR_CONTROL_POINTS_LEFT_Y && offset < Pm4::FSR_CONTROL_POINTS_LEFT_Y + 4) ||
+			       (offset >= Pm4::FSR_ALPHA_LEFT_X && offset < Pm4::FSR_ALPHA_LEFT_X + 2) ||
+			       (offset >= Pm4::FSR_ALPHA_LEFT_Y && offset < Pm4::FSR_ALPHA_LEFT_Y + 2);
+	}
+}
+
+void CommandProcessor::LookaheadPredict(std::span<const uint32_t> ahead) {
+	auto&      la    = g_lookahead;
+	const auto saved = m_sh_ctx;
+	// Indirect register writes may also set context and user config registers: run on copies,
+	// and a change of either makes the prediction unsafe unless the shaders stay the same.
+	const auto saved_ctx    = m_ctx;
+	const auto saved_ucfg   = m_ucfg;
+	const auto saved_index  = m_index_type_and_size;
+	const auto saved_marker = m_user_data_marker;
+	uint32_t   pos   = 0;
+	uint32_t   count = 0;
+	bool       ok    = false;
+	bool       touched = false;
+	bool       writes  = false;
+	while (pos < ahead.size()) {
+		const auto* packet = ahead.data() + pos;
+		const auto  header = packet[0];
+		const auto  left   = static_cast<uint32_t>(ahead.size() - pos);
+		if (header == 0x80000000u) {
+			pos++;
+			continue;
+		}
+		if ((header >> 30u) == 0u) {
+			pos += ((header >> 16u) & 0x3fffu) + 2u;
+			continue;
+		}
+		const auto opcode = (header >> 8u) & 0xffu;
+		const auto len    = KYTY_PM4_LEN(header);
+		if (len == 0 || len > left || (header & 1u) != 0) {
+			la.stops[opcode]++;
+			break;
+		}
+		count++;
+		if (IsDrawOrDispatchPacket(opcode)) {
+			ok = opcode != Pm4::IT_DISPATCH_DIRECT && opcode != Pm4::IT_DISPATCH_INDIRECT;
+			if (!ok) la.stops[opcode]++;
+			break;
+		}
+		writes  = writes || opcode == Pm4::IT_EVENT_WRITE ||
+		          (opcode == Pm4::IT_NOP && KYTY_PM4_R(header) == Pm4::R_RELEASE_MEM);
+		touched = touched || opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_UCONFIG_REG ||
+		          opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_UCONFIG_REG_INDEX;
+		bool run = opcode == Pm4::IT_SET_SH_REG || (opcode == Pm4::IT_SET_SH_REG_INDIRECT && len == 5u);
+		if (opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT && len == 5u) {
+			const auto* regs = reinterpret_cast<const uint32_t*>(
+			    (static_cast<uint64_t>(packet[1]) & 0xfffffffcu) | (static_cast<uint64_t>(packet[2]) << 32u));
+			const auto num = packet[4] & 0x3fffu;
+			run            = num == 0 || regs != nullptr;
+			for (uint32_t i = 0; run && i < num; i++) {
+				run = LookaheadUcRegisterPure(regs[i * 2] & ~0x70000000u);
+			}
+			if (!run) {
+				la.stops[opcode]++;
+				break;
+			}
+		}
+		if (opcode == Pm4::IT_SET_SH_REG_INDIRECT && len == 5u && packet[4] != 0 &&
+		    ((static_cast<uint64_t>(packet[1]) & 0xfffffffcu) | (static_cast<uint64_t>(packet[2]) << 32u)) == 0) {
+			la.stops[opcode]++;
+			break;
+		}
+		if (run) {
+			(void)g_cp_op_func[opcode](*this, header & ~1u, packet + 1, left, static_cast<uint32_t>(ahead.size()));
+		} else if (!(opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_UCONFIG_REG ||
+		             opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_EVENT_WRITE ||
+		             (opcode == Pm4::IT_NOP && (KYTY_PM4_R(header) == Pm4::R_RELEASE_MEM ||
+		                                        KYTY_PM4_R(header) == Pm4::R_ACQUIRE_MEM)) ||
+		             opcode == Pm4::IT_SET_UCONFIG_REG_INDEX || opcode == Pm4::IT_INDEX_TYPE ||
+		             opcode == Pm4::IT_INDEX_BASE || opcode == Pm4::IT_INDEX_BUFFER_SIZE ||
+		             opcode == Pm4::IT_NUM_INSTANCES || opcode == Pm4::IT_SET_BASE ||
+		             (opcode == Pm4::IT_NOP && (KYTY_PM4_R(header) == Pm4::R_ZERO ||
+		                                        KYTY_PM4_R(header) == Pm4::R_PUSH_MARKER ||
+		                                        KYTY_PM4_R(header) == Pm4::R_POP_MARKER ||
+		                                        KYTY_PM4_R(header) == Pm4::R_DRAW_RESET)))) {
+			la.stops[opcode == Pm4::IT_NOP ? 256u + KYTY_PM4_R(header) : opcode]++;
+			break;
+		}
+		pos += len;
+	}
+	if (ok) {
+		la.predicted = m_sh_ctx;
+		la.valid     = true;
+		la.distance += count;
+		la.trusted = !writes;
+		touched = touched || std::memcmp(&saved_ctx, &m_ctx, sizeof(HW::Context)) != 0 ||
+		          std::memcmp(&saved_ucfg, &m_ucfg, sizeof(HW::UserConfig)) != 0;
+		la.safe = !touched || (saved.GetVs().es_regs.data_addr == m_sh_ctx.GetVs().es_regs.data_addr &&
+		                       saved.GetVs().gs_regs.data_addr == m_sh_ctx.GetVs().gs_regs.data_addr &&
+		                       saved.GetPs().ps_regs.data_addr == m_sh_ctx.GetPs().ps_regs.data_addr);
+	} else {
+		la.stopped++;
+	}
+	m_sh_ctx               = saved;
+	m_ctx                  = saved_ctx;
+	m_ucfg                 = saved_ucfg;
+	m_index_type_and_size  = saved_index;
+	m_user_data_marker     = saved_marker;
+}
+
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
@@ -1284,8 +1578,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		PipelineStatsPacket(opcode, packet_header, g_stats_queue);
+		const bool lookahead_draw = (LookaheadStatsOn() || LookaheadOn()) && IsDrawOrDispatchPacket(opcode) &&
+		                            opcode != Pm4::IT_DISPATCH_DIRECT &&
+		                            opcode != Pm4::IT_DISPATCH_INDIRECT && (packet_header & 1u) == 0 &&
+		                            KYTY_PM4_LEN(packet_header) <= remaining_dw;
+		if (lookahead_draw) {
+			LookaheadCheck();
+			// The draw does not write shader registers: the state after it is the state now.
+			LookaheadPredict(cursor.commands.subspan(cursor.offset_dw + KYTY_PM4_LEN(packet_header)));
+			if (g_lookahead.valid && g_lookahead.safe && LookaheadOn()) {
+				Lookahead::g_next         = &g_lookahead.predicted;
+				Lookahead::g_next_trusted = g_lookahead.trusted;
+				g_lookahead.published++;
+			}
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		Lookahead::g_next = nullptr;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;

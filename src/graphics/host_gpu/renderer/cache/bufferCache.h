@@ -21,6 +21,9 @@
 
 namespace Libs::Graphics {
 
+// KYTY_UPLOAD_WORKER: waits until every queued direct upload copy is done (bufferCache.cpp).
+void WaitUploadWorker();
+
 struct GraphicContext;
 class CommandScheduler;
 class TextureCache;

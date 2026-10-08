@@ -11,7 +11,7 @@ Linux 7.2, in the opening jungle area:
 
 | | Frame rate |
 |---|---|
-| Standing / exploring | ~22 fps (~20 on 2026-10-07, ~10 on 2026-10-05) |
+| Standing / exploring | ~22-23 fps (~20 on 2026-10-07, ~10 on 2026-10-05) |
 | Combat | ~11-16 fps (varies a lot with the fight) |
 | Heavy combat (fire, many enemies) | 7-12 fps |
 
@@ -41,7 +41,12 @@ with a same-process A/B switch:
 - 2026-10-08 (command processor -11% per frame): the in-order walk replay runs a flat recorded request
   list; replay traces drop pass-through ops and repeated user-data reads at record time; the vertex/mesh
   stage of a draw materializes its resources on a worker thread while the command processor does the
-  pixel stage; per-descriptor diagnostics and hot-path clock reads off by default.
+  pixel stage; per-descriptor diagnostics and hot-path clock reads off by default. Later the same day:
+  guest-to-GPU upload copies run on their own worker thread (+2%).
+- Researched and left off (measured no gain): preparing the next draw's shader resources ahead on the
+  worker (the command stream is predicted 95% of the time, but the results must be re-validated, which
+  costs about what it saves), swapping which shader stage goes to the worker, per-page write epochs, a
+  per-submission read cache.
 - GPU: the mesh-indirect argument conversions of a render pass run in one batch before it begins, so
   those draws no longer end the render pass (~5 points less GPU load).
 
@@ -51,8 +56,9 @@ scripted gameplay A/B runs.
 
 ## Next
 
-- Command processor (still the limit, ~39 ms of CPU per frame, ~130k instructions per draw): a pipelined
-  command processor (resource preparation of the next draws ahead of the current one) or draw records
+- Command processor (still the limit, ~38 ms of CPU per frame, ~130k instructions per draw): a real
+  two-thread command processor (one thread parses and prepares draws, the other binds and records them;
+  the measurements say a front thread could run far ahead: hazards are ~0.2% of draws) or draw records
   (skip the whole per-draw preparation for repeated draws), needed for 30 fps and for heavy combat.
 - GPU: the frame is still split into many small, serialized pieces (barriers, render-pass breaks).
 

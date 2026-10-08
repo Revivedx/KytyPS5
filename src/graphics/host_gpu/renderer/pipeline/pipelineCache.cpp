@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/pipelineStats.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -428,6 +429,7 @@ bool ReadShaderGuestMemoryImpl(ShaderReadChunks* chunks, uint64_t address,
 	if (values.empty()) {
 		return false;
 	}
+	PipelineStats::NoteRead(address, values.size_bytes());
 	if (chunks != nullptr && chunks->Read(address, values)) {
 		return true;
 	}
@@ -799,6 +801,17 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		uint64_t                                     last_use = 0;
+		bool                                         ahead    = false; // stored by KYTY_LOOKAHEAD
+		uint64_t trusted_epoch = 0; // KYTY_LOOKAHEAD=2: hit without re-reading during this draw
+	};
+	struct SourceEntry;
+	// KYTY_LOOKAHEAD: one stage of the next draw, materialized on the worker into a memo slot.
+	struct LookaheadSide {
+		bool         used  = false;
+		bool         ok    = false;
+		SourceEntry* entry = nullptr;
+		ShaderParams params;
+		MemoSlot     slot;
 	};
 	// KYTY_MEMO_REBASE: per snapshot word (VisitSnapshotWords order), the rules still consistent
 	// with every learned sample: same word, a read user data dword i (copy bit i), or the word
@@ -855,7 +868,9 @@ struct PipelineCache::ProgramCache {
 			    slot.workgroup_count == runtime.workgroup_count &&
 			    slot.workgroup_size == runtime.workgroup_size &&
 			    MemoUserDataEqual(entry, slot.user_data, runtime.user_data) &&
-			    ReadsUnchanged(slot.log, reads)) {
+			    LookaheadReadsOk(slot, reads)) {
+				lookahead_stats[6] += slot.trusted_epoch == lookahead_epoch ? 1u : 0u;
+				slot.trusted_epoch = 0;
 				entry.resources      = slot.resources;
 				entry.specialization = slot.specialization;
 				// Dwords the plan does not read may differ; the draw still needs them (push data,
@@ -864,6 +879,8 @@ struct PipelineCache::ProgramCache {
 				slot.last_use = memo_clock;
 				t_materialize_evaluated = false;
 				memo_hits++;
+				lookahead_stats[4] += slot.ahead ? 1u : 0u;
+				slot.ahead = false;
 				entry.stat_exact++;
 				DrawRecordCensus::g_flags |= 4u;
 				ReportMemo();
@@ -972,6 +989,8 @@ struct PipelineCache::ProgramCache {
 			slot->resources      = entry.resources;
 			slot->specialization = entry.specialization;
 			slot->last_use = memo_clock;
+			slot->ahead    = false;
+			slot->trusted_epoch = 0;
 		}
 		ReportMemo();
 		return ok;
@@ -1842,13 +1861,282 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	static MaterializeWorker& Worker() {
+		static MaterializeWorker worker;
+		return worker;
+	}
+
+	// KYTY_LOOKAHEAD: while the CP binds and records this draw, the worker evaluates the next
+	// draw's stages (looked up here, on the CP) into side memo slots. Nothing of the entry is
+	// written: the CP's draw may use the same entry's resources.
+	template <typename InputInfo>
+	bool LookaheadFind(const ShaderParams& params, const InputInfo& input_info, ShaderType stage,
+	                   ProgramKey& key, LookaheadSide& side) {
+		side.used = false;
+		side.ok   = false;
+		if (SkipShaderRequested(params.hash) || LiveSkipShader(params.hash, stage)) {
+			return false;
+		}
+		BuildLookupKey(params, input_info, stage, std::span(params.user_data).first(params.user_data_count),
+		               key);
+		if (unsupported.contains(key)) {
+			return false;
+		}
+		const auto entry = programs.find(key);
+		if (entry == programs.end()) {
+			return false;
+		}
+		side.entry  = &entry->second;
+		side.params = params;
+		side.used   = true;
+		return true;
+	}
+
+	void LookaheadEvaluate(LookaheadSide& side) {
+		const auto faults0   = RenderContext::ThreadFaultCount();
+		const auto user_data = std::span(side.params.user_data).first(side.params.user_data_count);
+		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = user_data,
+		    .shader_base                = side.params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryRaw,
+		    .userdata                   = &read_chunks,
+		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		};
+		if (read_chunks.PageMode()) {
+			runtime.map_clean_page = +[](void* userdata, uint64_t page) {
+				return static_cast<ShaderReadChunks*>(userdata)->MapPage(page);
+			};
+			runtime.log_read = +[](void* userdata, uint64_t address, uint32_t word) {
+				static_cast<ShaderReadChunks*>(userdata)->Log(address, {&word, 1}, true);
+			};
+			runtime.page_userdata = &read_chunks;
+		}
+		auto& slot = side.slot;
+		slot.log.reads.clear();
+		slot.log.words.clear();
+		read_chunks.SetLog(&slot.log);
+		t_parallel_refused = false;
+		const bool ok      = ShaderRecompiler::IR::MaterializeResources(
+            side.entry->resource_plan, runtime, slot.resources, slot.specialization);
+		read_chunks.SetLog(nullptr);
+		const auto faults = RenderContext::ThreadFaultCount() - faults0;
+		g_worker_faults += faults;
+		side.ok = ok && !t_parallel_refused && faults == 0;
+		if (side.ok) {
+			slot.user_data.assign(user_data.begin(), user_data.end());
+			slot.shader_base     = runtime.shader_base;
+			slot.workgroup_count = runtime.workgroup_count;
+			slot.workgroup_size  = runtime.workgroup_size;
+			slot.resources.user_data.assign(user_data.begin(), user_data.end());
+		}
+	}
+
+	void LookaheadNextDraw() { lookahead_epoch++; }
+
+	// The memo's read check; a slot trusted for this draw skips it (KYTY_LOOKAHEAD=3 still
+	// re-reads and counts the trusted slots whose reads changed).
+	bool LookaheadReadsOk(MemoSlot& slot, ShaderReadChunks& reads) {
+		if (slot.trusted_epoch != lookahead_epoch) {
+			return ReadsUnchanged(slot.log, reads);
+		}
+		static auto& lookahead = Common::LiveSwitches::Get("KYTY_LOOKAHEAD", 0);
+		if (lookahead.load(std::memory_order_relaxed) == 3 && !ReadsUnchanged(slot.log, reads)) {
+			lookahead_stats[7]++;
+			static uint32_t reported = 0;
+			if (reported < 40) {
+				reported++;
+				for (const auto& read: slot.log.reads) {
+					memo_words.resize(read.count);
+					const bool ok = ReadShaderGuestMemoryImpl(&reads, read.address, memo_words);
+					if (ok != read.ok || (ok && !std::equal(memo_words.begin(), memo_words.end(),
+					                                        slot.log.words.begin() + read.first))) {
+						uint32_t i = 0;
+						while (ok && read.ok && i < read.count && memo_words[i] == slot.log.words[read.first + i]) {
+							i++;
+						}
+						std::printf("Lookahead trusted CHANGED: read 0x%016" PRIx64 " +%u words (of %zu reads): ok %d -> %d, "
+						            "word %u 0x%08x -> 0x%08x\n",
+						            read.address, read.count, slot.log.reads.size(), read.ok ? 1 : 0, ok ? 1 : 0, i,
+						            read.ok && i < read.count ? slot.log.words[read.first + i] : 0u,
+						            ok && i < read.count ? memo_words[i] : 0u);
+						break;
+					}
+				}
+			}
+			slot.trusted_epoch = 0;
+			return false;
+		}
+		return true;
+	}
+
+	// A logged read inside a GPU write made while the worker ran.
+	static bool LookaheadReadsWritten(const ShaderReadChunks::ReadLog& log,
+	                                  std::span<const std::pair<uint64_t, uint64_t>> writes) {
+		for (const auto& read: log.reads) {
+			const uint64_t end = read.address + uint64_t {read.count} * 4u;
+			for (const auto& [begin, write_end]: writes) {
+				if (read.address < write_end && begin < end) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	void LookaheadStart(const ShaderParams& pixel_params, const ShaderPixelInputInfo& pixel_info,
+	                    const ShaderParams& vertex_params, const ShaderVertexInputInfo& vertex_info,
+	                    bool trusted) {
+		LookaheadJoin();
+		if (!ResourceMemoEnabled()) {
+			return;
+		}
+		const bool pixel = LookaheadFind(pixel_params, pixel_info, ShaderType::Pixel, lookahead_key[0],
+		                                 lookahead_side[0]);
+		const bool vertex = LookaheadFind(vertex_params, vertex_info, vertex_info.logical_stage,
+		                                  lookahead_key[1], lookahead_side[1]);
+		if (!pixel && !vertex) {
+			return;
+		}
+		if (!lookahead_job) {
+			lookahead_job = [this] {
+				for (auto& side: lookahead_side) {
+					if (side.used) {
+						LookaheadEvaluate(side);
+					}
+				}
+			};
+		}
+		lookahead_stats[0]++;
+		static auto& lookahead = Common::LiveSwitches::Get("KYTY_LOOKAHEAD", 0);
+		if (lookahead.load(std::memory_order_relaxed) == 4) {
+			// Overhead control: the prediction, preparation and lookups without the evaluation.
+			lookahead_side[0].used = false;
+			lookahead_side[1].used = false;
+			return;
+		}
+		lookahead_pending = true;
+		lookahead_trusted = trusted;
+		if (trusted) {
+			while (Lookahead::g_watch_lock.test_and_set(std::memory_order_acquire)) {
+				__builtin_ia32_pause();
+			}
+			Lookahead::g_write_count = 0;
+			Lookahead::g_watch_lock.clear(std::memory_order_release);
+			Lookahead::g_watch.store(true, std::memory_order_release);
+		}
+		Worker().Start(lookahead_job);
+	}
+
+	// Waits for the worker's lookahead and stores its results as memo slots of their entries: the
+	// next Materialize of that entry hits one only if its user data and every logged read match.
+	void LookaheadJoin() {
+		if (!lookahead_pending) {
+			return;
+		}
+		const auto wait_start = std::chrono::steady_clock::now();
+		Worker().Wait();
+		lookahead_wait_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count());
+		lookahead_pending = false;
+		std::array<std::pair<uint64_t, uint64_t>, Lookahead::WatchSize> writes;
+		size_t                                                          write_count = 0;
+		if (lookahead_trusted) {
+			Lookahead::g_watch.store(false, std::memory_order_release);
+			while (Lookahead::g_watch_lock.test_and_set(std::memory_order_acquire)) {
+				__builtin_ia32_pause();
+			}
+			write_count = Lookahead::g_write_count;
+			std::copy_n(Lookahead::g_writes.begin(), std::min(write_count, Lookahead::WatchSize), writes.begin());
+			Lookahead::g_watch_lock.clear(std::memory_order_release);
+			lookahead_trusted = write_count <= Lookahead::WatchSize;
+		}
+		for (auto& side: lookahead_side) {
+			if (!side.used) {
+				continue;
+			}
+			side.used = false;
+			lookahead_stats[1]++;
+			if (!side.ok) {
+				lookahead_stats[2]++;
+				continue;
+			}
+			auto&     entry = *side.entry;
+			MemoSlot* slot  = nullptr;
+			for (auto& s: entry.memo) {
+				if (s.shader_base == side.slot.shader_base && s.user_data == side.slot.user_data &&
+				    s.workgroup_count == side.slot.workgroup_count &&
+				    s.workgroup_size == side.slot.workgroup_size) {
+					slot = &s;
+					break;
+				}
+			}
+			if (slot == nullptr) {
+				if (entry.memo.size() < MemoSlots) {
+					slot = &entry.memo.emplace_back();
+				} else {
+					slot = &*std::ranges::min_element(entry.memo, {}, &MemoSlot::last_use);
+				}
+			}
+			std::swap(*slot, side.slot);
+			slot->last_use = ++memo_clock;
+			slot->ahead    = true;
+			slot->trusted_epoch =
+			    lookahead_trusted && !LookaheadReadsWritten(slot->log, std::span(writes).first(write_count))
+			        ? lookahead_epoch
+			        : 0;
+			lookahead_stats[5] += slot->trusted_epoch != 0 ? 1u : 0u;
+			lookahead_stats[3]++;
+		}
+		if (const auto now = std::chrono::steady_clock::now(); now - lookahead_report > std::chrono::seconds(5)) {
+			std::printf("Lookahead materialize (5 s): draws %llu, stages %llu, refused %llu, adopted %llu, hits %llu, "
+			            "trusted %llu, trusted hits %llu, trusted but changed %llu; CP wait %.1f ms, prepare %.1f ms\n",
+			            (unsigned long long)lookahead_stats[0], (unsigned long long)lookahead_stats[1],
+			            (unsigned long long)lookahead_stats[2], (unsigned long long)lookahead_stats[3],
+			            (unsigned long long)lookahead_stats[4], (unsigned long long)lookahead_stats[5],
+			            (unsigned long long)lookahead_stats[6], (unsigned long long)lookahead_stats[7],
+			            lookahead_wait_ns / 1e6, lookahead_prepare_ns / 1e6);
+			lookahead_wait_ns    = 0;
+			lookahead_prepare_ns = 0;
+			std::fflush(stdout);
+			lookahead_stats  = {};
+			lookahead_report = now;
+		}
+	}
+
+	static uint64_t ElapsedNs(std::chrono::steady_clock::time_point start) {
+		return static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+	}
+
+	// KYTY_PARALLEL_SWAP=2: per shader, a running average of its stage's materialization time;
+	// the costlier stage of a draw runs on the CP (the worker's reads are slower), the other on
+	// the worker. Unknown shaders keep the default (pixel on the CP).
+	bool SwapStages(uint64_t pixel_hash, uint64_t vertex_hash) {
+		const auto pixel  = stage_cost.find(pixel_hash);
+		const auto vertex = stage_cost.find(vertex_hash ^ 0x9e3779b97f4a7c15ull);
+		return pixel != stage_cost.end() && vertex != stage_cost.end() && vertex->second > pixel->second;
+	}
+	void NoteStageCost(uint64_t pixel_hash, uint64_t vertex_hash, uint64_t pixel_ns, uint64_t vertex_ns) {
+		const auto note = [&](uint64_t key, uint64_t ns) {
+			auto [it, inserted] = stage_cost.try_emplace(key, static_cast<uint32_t>(std::min<uint64_t>(ns, 1u << 30)));
+			if (!inserted) {
+				it->second = static_cast<uint32_t>((uint64_t {it->second} * 7u + std::min<uint64_t>(ns, 1u << 30)) / 8u);
+			}
+		};
+		note(pixel_hash, pixel_ns);
+		note(vertex_hash ^ 0x9e3779b97f4a7c15ull, vertex_ns);
+	}
+
 	// The pixel and vertex stages of a draw: their lookups and materializations run at the same
 	// time (the vertex stage on the worker), then Get runs for each in the usual order (pixel
 	// first: the push data cursor and any compile stay sequential).
 	void GetPixelVertex(const ShaderParams& pixel_params, ShaderPixelInputInfo& pixel_info,
 	                    const ShaderParams& vertex_params, ShaderVertexInputInfo& vertex_info,
 	                    uint32_t& push_data_cursor, ShaderProgram& pixel, ShaderProgram& vertex) {
-		static MaterializeWorker worker;
+		auto&                    worker = Worker();
+		LookaheadJoin();
 		PreMaterialized          pre_vertex;
 		PreMaterialized          pre_pixel;
 		auto job = [&] {
@@ -1872,6 +2160,38 @@ struct PipelineCache::ProgramCache {
 			worker.Start(job);
 			worker.Wait();
 			PreMaterialize(pixel_params, pixel_info, ShaderType::Pixel, cp_pre_key, pre_pixel);
+		} else if (static auto& swap = Common::LiveSwitches::Get("KYTY_PARALLEL_SWAP", 0);
+		           swap.load(std::memory_order_relaxed) == 1 ||
+		           (swap.load(std::memory_order_relaxed) == 2 && SwapStages(pixel_params.hash, vertex_params.hash))) {
+			// KYTY_LOCAL_HACK KYTY_PARALLEL_SWAP (live, default 0: within noise, pn23/po23 off +1%): the pixel stage on the worker, the vertex
+			// stage on the CP (the CP waited ~4% for the vertex stage; the worker's reads are slower).
+			uint64_t pixel_ns  = 0;
+			auto     pixel_job = [&] {
+                const auto faults0 = RenderContext::ThreadFaultCount();
+                const auto start   = std::chrono::steady_clock::now();
+                PreMaterialize(pixel_params, pixel_info, ShaderType::Pixel, worker_key, pre_pixel);
+                pixel_ns = ElapsedNs(start);
+                g_worker_faults += RenderContext::ThreadFaultCount() - faults0;
+			};
+			worker.Start(pixel_job);
+			const auto start = std::chrono::steady_clock::now();
+			PreMaterialize(vertex_params, vertex_info, vertex_info.logical_stage, cp_pre_key, pre_vertex);
+			const auto vertex_ns = ElapsedNs(start);
+			worker.Wait();
+			NoteStageCost(pixel_params.hash, vertex_params.hash, pixel_ns, vertex_ns);
+		} else if (swap.load(std::memory_order_relaxed) == 2) {
+			uint64_t vertex_ns  = 0;
+			auto     vertex_job = [&] {
+                const auto start = std::chrono::steady_clock::now();
+                job();
+                vertex_ns = ElapsedNs(start);
+			};
+			worker.Start(vertex_job);
+			const auto start = std::chrono::steady_clock::now();
+			PreMaterialize(pixel_params, pixel_info, ShaderType::Pixel, cp_pre_key, pre_pixel);
+			const auto pixel_ns = ElapsedNs(start);
+			worker.Wait();
+			NoteStageCost(pixel_params.hash, vertex_params.hash, pixel_ns, vertex_ns);
 		} else {
 			worker.Start(job);
 			PreMaterialize(pixel_params, pixel_info, ShaderType::Pixel, cp_pre_key, pre_pixel);
@@ -1905,6 +2225,7 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor, const PreMaterialized* pre = nullptr) {
+		LookaheadJoin();
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -3125,7 +3446,21 @@ struct PipelineCache::ProgramCache {
 	ShaderRecompiler::Decoder::ShaderFunctionExpander          function_expander;
 	ProgramKey                                                  lookup_key;
 	ProgramKey                                                  worker_key; // KYTY_PARALLEL_MATERIALIZE
+	// KYTY_LOOKAHEAD: the next draw's stages, materialized on the worker into memo slots.
+	std::array<LookaheadSide, 2>                                lookahead_side; // 0 pixel, 1 vertex
+	std::array<ProgramKey, 2>                                   lookahead_key;
+	bool                                                        lookahead_pending = false;
+	std::function<void()>                                       lookahead_job;
+	// started draws, materialized stages, refused stages, adopted slots, memo hits on them,
+	// trusted slots, trusted hits
+	std::array<uint64_t, 8> lookahead_stats {}; // [7]: trusted slots whose reads changed (=3)
+	uint64_t                lookahead_wait_ns    = 0;
+	uint64_t                lookahead_prepare_ns = 0; // GetGraphicsPrograms: next draw's PrepareProgram + LookaheadStart
+	uint64_t                lookahead_epoch   = 1; // the draw being prepared (GetGraphicsPrograms)
+	bool                    lookahead_trusted = false;
+	std::chrono::steady_clock::time_point lookahead_report = std::chrono::steady_clock::now();
 	ProgramKey                                                  cp_pre_key;
+	std::unordered_map<uint64_t, uint32_t>                      stage_cost; // KYTY_PARALLEL_SWAP=2
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
 	// KYTY_RESOURCE_MEMO bookkeeping (GPU thread).
@@ -3372,6 +3707,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
     bool mesh_draw_indirect) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	m_program_cache->LookaheadNextDraw();
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		if (!PrepareTessellationPrograms(vertex_regs, context, vertex_info, vertex_params)) {
@@ -3384,10 +3720,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		KYTY_PROFILER_BLOCK("PipelineCache::PrepareProgram(VS)");
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
-	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
-	if (mesh_active) {
+	// The host-side mesh fields; false when the shader exceeds the host limits.
+	const auto mesh_host = [&](ShaderVertexInputInfo& info) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
-		auto& mesh              = vertex_info[0].mesh;
+		auto& mesh              = info.mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		// A subgroup with more threads than a mesh workgroup may have (NVIDIA: 128) runs its
@@ -3412,9 +3748,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		static auto& indirect_gpu = Common::LiveSwitches::Get("KYTY_MESH_INDIRECT_GPU", 1);
 		mesh.draw_data_indirect =
 		    mesh_draw_indirect && indirect_gpu.load(std::memory_order_relaxed) != 0;
-		if (mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+		return !(mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
+		         mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+		         mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize);
+	};
+	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	if (mesh_active) {
+		if (!mesh_host(vertex_info[0])) {
+			const auto& mesh = vertex_info[0].mesh;
 			// Skipped like the draws of a shader that gives up, and reported once per shader.
 			static std::mutex                   logged_mutex;
 			static std::unordered_set<uint64_t> logged;
@@ -3428,10 +3769,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return {};
 		}
 	}
-	ShaderParams pixel_params;
-	if (pixel_active) {
-		KYTY_PROFILER_BLOCK("PipelineCache::PrepareProgram(PS)");
-		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+	// The pixel stage's target and blending fields (context state).
+	const auto pixel_finish = [&](ShaderPixelInputInfo& info) {
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -3441,54 +3780,64 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				continue;
 			}
 			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
-				pixel_info.target_uint_mask |= 1u << slot;
+				info.target_uint_mask |= 1u << slot;
 			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
-				pixel_info.target_sint_mask |= 1u << slot;
+				info.target_sint_mask |= 1u << slot;
 			}
 		}
 		const auto& blend = context.GetBlendControl(0);
-		pixel_info.dual_source_blending =
+		info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		    (BlendFactorIsDualSource(blend.color_srcblend) ||
 		     BlendFactorIsDualSource(blend.color_destblend) ||
 		     (blend.separate_alpha_blend && (BlendFactorIsDualSource(blend.alpha_srcblend) ||
 		                                     BlendFactorIsDualSource(blend.alpha_destblend))));
-		if (pixel_info.dual_source_blending) {
+		if (info.dual_source_blending) {
 			// MRT1 supplies the second blend source for target 0.
-			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
-			pixel_info.target_uint_mask =
-			    (pixel_info.target_uint_mask & ~2u) | ((pixel_info.target_uint_mask & 1u) << 1u);
-			pixel_info.target_sint_mask =
-			    (pixel_info.target_sint_mask & ~2u) | ((pixel_info.target_sint_mask & 1u) << 1u);
+			info.target_output_mode[1]    = info.target_output_mode[0];
+			info.target_export_mapping[1] = info.target_export_mapping[0];
+			info.target_uint_mask =
+			    (info.target_uint_mask & ~2u) | ((info.target_uint_mask & 1u) << 1u);
+			info.target_sint_mask =
+			    (info.target_sint_mask & ~2u) | ((info.target_sint_mask & 1u) << 1u);
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
-		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
-		                       std::end(pixel_info.target_output_mode),
+		           info.target_output_mode[0] != 0 && info.target_output_mode[0] != 7 &&
+		           std::all_of(std::begin(info.target_output_mode) + 1,
+		                       std::end(info.target_output_mode),
 		                       [](uint8_t mode) { return mode == 0; }) &&
-		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
+		           ClassifyBlendMapping(blend, info.target_export_mapping[0]) ==
 		               BlendMappingSupport::SourceAlpha) {
 			// Preserve logical alpha when the export mapping moves it.
-			pixel_info.alpha_blend_source_remap = true;
-			pixel_info.dual_source_blending     = true;
-			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-			pixel_info.target_export_mapping[1] = {};
+			info.alpha_blend_source_remap = true;
+			info.dual_source_blending     = true;
+			info.target_output_mode[1]    = info.target_output_mode[0];
+			info.target_export_mapping[1] = {};
 		}
+	};
+	ShaderParams pixel_params;
+	if (pixel_active) {
+		KYTY_PROFILER_BLOCK("PipelineCache::PrepareProgram(PS)");
+		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_finish(pixel_info);
 	}
-	if (context.GetClipControl().clip_disable) {
-		const auto& viewport = context.GetScreenViewport().viewports[0];
-		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
-		clip.scale[0]        = viewport.xscale;
-		clip.scale[1]        = viewport.yscale;
-		clip.offset[0]       = viewport.xoffset;
-		clip.offset[1]       = viewport.yoffset;
-		clip.half_extent[0] =
-		    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
-		clip.half_extent[1] =
-		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
-		clip.enabled = true;
-	}
+	// The clip-space fields of the last geometry stage (context state).
+	const auto clip_finish = [&](ShaderVertexInputInfo& info) {
+		if (context.GetClipControl().clip_disable) {
+			const auto& viewport = context.GetScreenViewport().viewports[0];
+			const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
+			auto&       clip     = info.clip_space;
+			clip.scale[0]        = viewport.xscale;
+			clip.scale[1]        = viewport.yscale;
+			clip.offset[0]       = viewport.xoffset;
+			clip.offset[1]       = viewport.yoffset;
+			clip.half_extent[0] =
+			    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
+			clip.half_extent[1] =
+			    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
+			clip.enabled = true;
+		}
+	};
+	clip_finish(vertex_info[tess_active ? 2u : 0u]);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
@@ -3500,6 +3849,29 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		                                push_data_cursor, result.pixel, result.vertex[0]);
 		if (!result.vertex[0]) {
 			return {};
+		}
+		// KYTY_LOOKAHEAD: the next draw's programs, prepared from its predicted shader registers
+		// and this draw's context (the CP publishes a prediction only when they stay valid).
+		if (const auto* next = Lookahead::g_next; next != nullptr && next->GetPs().ps_regs.data_addr != 0) {
+			const auto prepare_start = std::chrono::steady_clock::now();
+			thread_local ShaderVertexInputInfo next_vertex_info;
+			thread_local ShaderPixelInputInfo  next_pixel_info;
+			next_vertex_info = {};
+			next_pixel_info  = {};
+			const auto next_vertex = PrepareProgram(next->GetVs(), context, user_config, next_vertex_info);
+			if (next_vertex_info.logical_stage != ShaderType::Mesh || mesh_host(next_vertex_info)) {
+				const auto next_pixel = PrepareProgram(next->GetPs(), sh, target_export_mapping, next_pixel_info);
+				pixel_finish(next_pixel_info);
+				clip_finish(next_vertex_info);
+				static auto& lookahead = Common::LiveSwitches::Get("KYTY_LOOKAHEAD", 0);
+				m_program_cache->LookaheadStart(next_pixel, next_pixel_info, next_vertex, next_vertex_info,
+				                                Lookahead::g_next_trusted &&
+				                                    lookahead.load(std::memory_order_relaxed) == 2 ||
+				                                    lookahead.load(std::memory_order_relaxed) == 3);
+			}
+			m_program_cache->lookahead_prepare_ns += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepare_start)
+			        .count());
 		}
 		return result;
 	}

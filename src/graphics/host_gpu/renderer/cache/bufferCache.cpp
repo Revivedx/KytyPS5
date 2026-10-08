@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/pipelineStats.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -32,6 +33,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <thread>
+#include <pthread.h>
 
 namespace Libs::Graphics {
 
@@ -946,6 +949,7 @@ bool BufferCache::TryDirectReadback(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (direct == 0 || buffer.Mapped().empty()) {
 		return false;
 	}
+	WaitUploadWorker(); // mapped bytes must hold every queued upload
 	if (!m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
 		if (direct < 2) {
 			return false;
@@ -1406,6 +1410,79 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t size);
+
+// KYTY_LOCAL_HACK KYTY_UPLOAD_WORKER (live, default 1; uw1 +2.4% fps): the guest-to-device copies of direct uploads run on a
+// worker thread (FIFO, so copies into the same bytes keep their order); the GPU thread waits for
+// them before every submit (CommandScheduler::Submit) and before reading mapped device memory.
+// As on the console, the GPU reads the memory when it runs, so a copy taken a little later is no
+// staler than the hardware's view.
+namespace {
+class UploadWorker {
+public:
+	static UploadWorker& Get() {
+		static UploadWorker worker;
+		return worker;
+	}
+	// GPU thread. False when the queue is full (the caller copies itself).
+	bool Push(uint8_t* destination, uint64_t address, uint64_t size) {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		if (head - m_tail.load(std::memory_order_acquire) >= Capacity) {
+			return false;
+		}
+		m_jobs[head % Capacity] = {destination, address, size};
+		m_head.store(head + 1, std::memory_order_release);
+		m_head.notify_one();
+		return true;
+	}
+	// GPU thread: every copy pushed so far is done.
+	void Wait() {
+		const auto head = m_head.load(std::memory_order_relaxed);
+		while (m_tail.load(std::memory_order_acquire) != head) {
+			__builtin_ia32_pause();
+		}
+	}
+
+private:
+	struct Job {
+		uint8_t* destination = nullptr;
+		uint64_t address     = 0;
+		uint64_t size        = 0;
+	};
+	static constexpr uint64_t Capacity = 8192;
+
+	UploadWorker() {
+		std::thread([this] {
+			pthread_setname_np(pthread_self(), "UploadWorker");
+			uint64_t tail = 0;
+			for (;;) {
+				uint64_t head = m_head.load(std::memory_order_acquire);
+				for (uint32_t spin = 0; head == tail && spin < 100000u; spin++) {
+					__builtin_ia32_pause();
+					head = m_head.load(std::memory_order_acquire);
+				}
+				if (head == tail) {
+					m_head.wait(tail, std::memory_order_acquire);
+					continue;
+				}
+				while (tail != head) {
+					const auto& job = m_jobs[tail % Capacity];
+					ReadGuestForUpload(job.destination, job.address, job.size);
+					tail++;
+					m_tail.store(tail, std::memory_order_release);
+				}
+			}
+		}).detach();
+	}
+
+	std::array<Job, Capacity> m_jobs {};
+	std::atomic<uint64_t>     m_head {0};
+	std::atomic<uint64_t>     m_tail {0};
+};
+} // namespace
+
+void WaitUploadWorker() {
+	UploadWorker::Get().Wait();
+}
 // Bytes uploaded through staging copies [0] and direct writes [1] (KYTY_SYNC_STATS).
 static std::array<std::atomic<uint64_t>, 2> g_upload_bytes {};
 
@@ -1478,8 +1555,16 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			    source = UploadCopies(buffer, copies, total_size);
 			    return;
 		    }
+		    static auto& upload_worker = Common::LiveSwitches::Get("KYTY_UPLOAD_WORKER", 1);
+		    const bool   deferred = upload_worker.load(std::memory_order_relaxed) != 0 &&
+		                          buffer.IsCoherent();
 		    for (const auto& copy: copies) {
 			    if (count) g_upload_bytes[1].fetch_add(copy.size, std::memory_order_relaxed);
+			    if (deferred && UploadWorker::Get().Push(buffer.Mapped().data() + copy.dstOffset,
+			                                            buffer.CpuAddress() + copy.dstOffset,
+			                                            copy.size)) {
+				    continue;
+			    }
 			    ReadGuestForUpload(buffer.Mapped().data() + copy.dstOffset,
 			                       buffer.CpuAddress() + copy.dstOffset, copy.size);
 			    if (!buffer.IsCoherent()) {
@@ -1544,9 +1629,15 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// KYTY_UPLOAD_WORKER: the staging copies too (the GPU copy reads them after the submit).
+		static auto& upload_worker = Common::LiveSwitches::Get("KYTY_UPLOAD_WORKER", 1);
+		const bool   deferred      = upload_worker.load(std::memory_order_relaxed) != 0 &&
+		                      m_staging_buffer.IsCoherent();
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			ReadGuestForUpload(mapped + copy.srcOffset, address, copy.size);
+			if (!deferred || !UploadWorker::Get().Push(mapped + copy.srcOffset, address, copy.size)) {
+				ReadGuestForUpload(mapped + copy.srcOffset, address, copy.size);
+			}
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -1630,6 +1721,7 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
+	PipelineStats::NoteWrite(vaddr, size);
 	ReadbackStats::NoteWrite(vaddr, size, m_scheduler.CurrentTick());
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
@@ -1701,6 +1793,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	if (!is_gds) PipelineStats::NoteWrite(vaddr, size);
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -1729,6 +1822,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
+	if (!dst_gds) PipelineStats::NoteWrite(dst_vaddr, size);
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||
