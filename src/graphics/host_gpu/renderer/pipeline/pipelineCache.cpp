@@ -169,7 +169,9 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 thread_local bool t_parallel_worker  = false;
 thread_local bool t_parallel_refused = false;
 thread_local bool t_materialize_evaluated = false; // the last Materialize evaluated (no memo hit)
-std::atomic<uint64_t> g_worker_faults {0}; // faults handled on the worker (must stay 0)
+std::atomic<uint64_t> g_worker_faults {0};
+std::atomic<uint64_t> g_la_log_bad {0};     // KYTY_LOOKAHEAD=3 diagnostics
+std::atomic<uint64_t> g_la_log_checked {0}; // faults handled on the worker (must stay 0)
 uint64_t              g_cp_pre_faults = 0; // faults during the CP's last pixel pre-materialize
 
 bool CleanGuestRead(uint64_t address, void* data, uint64_t size) {
@@ -1475,6 +1477,7 @@ struct PipelineCache::ProgramCache {
 			if (!same) {
 				continue;
 			}
+			thread_local std::vector<uint32_t> memo_words; // per thread (parallel materialize)
 			memo_words.resize(read.count);
 			const bool ok = ReadShaderGuestMemoryImpl(&reads, address, memo_words);
 			same = ok == read.ok && (!ok || std::equal(memo_words.begin(), memo_words.end(),
@@ -1545,6 +1548,10 @@ struct PipelineCache::ProgramCache {
 	}
 
 	bool ReadsUnchanged(const ShaderReadChunks::ReadLog& log, ShaderReadChunks& reads) {
+		// Per thread: the CP (pixel stage) and the MaterializeWkr (vertex stage) check their memo
+		// slots at the same time (KYTY_PARALLEL_MATERIALIZE); a shared buffer let one thread
+		// compare the words the other had just read.
+		thread_local std::vector<uint32_t> memo_words;
 		for (const auto& read: log.reads) {
 			memo_words.resize(read.count);
 			const bool ok = ReadShaderGuestMemoryImpl(&reads, read.address, memo_words);
@@ -1924,6 +1931,23 @@ struct PipelineCache::ProgramCache {
 		const auto faults = RenderContext::ThreadFaultCount() - faults0;
 		g_worker_faults += faults;
 		side.ok = ok && !t_parallel_refused && faults == 0;
+		static auto& lookahead_mode = Common::LiveSwitches::Get("KYTY_LOOKAHEAD", 0);
+		if (side.ok && lookahead_mode.load(std::memory_order_relaxed) == 3) {
+			// Diagnostics: the logged words against guest memory right after the evaluation.
+			for (const auto& read: slot.log.reads) {
+				for (uint32_t i = 0; read.ok && i < read.count; i++) {
+					uint32_t word = 0;
+					if (Libs::LibKernel::Memory::TryReadGpuCleanBackingConcurrent(read.address + i * 4u, &word, 4) &&
+					    word != slot.log.words[read.first + i]) {
+						if (g_la_log_bad.fetch_add(1, std::memory_order_relaxed) < 20) {
+							std::printf("Lookahead worker LOG != MEMORY: 0x%016" PRIx64 " logged 0x%08x memory 0x%08x (read %u words)\n",
+							            read.address + i * 4u, slot.log.words[read.first + i], word, read.count);
+						}
+					}
+				}
+			}
+			g_la_log_checked.fetch_add(1, std::memory_order_relaxed);
+		}
 		if (side.ok) {
 			slot.user_data.assign(user_data.begin(), user_data.end());
 			slot.shader_base     = runtime.shader_base;
@@ -1947,6 +1971,7 @@ struct PipelineCache::ProgramCache {
 			static uint32_t reported = 0;
 			if (reported < 40) {
 				reported++;
+				thread_local std::vector<uint32_t> memo_words; // per thread
 				for (const auto& read: slot.log.reads) {
 					memo_words.resize(read.count);
 					const bool ok = ReadShaderGuestMemoryImpl(&reads, read.address, memo_words);
@@ -1956,8 +1981,36 @@ struct PipelineCache::ProgramCache {
 						while (ok && read.ok && i < read.count && memo_words[i] == slot.log.words[read.first + i]) {
 							i++;
 						}
-						std::printf("Lookahead trusted CHANGED: read 0x%016" PRIx64 " +%u words (of %zu reads): ok %d -> %d, "
+						uint32_t raw = 0;
+						const uint64_t at = read.address + i * 4u;
+						const bool raw_ok = Libs::LibKernel::Memory::TryReadGpuCleanBackingConcurrent(at, &raw, 4);
+						// The CP's views of the same word: a fresh page reader, the page-backing verdicts,
+						// the clean read and the backing store.
+						std::array<uint32_t, 1> fresh_word {};
+						ShaderReadChunks        fresh(ShaderReadChunks::Mode());
+						const bool fresh_ok = ReadShaderGuestMemoryImpl(&fresh, at, fresh_word);
+						const uint64_t page = at & ~uint64_t {TRACKER_PAGE_SIZE - 1};
+						const auto* cp_page = Libs::LibKernel::Memory::FindGpuCleanBacking(page, TRACKER_PAGE_SIZE);
+						const auto* wk_page = Libs::LibKernel::Memory::FindGpuCleanBackingConcurrent(page, TRACKER_PAGE_SIZE);
+						uint32_t clean_word = 0, backing_word = 0;
+						const bool clean_ok   = Libs::LibKernel::Memory::TryReadGpuCleanBacking(at, &clean_word, 4);
+						const bool backing_ok = Libs::LibKernel::Memory::TryReadBacking(at, &backing_word, 4);
+						std::printf("Lookahead views 0x%016" PRIx64 ": fresh %d 0x%08x, cp page %s%s 0x%08x, worker page %s, "
+						            "clean %d 0x%08x, backing %d 0x%08x\n",
+						            at, fresh_ok ? 1 : 0, fresh_word[0], cp_page != nullptr ? "clean" : "NULL",
+						            cp_page != nullptr && cp_page != wk_page && wk_page != nullptr ? " (DIFFERENT ptr)" : "",
+						            cp_page != nullptr ? *reinterpret_cast<const uint32_t*>(cp_page + (at - page)) : 0u,
+						            wk_page != nullptr ? "clean" : "NULL", clean_ok ? 1 : 0, clean_word,
+						            backing_ok ? 1 : 0, backing_word);
+						std::printf("Lookahead trusted CHANGED (raw now %d 0x%08x; worker log!=memory %llu of %llu slots): ",
+						            raw_ok ? 1 : 0, raw, (unsigned long long)g_la_log_bad.load(),
+						            (unsigned long long)g_la_log_checked.load());
+						std::printf("%.1f us after start, cp writes %llu, commands %llu; "
+						            "read 0x%016" PRIx64 " +%u words (of %zu reads): ok %d -> %d, "
 						            "word %u 0x%08x -> 0x%08x\n",
+						            ElapsedNs(lookahead_start_time) / 1e3,
+						            (unsigned long long)(Lookahead::g_cp_writes - lookahead_start_writes),
+						            (unsigned long long)(Lookahead::g_commands - lookahead_start_commands),
 						            read.address, read.count, slot.log.reads.size(), read.ok ? 1 : 0, ok ? 1 : 0, i,
 						            read.ok && i < read.count ? slot.log.words[read.first + i] : 0u,
 						            ok && i < read.count ? memo_words[i] : 0u);
@@ -2018,6 +2071,10 @@ struct PipelineCache::ProgramCache {
 		}
 		lookahead_pending = true;
 		lookahead_trusted = trusted;
+		lookahead_start_time     = std::chrono::steady_clock::now();
+		lookahead_start_writes   = Lookahead::g_cp_writes;
+		lookahead_start_commands = Lookahead::g_commands;
+		lookahead_start_gpu      = Lookahead::g_write_count;
 		if (trusted) {
 			while (Lookahead::g_watch_lock.test_and_set(std::memory_order_acquire)) {
 				__builtin_ia32_pause();
@@ -3454,6 +3511,8 @@ struct PipelineCache::ProgramCache {
 	// started draws, materialized stages, refused stages, adopted slots, memo hits on them,
 	// trusted slots, trusted hits
 	std::array<uint64_t, 8> lookahead_stats {}; // [7]: trusted slots whose reads changed (=3)
+	std::chrono::steady_clock::time_point lookahead_start_time;
+	uint64_t                lookahead_start_writes = 0, lookahead_start_commands = 0, lookahead_start_gpu = 0;
 	uint64_t                lookahead_wait_ns    = 0;
 	uint64_t                lookahead_prepare_ns = 0; // GetGraphicsPrograms: next draw's PrepareProgram + LookaheadStart
 	uint64_t                lookahead_epoch   = 1; // the draw being prepared (GetGraphicsPrograms)
@@ -3482,7 +3541,6 @@ struct PipelineCache::ProgramCache {
 	uint64_t                              rebase_disabled = 0;
 	std::vector<uint32_t>                 rebase_old;
 	std::vector<uint32_t>                 rebase_new;
-	std::vector<uint32_t>                 memo_words; // research paths (GPU thread only)
 	std::chrono::steady_clock::time_point memo_report = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;

@@ -24,6 +24,10 @@ inline std::atomic<bool>                            g_watch {false};
 inline std::atomic_flag                             g_watch_lock;
 inline std::array<std::pair<uint64_t, uint64_t>, WatchSize> g_writes {};
 inline size_t                                       g_write_count = 0; // > WatchSize: overflow
+// Diagnostics (KYTY_LOOKAHEAD=3): guest memory writes made by the CP itself (WRITE_DATA, DMA_DATA,
+// DUMP_CONST_RAM) and commands run from other threads (GuestGpu::ProcessCommands), GPU thread only.
+inline uint64_t g_cp_writes = 0;
+inline uint64_t g_commands  = 0;
 
 inline void NoteWrite(uint64_t vaddr, uint64_t size) noexcept {
 	if (!g_watch.load(std::memory_order_acquire) || size == 0) return;
