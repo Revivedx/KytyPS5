@@ -47,7 +47,9 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <spirv-tools/libspirv.hpp>
@@ -173,6 +175,25 @@ std::atomic<uint64_t> g_worker_faults {0};
 std::atomic<uint64_t> g_la_log_bad {0};     // KYTY_LOOKAHEAD=3 diagnostics
 std::atomic<uint64_t> g_la_log_checked {0}; // faults handled on the worker (must stay 0)
 uint64_t              g_cp_pre_faults = 0; // faults during the CP's last pixel pre-materialize
+// KYTY_LOCAL_HACK research KYTY_SERVE_CENSUS (live, default 0): Materialize time by stage and outcome
+// (memo hit, miss whose reads were all GPU-clean = servable by a clean-only reader ahead of the CP,
+// miss that needed a non-clean read). Rows: pixel, vertex/mesh, compute, any stage on the worker.
+thread_local bool t_walk_unclean = false;
+thread_local int  t_census_row   = 1;
+struct ServeCensus {
+	std::array<std::array<std::atomic<uint64_t>, 3>, 4> ns {};
+	std::array<std::array<std::atomic<uint64_t>, 3>, 4> calls {};
+};
+ServeCensus g_serve_census;
+bool ServeCensusOn() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_SERVE_CENSUS", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+int CensusRow(Libs::Graphics::ShaderType stage) {
+	return stage == Libs::Graphics::ShaderType::Pixel     ? 0
+	       : stage == Libs::Graphics::ShaderType::Compute ? 2
+	                                                      : 1;
+}
 
 bool CleanGuestRead(uint64_t address, void* data, uint64_t size) {
 	return t_parallel_worker
@@ -439,6 +460,7 @@ bool ReadShaderGuestMemoryImpl(ShaderReadChunks* chunks, uint64_t address,
 	                                                    values.size_bytes())) {
 		return true;
 	}
+	t_walk_unclean = true;
 	if (t_parallel_worker) {
 		t_parallel_refused = true;
 		return false;
@@ -848,7 +870,18 @@ struct PipelineCache::ProgramCache {
 		uint64_t                                     stat_exact = 0;
 		uint64_t                                     stat_pred  = 0;
 		ShaderType                                   stat_stage = ShaderType::Unknown;
+		// KYTY_DRAW_PREP: held around every evaluation of resource_plan (its trace and walk state
+		// are mutable), which the scanner thread runs too.
+		std::mutex                                   walk_mutex;
 	};
+
+	static bool MaterializeLocked(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                              ShaderRecompiler::IR::ResourceSnapshot&       resources,
+	                              ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		std::lock_guard lock(entry.walk_mutex);
+		return ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime, resources,
+		                                                  specialization);
+	}
 
 	static constexpr size_t MemoSlots = 8;
 
@@ -858,11 +891,28 @@ struct PipelineCache::ProgramCache {
 	// stored result instead of evaluating the resource plan again.
 	bool Materialize(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
 	                 ShaderReadChunks& reads) {
+		if (!ServeCensusOn()) {
+			return MaterializeImpl(entry, runtime, reads);
+		}
+		t_walk_unclean   = false;
+		const auto start = std::chrono::steady_clock::now();
+		const bool ok    = MaterializeImpl(entry, runtime, reads);
+		const auto ns    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - start)
+                                                  .count());
+		const int  row   = t_parallel_worker ? 3 : t_census_row;
+		const int  col   = !t_materialize_evaluated ? 0 : (t_walk_unclean ? 2 : 1);
+		g_serve_census.ns[row][col].fetch_add(ns, std::memory_order_relaxed);
+		g_serve_census.calls[row][col].fetch_add(1, std::memory_order_relaxed);
+		return ok;
+	}
+
+	bool MaterializeImpl(SourceEntry& entry, const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                     ShaderReadChunks& reads) {
 		t_materialize_evaluated = true; // cleared again by a memo hit
 		if (!ResourceMemoEnabled()) {
 			DrawRecordCensus::g_flags |= 1u;
-			return ShaderRecompiler::IR::MaterializeResources(
-			    entry.resource_plan, runtime, entry.resources, entry.specialization);
+			return MaterializeLocked(entry, runtime, entry.resources, entry.specialization);
 		}
 		memo_clock++;
 		for (auto& slot: entry.memo) {
@@ -882,6 +932,9 @@ struct PipelineCache::ProgramCache {
 				t_materialize_evaluated = false;
 				memo_hits++;
 				lookahead_stats[4] += slot.ahead ? 1u : 0u;
+				if (slot.ahead) {
+					DrawPrep::Add(DrawPrep::Counter::AheadHits);
+				}
 				slot.ahead = false;
 				entry.stat_exact++;
 				DrawRecordCensus::g_flags |= 4u;
@@ -909,8 +962,7 @@ struct PipelineCache::ProgramCache {
 				// this plan and the real result is used.
 				const auto predicted      = entry.resources;
 				const auto predicted_spec = entry.specialization;
-				const bool ok             = ShaderRecompiler::IR::MaterializeResources(
-                    entry.resource_plan, runtime, entry.resources, entry.specialization);
+				const bool ok             = MaterializeLocked(entry, runtime, entry.resources, entry.specialization);
 				rebase_verified++;
 				if (!ok || predicted_spec != entry.specialization ||
 				    !SameSnapshotWords(predicted, entry.resources)) {
@@ -953,8 +1005,7 @@ struct PipelineCache::ProgramCache {
 		// Timed only for the miss classifier (KYTY_MEMO_CLASSIFY).
 		const auto miss_start = memo_last_class >= 0 ? std::chrono::steady_clock::now()
 		                                             : std::chrono::steady_clock::time_point {};
-		const bool ok = ShaderRecompiler::IR::MaterializeResources(
-		    entry.resource_plan, runtime, entry.resources, entry.specialization);
+		const bool ok = MaterializeLocked(entry, runtime, entry.resources, entry.specialization);
 		reads.SetLog(nullptr);
 		ReadStabilityCensus(entry, log);
 		DrawRecordCensus::g_flags |= memo_last_class == 6 || memo_last_class == 8 ? 8u : 1u;
@@ -1622,6 +1673,20 @@ struct PipelineCache::ProgramCache {
 		::printf("Resource memo delta (5 s): pass same %" PRIu64 " / differ %" PRIu64
 		         ", reloc same %" PRIu64 " / differ %" PRIu64 "\n",
 		         memo_delta_kinds[0], memo_delta_kinds[1], memo_delta_kinds[2], memo_delta_kinds[3]);
+		if (ServeCensusOn()) {
+			static const char* rows[4] = {"px", "vs", "cs", "wkr"};
+			::printf("Serve census (5 s):");
+			for (int r = 0; r < 4; r++) {
+				::printf(" %s", rows[r]);
+				for (int c = 0; c < 3; c++) {
+					::printf(" %.1fms/%" PRIu64,
+					         static_cast<double>(g_serve_census.ns[r][c].exchange(0)) / 1e6,
+					         g_serve_census.calls[r][c].exchange(0));
+				}
+				::printf(";");
+			}
+			::printf(" (hit / miss clean / miss unclean)\n");
+		}
 		::printf("Resource memo rebase (5 s): %" PRIu64 " predicted, %" PRIu64 " verified, %" PRIu64
 		         " failed, %" PRIu64 " plans disabled\n",
 		         rebase_hits, rebase_verified, rebase_failed, rebase_disabled);
@@ -1813,6 +1878,7 @@ struct PipelineCache::ProgramCache {
 			runtime.page_userdata = &read_chunks;
 		}
 		t_parallel_refused = false;
+		t_census_row            = CensusRow(stage);
 		const bool materialized = Materialize(entry->second, runtime, read_chunks);
 		out.ok    = materialized && !t_parallel_refused;
 		out.entry = &entry->second;
@@ -1839,7 +1905,7 @@ struct PipelineCache::ProgramCache {
 		};
 		ShaderRecompiler::IR::ResourceSnapshot       fresh;
 		ShaderRecompiler::IR::ResourceSpecialization fresh_spec;
-		const bool ok = ShaderRecompiler::IR::MaterializeResources(entry.resource_plan, runtime, fresh,
+		const bool ok = MaterializeLocked(entry, runtime, fresh,
 		                                                           fresh_spec);
 		static uint64_t checks = 0, differ = 0;
 		checks++;
@@ -1925,8 +1991,7 @@ struct PipelineCache::ProgramCache {
 		slot.log.words.clear();
 		read_chunks.SetLog(&slot.log);
 		t_parallel_refused = false;
-		const bool ok      = ShaderRecompiler::IR::MaterializeResources(
-            side.entry->resource_plan, runtime, slot.resources, slot.specialization);
+		const bool ok      = MaterializeLocked(*side.entry, runtime, slot.resources, slot.specialization);
 		read_chunks.SetLog(nullptr);
 		const auto faults = RenderContext::ThreadFaultCount() - faults0;
 		g_worker_faults += faults;
@@ -1958,6 +2023,233 @@ struct PipelineCache::ProgramCache {
 	}
 
 	void LookaheadNextDraw() { lookahead_epoch++; }
+
+	// KYTY_DRAW_PREP (drawPrep.h). A stage the scanner evaluated: a memo slot for its entry.
+	struct ScanStage {
+		SourceEntry* entry   = nullptr;
+		ShaderType   stage   = ShaderType::Unknown;
+		bool         adopted = false;
+		MemoSlot     slot;
+	};
+	struct ScanResult {
+		DrawPrep::Key            key;
+		uint32_t                 count = 0;
+		std::array<ScanStage, 2> stages;
+	};
+	struct ScanStore {
+		std::mutex                                               mutex;
+		std::array<std::deque<ScanResult>, DrawPrep::MaxQueues> pending;
+		std::vector<ScanResult>                                  recycled; // buffers to reuse
+	};
+	static constexpr size_t ScanMaxPending  = 8192;
+	static constexpr size_t ScanMaxRecycled = 4096;
+
+	// Scanner thread: evaluates one stage into `out` (worker reads: GPU-clean only).
+	template <typename InputInfo>
+	bool ScanEvaluate(const ShaderParams& params, const InputInfo& input_info, ShaderType stage,
+	                  ScanStage& out) {
+		if (SkipShaderRequested(params.hash) || LiveSkipShader(params.hash, stage)) {
+			DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
+			return false;
+		}
+		thread_local ProgramKey key;
+		const auto              user_data = std::span(params.user_data).first(params.user_data_count);
+		SourceEntry*            entry     = nullptr;
+		{
+			std::shared_lock programs_lock(programs_mutex);
+			BuildLookupKey(params, input_info, stage, user_data, key);
+			if (!unsupported.contains(key)) {
+				if (const auto found = programs.find(key); found != programs.end()) {
+					entry = &found->second;
+				}
+			}
+		}
+		if (entry == nullptr) {
+			DrawPrep::Add(DrawPrep::Counter::SkipNoEntry);
+			return false;
+		}
+		ShaderReadChunks                 read_chunks(ShaderReadChunks::Mode());
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data                  = user_data,
+		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryRaw,
+		    .userdata                   = &read_chunks,
+		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
+		};
+		if (read_chunks.PageMode()) {
+			runtime.map_clean_page = +[](void* userdata, uint64_t page) {
+				return static_cast<ShaderReadChunks*>(userdata)->MapPage(page);
+			};
+			runtime.log_read = +[](void* userdata, uint64_t address, uint32_t word) {
+				static_cast<ShaderReadChunks*>(userdata)->Log(address, {&word, 1}, true);
+			};
+			runtime.page_userdata = &read_chunks;
+		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				runtime.workgroup_count[axis] = input_info.dispatch_groups[axis];
+				runtime.workgroup_size[axis]  = input_info.threads_num[axis];
+			}
+		}
+		auto& slot = out.slot;
+		slot.log.reads.clear();
+		slot.log.words.clear();
+		read_chunks.SetLog(&slot.log);
+		t_parallel_refused = false;
+		const auto faults0 = RenderContext::ThreadFaultCount();
+		const bool ok = MaterializeLocked(*entry, runtime, slot.resources, slot.specialization);
+		read_chunks.SetLog(nullptr);
+		if (!ok || t_parallel_refused || RenderContext::ThreadFaultCount() != faults0) {
+			DrawPrep::Add(DrawPrep::Counter::FailWalk);
+			return false;
+		}
+		slot.user_data.assign(user_data.begin(), user_data.end());
+		slot.shader_base     = runtime.shader_base;
+		slot.workgroup_count = runtime.workgroup_count;
+		slot.workgroup_size  = runtime.workgroup_size;
+		slot.resources.user_data.assign(user_data.begin(), user_data.end());
+		slot.ahead         = true;
+		slot.trusted_epoch = 0;
+		out.entry          = entry;
+		out.stage          = stage;
+		out.adopted        = false;
+		DrawPrep::Add(DrawPrep::Counter::Prepared);
+		return true;
+	}
+
+	// Scanner thread: a result object, with buffers of one the GPU thread is done with.
+	ScanResult ScanBegin(const DrawPrep::Key& key) {
+		ScanResult result;
+		{
+			std::lock_guard lock(scan_store.mutex);
+			if (!scan_store.recycled.empty()) {
+				result = std::move(scan_store.recycled.back());
+				scan_store.recycled.pop_back();
+			}
+		}
+		result.key   = key;
+		result.count = 0;
+		return result;
+	}
+
+	void ScanPublish(ScanResult&& result) {
+		if (result.count == 0) {
+			std::lock_guard lock(scan_store.mutex);
+			if (scan_store.recycled.size() < ScanMaxRecycled) {
+				scan_store.recycled.push_back(std::move(result));
+			}
+			return;
+		}
+		std::lock_guard lock(scan_store.mutex);
+		auto&           pending = scan_store.pending[result.key.queue % DrawPrep::MaxQueues];
+		if (pending.size() >= ScanMaxPending) {
+			DrawPrep::Add(DrawPrep::Counter::Dropped);
+			return;
+		}
+		pending.push_back(std::move(result));
+	}
+
+	// GPU thread: the scanner's result for the packet being executed, or null. Results of
+	// packets passed without asking are recycled.
+	ScanResult* ScanTake() {
+		const auto* key = DrawPrep::Current();
+		if (key == nullptr || DrawPrep::Mode() == 0) {
+			return nullptr;
+		}
+		if (scan_taken_valid && scan_taken.key == *key) {
+			return &scan_taken; // another draw of the same packet
+		}
+		DrawPrep::Add(DrawPrep::Counter::Takes);
+		std::lock_guard lock(scan_store.mutex);
+		if (scan_taken_valid && scan_store.recycled.size() < ScanMaxRecycled) {
+			scan_store.recycled.push_back(std::move(scan_taken));
+		}
+		scan_taken_valid = false;
+		auto& pending    = scan_store.pending[key->queue % DrawPrep::MaxQueues];
+		while (!pending.empty() && pending.front().key.Before(*key)) {
+			DrawPrep::Add(DrawPrep::Counter::Stale);
+			if (scan_store.recycled.size() < ScanMaxRecycled) {
+				scan_store.recycled.push_back(std::move(pending.front()));
+			}
+			pending.pop_front();
+		}
+		if (pending.empty() || !(pending.front().key == *key)) {
+			DrawPrep::Add(DrawPrep::Counter::MissNone);
+			return nullptr;
+		}
+		scan_taken = std::move(pending.front());
+		pending.pop_front();
+		scan_taken_valid = true;
+		return &scan_taken;
+	}
+
+	// GPU thread: stores the prepared slot of `stage` in its entry's memo when it was made from
+	// these inputs; Materialize then uses it only as a memo hit (logged reads unchanged).
+	void ScanAdopt(ShaderType stage, const ShaderParams& params) {
+		auto* result = ScanTake();
+		if (result == nullptr) {
+			return;
+		}
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		for (uint32_t i = 0; i < result->count; i++) {
+			auto& prepared = result->stages[i];
+			if (prepared.stage != stage || prepared.adopted) {
+				continue;
+			}
+			if (prepared.slot.shader_base != params.Base() ||
+			    !std::ranges::equal(prepared.slot.user_data, user_data)) {
+				DrawPrep::Add(DrawPrep::Counter::MissInputs);
+				continue;
+			}
+			auto&     entry = *prepared.entry;
+			MemoSlot* slot  = nullptr;
+			for (auto& s: entry.memo) {
+				if (s.shader_base == prepared.slot.shader_base && s.user_data == prepared.slot.user_data &&
+				    s.workgroup_count == prepared.slot.workgroup_count &&
+				    s.workgroup_size == prepared.slot.workgroup_size) {
+					slot = &s;
+					break;
+				}
+			}
+			if (slot == nullptr) {
+				if (entry.memo.size() < MemoSlots) {
+					slot = &entry.memo.emplace_back();
+				} else {
+					slot = &*std::ranges::min_element(entry.memo, {}, &MemoSlot::last_use);
+				}
+			}
+			// Swapped: the replaced slot's buffers go back to the scanner with the result.
+			std::swap(*slot, prepared.slot);
+			slot->last_use   = ++memo_clock;
+			prepared.adopted = true;
+			DrawPrep::Add(DrawPrep::Counter::Adopted);
+		}
+	}
+
+	// Scanner thread: both stages of a draw.
+	void ScanDraw(const DrawPrep::Key& key, const ShaderParams* pixel_params,
+	              const ShaderPixelInputInfo& pixel_info, const ShaderParams& vertex_params,
+	              const ShaderVertexInputInfo& vertex_info) {
+		auto result = ScanBegin(key);
+		if (pixel_params != nullptr &&
+		    ScanEvaluate(*pixel_params, pixel_info, ShaderType::Pixel, result.stages[result.count])) {
+			result.count++;
+		}
+		if (ScanEvaluate(vertex_params, vertex_info, vertex_info.logical_stage, result.stages[result.count])) {
+			result.count++;
+		}
+		ScanPublish(std::move(result));
+	}
+
+	void ScanDispatch(const DrawPrep::Key& key, const ShaderParams& params,
+	                  const ShaderComputeInputInfo& input_info) {
+		auto result = ScanBegin(key);
+		if (ScanEvaluate(params, input_info, ShaderType::Compute, result.stages[0])) {
+			result.count = 1;
+		}
+		ScanPublish(std::move(result));
+	}
 
 	// The memo's read check; a slot trusted for this draw skips it (KYTY_LOOKAHEAD=3 still
 	// re-reads and counts the trusted slots whose reads changed).
@@ -2194,6 +2486,9 @@ struct PipelineCache::ProgramCache {
 	                    uint32_t& push_data_cursor, ShaderProgram& pixel, ShaderProgram& vertex) {
 		auto&                    worker = Worker();
 		LookaheadJoin();
+		// KYTY_DRAW_PREP: the scanner's slots of this draw go to the memo before either stage runs.
+		ScanAdopt(ShaderType::Pixel, pixel_params);
+		ScanAdopt(vertex_info.logical_stage, vertex_params);
 		PreMaterialized          pre_vertex;
 		PreMaterialized          pre_pixel;
 		auto job = [&] {
@@ -2373,6 +2668,10 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry != programs.end()) {
 			bool materialized = false;
+			t_census_row      = CensusRow(stage);
+			if (pre == nullptr) {
+				ScanAdopt(stage, params); // KYTY_DRAW_PREP
+			}
 			if (pre != nullptr && pre->ok && pre->entry == &entry->second) {
 				materialized = true; // done ahead (KYTY_PARALLEL_MATERIALIZE)
 				// KYTY_PARALLEL_MATERIALIZE=2: materialize again here and compare (verify).
@@ -2722,7 +3021,10 @@ struct PipelineCache::ProgramCache {
 		g_recompile_translate_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 		    std::chrono::steady_clock::now() - translate_start).count());
 		if (!translated.unsupported && !translated.call_target_user_data.empty() &&
-		    call_targets.try_emplace(params.hash, translated.call_target_user_data).second) {
+		    [&] {
+		        std::unique_lock programs_lock(programs_mutex);
+		        return call_targets.try_emplace(params.hash, translated.call_target_user_data).second;
+		    }()) {
 			for (const auto index: translated.call_target_user_data) {
 				lookup_key.static_state.push_back(index < user_data.size() ? user_data[index] : 0u);
 			}
@@ -2730,7 +3032,10 @@ struct PipelineCache::ProgramCache {
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
-			unsupported.insert(lookup_key);
+			{
+				std::unique_lock programs_lock(programs_mutex);
+				unsupported.insert(lookup_key);
+			}
 			return ShaderProgram {};
 		}
 		if (!shader_clock && UsesShaderClock(translated.program)) {
@@ -2743,14 +3048,19 @@ struct PipelineCache::ProgramCache {
 				     ": S_MEMREALTIME needs shaderDeviceClock\n",
 				     static_cast<uint32_t>(stage), params.hash);
 			}
-			unsupported.insert(lookup_key);
+			{
+				std::unique_lock programs_lock(programs_mutex);
+				unsupported.insert(lookup_key);
+			}
 			return ShaderProgram {};
 		}
 		if (entry == programs.end()) {
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
+			{
+				std::unique_lock programs_lock(programs_mutex);
+				entry = programs.try_emplace(lookup_key,
+				    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			}
+			if (!MaterializeLocked(entry->second, runtime, entry->second.resources,
 			        entry->second.specialization)) {
 				if (!ShaderFailureNonFatal()) {
 					EXIT("shader resource materialization failed\n");
@@ -3209,9 +3519,11 @@ struct PipelineCache::ProgramCache {
 			}
 			auto plan         = std::move(source.plan);
 			source.plan_taken = true;
-			entry = programs.try_emplace(lookup_key, std::move(*plan)).first;
-			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
+			{
+				std::unique_lock programs_lock(programs_mutex);
+				entry = programs.try_emplace(lookup_key, std::move(*plan)).first;
+			}
+			if (!MaterializeLocked(entry->second, runtime, entry->second.resources,
 			        entry->second.specialization)) {
 				if (!ShaderFailureNonFatal()) {
 					EXIT("shader resource materialization failed\n");
@@ -3499,6 +3811,10 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, ExpandMemo> expand_memo;
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// KYTY_DRAW_PREP: taken exclusively by the GPU thread when it inserts into programs,
+	// unsupported or call_targets (entries are never erased), shared by the scanner's lookups.
+	std::shared_mutex                                            programs_mutex;
+	ScanStore                                                    scan_store;
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander          function_expander;
 	ProgramKey                                                  lookup_key;
@@ -3524,6 +3840,8 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
 	// KYTY_RESOURCE_MEMO bookkeeping (GPU thread).
 	uint64_t                              memo_clock  = 0;
+	ScanResult                            scan_taken;       // KYTY_DRAW_PREP: GPU thread's current result
+	bool                                  scan_taken_valid = false;
 	uint64_t                              memo_hits   = 0;
 	uint64_t                              memo_misses = 0;
 	std::array<uint64_t, 6>               memo_miss_kinds {};
@@ -3758,6 +4076,108 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+// The host-side mesh fields; false when the shader exceeds the host limits.
+bool PipelineCache::MeshHost(ShaderVertexInputInfo& info, bool mesh_draw_indirect) const {
+	EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+	auto& mesh              = info.mesh;
+	mesh.host_subgroup_size = m_graphics.subgroup_size;
+	const auto& limits      = m_graphics.mesh_shader_properties;
+	// A subgroup with more threads than a mesh workgroup may have (NVIDIA: 128) runs its
+	// waves in passes; see EmitMeshEntryPoint.
+	mesh.passes = mesh.PassesFor(
+	    std::min(limits.maxMeshWorkGroupInvocations, limits.maxMeshWorkGroupSize[0]));
+	// Guest wave32 waves sharing one wider host subgroup (RADV runs mesh shaders as wave64
+	// and cannot be asked for a subgroup size there) would read each other's ballots:
+	// wave 1 then used wave 0's EXEC/VCC masks and dropped its primitives (Wolverine
+	// skin "cracks"). One guest wave per pass keeps every host subgroup to one wave.
+	// KYTY_MESH_WAVE_PASSES=0 restores the shared-subgroup layout for comparison.
+	static const bool wave_passes = [] {
+		const char* value = std::getenv("KYTY_MESH_WAVE_PASSES");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (wave_passes && mesh.passes != 0 && mesh.wave_size < mesh.host_subgroup_size &&
+	    mesh.Waves() > 1) {
+		mesh.passes = mesh.Waves();
+	}
+	// Indirect mesh draws read their arguments on the GPU (MeshIndirectDraw).
+	// KYTY_MESH_INDIRECT_GPU=0 (live) restores the CPU read for every draw.
+	static auto& indirect_gpu = Common::LiveSwitches::Get("KYTY_MESH_INDIRECT_GPU", 1);
+	mesh.draw_data_indirect =
+	    mesh_draw_indirect && indirect_gpu.load(std::memory_order_relaxed) != 0;
+	return !(mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
+	         mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+	         mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize);
+}
+
+// The pixel stage's target and blending fields (context state).
+void PipelineCache::PixelFinish(const HW::Context& context, ShaderPixelInputInfo& info) {
+	// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
+	// In particular, 32-bit exports can carry raw integer material data.
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt = context.GetRenderTarget(slot);
+		if (rt.base.addr == 0 ||
+		    render_target_mask_slot(context.GetRenderTargetMask(), slot) == 0) {
+			continue;
+		}
+		if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
+			info.target_uint_mask |= 1u << slot;
+		} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
+			info.target_sint_mask |= 1u << slot;
+		}
+	}
+	const auto& blend = context.GetBlendControl(0);
+	info.dual_source_blending =
+	    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
+	    (BlendFactorIsDualSource(blend.color_srcblend) ||
+	     BlendFactorIsDualSource(blend.color_destblend) ||
+	     (blend.separate_alpha_blend && (BlendFactorIsDualSource(blend.alpha_srcblend) ||
+	                                     BlendFactorIsDualSource(blend.alpha_destblend))));
+	if (info.dual_source_blending) {
+		// MRT1 supplies the second blend source for target 0.
+		info.target_output_mode[1]    = info.target_output_mode[0];
+		info.target_export_mapping[1] = info.target_export_mapping[0];
+		info.target_uint_mask =
+		    (info.target_uint_mask & ~2u) | ((info.target_uint_mask & 1u) << 1u);
+		info.target_sint_mask =
+		    (info.target_sint_mask & ~2u) | ((info.target_sint_mask & 1u) << 1u);
+	} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
+	           info.target_output_mode[0] != 0 && info.target_output_mode[0] != 7 &&
+	           std::all_of(std::begin(info.target_output_mode) + 1,
+	                       std::end(info.target_output_mode),
+	                       [](uint8_t mode) { return mode == 0; }) &&
+	           ClassifyBlendMapping(blend, info.target_export_mapping[0]) ==
+	               BlendMappingSupport::SourceAlpha) {
+		// Preserve logical alpha when the export mapping moves it.
+		info.alpha_blend_source_remap = true;
+		info.dual_source_blending     = true;
+		info.target_output_mode[1]    = info.target_output_mode[0];
+		info.target_export_mapping[1] = {};
+	}
+}
+
+// The clip-space fields of the last geometry stage (context state).
+void PipelineCache::ClipFinish(const HW::Context& context, ShaderVertexInputInfo& info) const {
+	if (context.GetClipControl().clip_disable) {
+		const auto& viewport = context.GetScreenViewport().viewports[0];
+		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
+		auto&       clip     = info.clip_space;
+		clip.scale[0]        = viewport.xscale;
+		clip.scale[1]        = viewport.yscale;
+		clip.offset[0]       = viewport.xoffset;
+		clip.offset[1]       = viewport.yoffset;
+		clip.half_extent[0] =
+		    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
+		clip.half_extent[1] =
+		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
+		clip.enabled = true;
+	}
+}
+
+// KYTY_DRAW_PREP: the vertex-side identity of a draw for DrawPrep::NoteGoodPair / IsGoodPair.
+static uint64_t DrawPrepVertexIdentity(const HW::VertexShaderInfo& vertex_regs) {
+	return vertex_regs.es_regs.data_addr ^ (vertex_regs.gs_regs.data_addr << 1u);
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -3779,37 +4199,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	// The host-side mesh fields; false when the shader exceeds the host limits.
-	const auto mesh_host = [&](ShaderVertexInputInfo& info) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
-		auto& mesh              = info.mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
-		// A subgroup with more threads than a mesh workgroup may have (NVIDIA: 128) runs its
-		// waves in passes; see EmitMeshEntryPoint.
-		mesh.passes = mesh.PassesFor(
-		    std::min(limits.maxMeshWorkGroupInvocations, limits.maxMeshWorkGroupSize[0]));
-		// Guest wave32 waves sharing one wider host subgroup (RADV runs mesh shaders as wave64
-		// and cannot be asked for a subgroup size there) would read each other's ballots:
-		// wave 1 then used wave 0's EXEC/VCC masks and dropped its primitives (Wolverine
-		// skin "cracks"). One guest wave per pass keeps every host subgroup to one wave.
-		// KYTY_MESH_WAVE_PASSES=0 restores the shared-subgroup layout for comparison.
-		static const bool wave_passes = [] {
-			const char* value = std::getenv("KYTY_MESH_WAVE_PASSES");
-			return value == nullptr || value[0] != '0';
-		}();
-		if (wave_passes && mesh.passes != 0 && mesh.wave_size < mesh.host_subgroup_size &&
-		    mesh.Waves() > 1) {
-			mesh.passes = mesh.Waves();
-		}
-		// Indirect mesh draws read their arguments on the GPU (MeshIndirectDraw).
-		// KYTY_MESH_INDIRECT_GPU=0 (live) restores the CPU read for every draw.
-		static auto& indirect_gpu = Common::LiveSwitches::Get("KYTY_MESH_INDIRECT_GPU", 1);
-		mesh.draw_data_indirect =
-		    mesh_draw_indirect && indirect_gpu.load(std::memory_order_relaxed) != 0;
-		return !(mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
-		         mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		         mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize);
-	};
+	const auto mesh_host = [&](ShaderVertexInputInfo& info) { return MeshHost(info, mesh_draw_indirect); };
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		if (!mesh_host(vertex_info[0])) {
@@ -3828,50 +4218,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	// The pixel stage's target and blending fields (context state).
-	const auto pixel_finish = [&](ShaderPixelInputInfo& info) {
-		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
-		// In particular, 32-bit exports can carry raw integer material data.
-		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-			const auto& rt = context.GetRenderTarget(slot);
-			if (rt.base.addr == 0 ||
-			    render_target_mask_slot(context.GetRenderTargetMask(), slot) == 0) {
-				continue;
-			}
-			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
-				info.target_uint_mask |= 1u << slot;
-			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
-				info.target_sint_mask |= 1u << slot;
-			}
-		}
-		const auto& blend = context.GetBlendControl(0);
-		info.dual_source_blending =
-		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-		    (BlendFactorIsDualSource(blend.color_srcblend) ||
-		     BlendFactorIsDualSource(blend.color_destblend) ||
-		     (blend.separate_alpha_blend && (BlendFactorIsDualSource(blend.alpha_srcblend) ||
-		                                     BlendFactorIsDualSource(blend.alpha_destblend))));
-		if (info.dual_source_blending) {
-			// MRT1 supplies the second blend source for target 0.
-			info.target_output_mode[1]    = info.target_output_mode[0];
-			info.target_export_mapping[1] = info.target_export_mapping[0];
-			info.target_uint_mask =
-			    (info.target_uint_mask & ~2u) | ((info.target_uint_mask & 1u) << 1u);
-			info.target_sint_mask =
-			    (info.target_sint_mask & ~2u) | ((info.target_sint_mask & 1u) << 1u);
-		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
-		           info.target_output_mode[0] != 0 && info.target_output_mode[0] != 7 &&
-		           std::all_of(std::begin(info.target_output_mode) + 1,
-		                       std::end(info.target_output_mode),
-		                       [](uint8_t mode) { return mode == 0; }) &&
-		           ClassifyBlendMapping(blend, info.target_export_mapping[0]) ==
-		               BlendMappingSupport::SourceAlpha) {
-			// Preserve logical alpha when the export mapping moves it.
-			info.alpha_blend_source_remap = true;
-			info.dual_source_blending     = true;
-			info.target_output_mode[1]    = info.target_output_mode[0];
-			info.target_export_mapping[1] = {};
-		}
-	};
+	const auto pixel_finish = [&](ShaderPixelInputInfo& info) { PixelFinish(context, info); };
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		KYTY_PROFILER_BLOCK("PipelineCache::PrepareProgram(PS)");
@@ -3879,22 +4226,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		pixel_finish(pixel_info);
 	}
 	// The clip-space fields of the last geometry stage (context state).
-	const auto clip_finish = [&](ShaderVertexInputInfo& info) {
-		if (context.GetClipControl().clip_disable) {
-			const auto& viewport = context.GetScreenViewport().viewports[0];
-			const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-			auto&       clip     = info.clip_space;
-			clip.scale[0]        = viewport.xscale;
-			clip.scale[1]        = viewport.yscale;
-			clip.offset[0]       = viewport.xoffset;
-			clip.offset[1]       = viewport.yoffset;
-			clip.half_extent[0] =
-			    static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u)) * 0.5f;
-			clip.half_extent[1] =
-			    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
-			clip.enabled = true;
-		}
-	};
+	const auto clip_finish = [&](ShaderVertexInputInfo& info) { ClipFinish(context, info); };
 	clip_finish(vertex_info[tess_active ? 2u : 0u]);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
@@ -3902,11 +4234,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	// KYTY_LOCAL_HACK KYTY_PARALLEL_MATERIALIZE (live, default 1; pm4 +4%): the pixel and vertex stages' resource
 	// materialization at the same time (ProgramCache::GetPixelVertex).
 	static auto& parallel = Common::LiveSwitches::Get("KYTY_PARALLEL_MATERIALIZE", 1);
-	if (pixel_active && !tess_active && parallel.load(std::memory_order_relaxed) != 0) {
+	// With KYTY_DRAW_PREP the stages are mostly memo hits: mode 1 runs no worker (dp4: same fps,
+	// one core less spinning); the verify/control modes 2-4 still do.
+	if (pixel_active && !tess_active && parallel.load(std::memory_order_relaxed) != 0 &&
+	    (DrawPrep::Mode() == 0 || parallel.load(std::memory_order_relaxed) >= 2)) {
 		m_program_cache->GetPixelVertex(pixel_params, pixel_info, vertex_params[0], vertex_info[0],
 		                                push_data_cursor, result.pixel, result.vertex[0]);
 		if (!result.vertex[0]) {
 			return {};
+		}
+		if (result.pixel) {
+			DrawPrep::NoteGoodPair(DrawPrepVertexIdentity(vertex_regs), pixel_regs.ps_regs.data_addr);
 		}
 		// KYTY_LOOKAHEAD: the next draw's programs, prepared from its predicted shader registers
 		// and this draw's context (the CP publishes a prediction only when they stay valid).
@@ -3942,7 +4280,61 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return {};
 		}
 	}
+	if (!tess_active && (!pixel_active || result.pixel)) {
+		DrawPrep::NoteGoodPair(DrawPrepVertexIdentity(vertex_regs),
+		                       pixel_active ? pixel_regs.ps_regs.data_addr : 0u);
+	}
 	return result;
+}
+
+void PipelineCache::MarkDrawPrepThread() {
+	t_parallel_worker = true;
+}
+
+void PipelineCache::DrawPrepGraphics(const HW::VertexShaderInfo& vertex_regs,
+                                     const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+                                     const HW::Context& context, const HW::UserConfig& user_config,
+                                     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+                                     bool pixel_active, bool mesh_draw_indirect, const DrawPrep::Key& key) {
+	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
+		return;
+	}
+	if (!DrawPrep::IsGoodPair(DrawPrepVertexIdentity(vertex_regs),
+	                          pixel_active ? pixel_regs.ps_regs.data_addr : 0u)) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
+		return;
+	}
+	ShaderVertexInputInfo vertex_info {};
+	ShaderPixelInputInfo  pixel_info {};
+	const auto            vertex_params = PrepareProgram(vertex_regs, context, user_config, vertex_info);
+	if (vertex_info.logical_stage == ShaderType::Mesh && !MeshHost(vertex_info, mesh_draw_indirect)) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnsupported);
+		return;
+	}
+	ShaderParams pixel_params;
+	if (pixel_active) {
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		PixelFinish(context, pixel_info);
+	}
+	ClipFinish(context, vertex_info);
+	m_program_cache->ScanDraw(key, pixel_active ? &pixel_params : nullptr, pixel_info, vertex_params,
+	                          vertex_info);
+}
+
+void PipelineCache::DrawPrepCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+                                    ShaderComputeInputInfo& input_info, const DrawPrep::Key& key) {
+	if (!DrawPrep::IsGoodPair(regs.cs_regs.data_addr, UINT64_MAX)) {
+		DrawPrep::Add(DrawPrep::Counter::SkipUnknownPair);
+		return;
+	}
+	// As GetComputeProgram.
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	const auto params             = PrepareProgram(regs, sh, input_info);
+	const auto max_lds_dwords =
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
+	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
+	m_program_cache->ScanDispatch(key, params, input_info);
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -3964,7 +4356,12 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	}
 	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor);
+	auto              program          = m_program_cache->Get(params, input_info, push_data_cursor);
+	if (program) {
+		// KYTY_DRAW_PREP: compute shaders join the known-good list with a vertex identity no draw has.
+		DrawPrep::NoteGoodPair(regs.cs_regs.data_addr, UINT64_MAX);
+	}
+	return program;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

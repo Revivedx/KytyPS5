@@ -9,7 +9,7 @@ dump of the game (PPSA03671).
 Tested on a Ryzen 7 5800X3D + Radeon RX 7900 XT, Mesa RADV, Linux 7.2, opening jungle area:
 
 - Title, menus and gameplay work; character models render correctly on AMD.
-- About 20 fps standing in the jungle; 7-12 fps in heavy combat (fire, many enemies).
+- About 25 fps standing in the jungle; 7-12 fps in heavy combat (fire, many enemies).
 - The bottleneck is the single command-processor thread (per-draw resource preparation) and, in heavy
   scenes, GPU serialization (a barrier/render-pass break around most draws). Both are being worked on.
 
@@ -23,6 +23,10 @@ AMD/RADV correctness:
   65535 groups split; BC6H/BC7 3D image flags; LibAtrac9 band-extension bounds (see below).
 
 Performance (command processor), each measured with same-process A/B switches:
+- Draw prep (`KYTY_DRAW_PREP`, port of Senaxx 6632a241 onto this branch's resource memo): a scanner
+  thread follows each queued submission's registers and evaluates the resource walks of its draws and
+  dispatches ahead of the command processor; the command processor takes them as memo hits (same inputs,
+  every logged read unchanged). Command processor -11%, +9% fps.
 - SRT replay traces (port of Senaxx 598030de/34e492b2) and an in-order replay of the resource walk
   (`KYTY_WALK_INORDER`), texture description cache (Senaxx 50a04054), `FindImage` memo, lazy timeline
   queries, shader-expansion hashing, shared address-space lock for tracker protections, larger fault-ahead

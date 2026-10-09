@@ -10,6 +10,8 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/drawPrepScanner.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -215,6 +217,8 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	// KYTY_LOCAL_HACK KYTY_DRAW_PREP (live): the scanner thread waits for submissions while it is off.
+	m_draw_prep = std::make_unique<DrawPrepScanner>(renderer);
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -237,6 +241,7 @@ void GuestGpu::Shutdown() {
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
+	m_draw_prep.reset();
 	m_shutdown_complete = true;
 }
 
@@ -798,6 +803,18 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	if (m_draw_prep != nullptr) {
+		// In queue order, as the GPU thread will run them; the GPU thread resets its graphics
+		// command processor where the submission asks for it, and so does the scanner.
+		if (submission.queue_id == 0 && submission.reset_processor) {
+			m_draw_prep->EnqueueReset(0);
+		}
+		if (DrawPrep::Mode() != 0 && (submission.type == SubmissionType::Graphics ||
+		                              submission.type == SubmissionType::Compute)) {
+			submission.prep_seq = ++m_prep_seq;
+			m_draw_prep->EnqueueSubmission(submission.queue_id, submission.prep_seq, submission.commands);
+		}
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -1073,6 +1090,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
+			submission.command_execution.SetPrepSeq(submission.prep_seq, submission.queue_id);
 			bool progressed = false;
 			submission.constant_complete |= submission.constant_commands.empty();
 			for (;;) {
@@ -1107,6 +1125,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		}
 		case SubmissionType::Compute: {
+			submission.command_execution.SetPrepSeq(submission.prep_seq, submission.queue_id);
 			const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
 			const auto*     buffer = submission.commands.data();
 			static uint32_t compute_batch_log_count = 0;
@@ -1486,6 +1505,10 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	const bool draw_prep = execution.m_prep_seq != 0;
+	if (!draw_prep) {
+		DrawPrep::ClearCurrent();
+	}
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -1518,6 +1541,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			continue;
+		}
+
+		// KYTY_DRAW_PREP: number the draw and dispatch packets as the scanner does (predicated ones
+		// too; a packet suspended and run again keeps its number).
+		if (draw_prep && DrawPrep::CountsAsDrawOrDispatch(opcode)) {
+			if (execution.m_prep_packet != packet) {
+				execution.m_prep_packet = packet;
+				execution.m_prep_ordinal++;
+			}
+			DrawPrep::SetCurrent({.queue   = execution.m_prep_queue,
+			                      .seq     = execution.m_prep_seq,
+			                      .ordinal = execution.m_prep_ordinal - 1u,
+			                      .packet  = packet});
 		}
 
 		if (GraphicsRunDebugDumpEnabled()) {

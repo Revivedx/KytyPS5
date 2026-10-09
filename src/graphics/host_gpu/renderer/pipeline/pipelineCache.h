@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -212,6 +213,17 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
+	// KYTY_DRAW_PREP (drawPrep.h), scanner thread: evaluates the resource plans of a draw's or
+	// dispatch's stages ahead of the GPU thread and stores them for `key`.
+	static void MarkDrawPrepThread();
+	void DrawPrepGraphics(const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	                      const HW::ShaderRegisters& sh, const HW::Context& context,
+	                      const HW::UserConfig&                               user_config,
+	                      std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                      bool pixel_active, bool mesh_draw_indirect, const DrawPrep::Key& key);
+	void DrawPrepCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                     ShaderComputeInputInfo& input_info, const DrawPrep::Key& key);
+
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
@@ -231,6 +243,11 @@ public:
 	                             const ShaderProgram&          compute_program);
 
 private:
+	// GetGraphicsPrograms' stage fields (also the KYTY_DRAW_PREP scanner's).
+	bool        MeshHost(ShaderVertexInputInfo& info, bool mesh_draw_indirect) const;
+	static void PixelFinish(const HW::Context& context, ShaderPixelInputInfo& info);
+	void        ClipFinish(const HW::Context& context, ShaderVertexInputInfo& info) const;
+
 	struct ProgramCache;
 
 	struct GraphicsPipelineKey {
