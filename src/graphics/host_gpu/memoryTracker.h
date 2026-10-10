@@ -7,7 +7,10 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 
+#include "common/waitStats.h"
+
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <bit>
 #include <memory>
@@ -84,16 +87,19 @@ public:
 				// on_flush performs the CPU state change.
 				{
 					KYTY_PROFILER_BLOCK("MemoryTracker::FaultLockWait");
+					Common::WaitStats::Inner part(Common::WaitStats::FaultLock);
 					manager->lock.lock();
 				}
 				std::scoped_lock lock(std::adopt_lock, manager->lock);
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
+				Common::WaitStats::Inner part(Common::WaitStats::FaultState);
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				return false;
 			}();
 			if (should_flush) {
+				Common::WaitStats::Inner part(Common::WaitStats::FaultFlush);
 				on_flush();
 			}
 		});
@@ -130,6 +136,11 @@ public:
 		CheckNotInUploadCallback();
 		EnsureRegions(vaddr, size);
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		// KYTY_WAIT_STATS: how long a written upload keeps its regions locked (faults wait on it).
+		std::optional<Common::WaitStats::CpPart> hold;
+		if (is_written) {
+			hold.emplace(Common::WaitStats::CpLockHold);
+		}
 		const auto  upload_region = [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
             manager->lock.lock();
             manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,

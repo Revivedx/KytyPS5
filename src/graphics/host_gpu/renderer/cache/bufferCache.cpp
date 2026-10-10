@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/waitStats.h"
 #include "graphics/host_gpu/pipelineStats.h"
 
 #include "common/alignment.h"
@@ -848,6 +849,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	Common::WaitStats::Scope wait(Common::WaitStats::Readback);
 	KYTY_PROFILER_BLOCK("BufferCache::ReadMemory(GPU thread)");
 	struct CallerPhase {
 		int                                   tag   = g_rb_caller;

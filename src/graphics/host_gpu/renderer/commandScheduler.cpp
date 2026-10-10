@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/waitStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
@@ -671,6 +672,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 
 void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	Common::WaitStats::Scope wait(Common::WaitStats::PriorityOps);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(
 	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
@@ -678,6 +680,7 @@ void CommandScheduler::DrainPriorityOperations() {
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	Common::WaitStats::Scope wait(Common::WaitStats::PriorityOps);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
@@ -757,6 +760,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	EXIT_IF(graphics.queue == nullptr);
 	vk::Result result;
 	{
+		Common::WaitStats::Scope wait(Common::WaitStats::Submit);
 		Common::LockGuard lock(graphics.queue_mutex);
 		submit.AddSignal(m_master.Handle(), tick);
 
@@ -946,6 +950,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 	if (!m_record_thread.joinable()) {
 		return m_command.m_buffer;
 	}
+	Common::WaitStats::Scope wait(Common::WaitStats::RecordDrain);
 	KYTY_PROFILER_FUNCTION();
 	if (m_threaded) {
 		m_record_stats.drains++;

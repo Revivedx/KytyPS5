@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "common/waitStats.h"
 
 #include "common/assert.h"
 #include "common/liveSwitches.h"
@@ -166,6 +167,8 @@ uint64_t RenderContext::ThreadFaultCount() noexcept {
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	KYTY_PROFILER_FUNCTION();
+	Common::WaitStats::Scope wait(access == PageFaultAccess::Write ? Common::WaitStats::Fault
+	                                                                : Common::WaitStats::FaultRead);
 	t_fault_count++;
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -177,8 +180,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		g_fault_stats.Add(access == PageFaultAccess::Write, fault_vaddr, GuestGpu::IsGpuThread());
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		{
+			Common::WaitStats::Inner part(Common::WaitStats::FaultBuffers);
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			Common::WaitStats::Inner part(Common::WaitStats::FaultTextures);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		Common::WaitStats::Inner part(Common::WaitStats::FaultAheadK);
 		FaultAhead(fault_vaddr);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
@@ -343,6 +353,7 @@ void RenderContext::PrepareBda() {
 
 Common::LockGuard RenderContext::LockMutexProfiled() {
 	KYTY_PROFILER_BLOCK("RenderContext::WaitMutex");
+	Common::WaitStats::Scope wait(Common::WaitStats::RendererMutex);
 	return Common::LockGuard(m_mutex);
 }
 

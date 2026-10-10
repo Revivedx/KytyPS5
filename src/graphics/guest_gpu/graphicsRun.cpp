@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/drawPrepScanner.h"
+#include "common/waitStats.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
@@ -373,6 +374,7 @@ void GuestGpu::ProcessCommands() {
 }
 
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
+	Common::WaitStats::Scope wait(Common::WaitStats::CommandSync);
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
 		command();
@@ -899,6 +901,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	Common::WaitStats::t_cp_thread = true;
 
 	for (;;) {
 		Submission                   submission;
@@ -920,7 +923,10 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_idle.Signal();
 				const auto idle_start = CpIdleStatsOn() ? std::chrono::steady_clock::now()
 				                                        : std::chrono::steady_clock::time_point {};
-				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				{
+					Common::WaitStats::Scope wait(Common::WaitStats::NoWork);
+					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				}
 				NoteCpIdle(0, idle_start);
 			}
 			if (flush_pending) {
@@ -954,7 +960,10 @@ void GuestGpu::ThreadRun(void* data) {
 						const auto idle_start = CpIdleStatsOn()
 						                            ? std::chrono::steady_clock::now()
 						                            : std::chrono::steady_clock::time_point {};
-						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						{
+							Common::WaitStats::Scope wait(Common::WaitStats::BlockedQueues);
+							gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						}
 						NoteCpIdle(1, idle_start);
 					}
 					for (auto& queue: gpu->m_queues) {
