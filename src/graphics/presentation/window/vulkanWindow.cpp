@@ -425,7 +425,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    queue_family < families.size() && families[queue_family].queueCount >= 2 ? 2u : 1u;
 	queue_create_info.pQueuePriorities = queue_priorities;
 	graphics.queue_count               = queue_create_info.queueCount;
-	// KYTY_LOCAL_HACK KYTY_READBACK_COMPUTE_QUEUE (env, default off; 1 on: cq2 no gain): RADV has a single queue
+	// KYTY_LOCAL_HACK KYTY_READBACK_COMPUTE_QUEUE (env, default on since 2026-10-10, 0 = off; idle cq2 10-07:
+	// no gain alone; it carries KYTY_GUEST_COPY_QUEUE, gc5/gc6 combat +30-50%): RADV has a single queue
 	// in the graphics family, so the copy-queue readback never ran there and every readback of
 	// GPU-written bytes drained the whole graphics queue (Wolverine 10-07 ci2: ~216 per 5 s,
 	// ~3.5 ms each, 15% of the GPU thread). A queue of a compute-only family serves it instead;
@@ -436,8 +437,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.readback_queue_family =
 	    queue_create_info.queueCount >= 2 ? queue_family : static_cast<uint32_t>(-1);
 	const char* compute_readback = std::getenv("KYTY_READBACK_COMPUTE_QUEUE");
-	if (queue_create_info.queueCount < 2 && compute_readback != nullptr &&
-	    std::strcmp(compute_readback, "0") != 0) {
+	if (queue_create_info.queueCount < 2 &&
+	    (compute_readback == nullptr || std::strcmp(compute_readback, "0") != 0)) {
 		for (uint32_t family = 0; family < families.size(); family++) {
 			const auto flags = families[family].queueFlags;
 			if (family != queue_family && families[family].queueCount >= 1 &&
@@ -1206,6 +1207,12 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		if (HasExtension(available_extensions, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+			graphic_ctx.dma_buf_import = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

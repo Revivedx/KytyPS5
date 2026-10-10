@@ -895,6 +895,12 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool FindBackingSlices(uint64_t vaddr, uint64_t size, int* fd,
+                       std::vector<std::pair<uint64_t, uint64_t>>* slices) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->FindBackingSlices(vaddr, size, fd, slices);
+}
+
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_guest_address_space == nullptr) {
 		return nullptr;

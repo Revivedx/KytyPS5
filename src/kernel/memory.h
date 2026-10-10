@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -123,6 +126,11 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // work has written any of them, else nullptr. Current until the GPU thread marks them
 // GPU-written or the guest remaps them.
 [[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// The backing file and its slices (offset, bytes), in address order, of [vaddr, vaddr + size) when
+// guest mappings cover all of it (Linux: the direct-memory memfd, sealed against shrinking).
+// Current until the guest remaps the range.
+[[nodiscard]] bool FindBackingSlices(uint64_t vaddr, uint64_t size, int* fd,
+                                     std::vector<std::pair<uint64_t, uint64_t>>* slices);
 // Off the GPU thread (KYTY_PARALLEL_MATERIALIZE worker): the same, never faulting.
 bool                         TryReadGpuCleanBackingConcurrent(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] const uint8_t* FindGpuCleanBackingConcurrent(uint64_t vaddr, uint64_t size);

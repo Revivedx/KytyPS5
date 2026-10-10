@@ -50,6 +50,8 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
+	// VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf (KYTY_HOST_IMPORT, bufferCache.cpp).
+	bool                               dma_buf_import                        = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
 	bool                               calibrated_timestamps_enabled         = false;

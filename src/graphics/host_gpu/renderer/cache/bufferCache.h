@@ -129,6 +129,9 @@ public:
 	void                            RunGarbageCollector();
 	// Bytes of the cached buffers.
 	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }
+	// GPU thread, before the guest range is unmapped: drops the host-imported zones on it
+	// (KYTY_HOST_IMPORT), whose memory is the backing pages, not the guest addresses.
+	void UnmapHostImport(uint64_t vaddr, uint64_t size);
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
@@ -184,7 +187,7 @@ private:
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 	// GPU thread: KYTY_DIRECT_READBACK (see bufferCache.cpp).
 	[[nodiscard]] bool TryDirectReadback(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_write);
+	                                     bool is_write, int forced_mode = 0);
 	// GPU thread: KYTY_COPY_QUEUE_READBACK (see bufferCache.cpp). Downloads the window's
 	// GPU-written bytes on the readback queue when every GPU write to the buffer has executed.
 	[[nodiscard]] bool TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin,
@@ -214,6 +217,45 @@ private:
 	                         uint64_t window_end, uint64_t tick, bool snapshot = false);
 	// Reads served from a download the GPU overwrote afterwards (KYTY_ASYNC_READ_SNAPSHOT).
 	uint64_t               m_snapshot_reads = 0;
+	// KYTY_GUEST_COPY_QUEUE (see bufferCache.cpp): window downloads for game-thread faults on the
+	// compute-family readback queue; the game thread waits for the slot's fence itself.
+	struct GuestCopySlot {
+		vk::CommandBuffer           command = nullptr;
+		vk::Fence                   fence   = nullptr;
+		std::unique_ptr<Buffer>     staging;
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    buffer_address = 0;
+		vk::Buffer                  buffer_handle  = nullptr;
+		uint64_t                    writer_tick    = 0;
+		uint64_t                    window_begin   = 0;
+		uint64_t                    window_end     = 0;
+		uint64_t                    generation     = 0;
+		bool                        busy           = false;
+		std::atomic<uint32_t>       waiters {0};
+		// 0 = not published, 1 = being copied into guest memory, 2 = published.
+		std::atomic<int>            publish_state {0};
+	};
+	// Any thread, after the slot's fence: copies the staging bytes into guest memory once.
+	static void PublishGuestCopy(GuestCopySlot& slot);
+	static constexpr size_t GuestCopySlots = 6;
+	std::array<GuestCopySlot, GuestCopySlots> m_guest_copy_slots;
+	vk::CommandPool                           m_guest_copy_pool = nullptr;
+	// GPU thread: submits the copy; the slot index, or -1 (then the main-queue path runs).
+	[[nodiscard]] int StartGuestCopy(Buffer& buffer, uint64_t window_begin, uint64_t window_end);
+	// GPU thread: waits for the slot's copy and publishes it.
+	void CompleteGuestCopy(size_t slot);
+	void CompleteGuestCopies(uint64_t begin, uint64_t end);
+
+public:
+	// Game thread: waits for a guest copy started for it.
+	void WaitGuestCopy(int slot);
+	// GPU thread, after WaitGuestCopy: publishes the copy (unless done) and resolves the fault.
+	void FinishGuestCopy(int slot, uint64_t generation, uint64_t vaddr, uint64_t size,
+	                     bool is_write);
+
+private:
+	// KYTY_RACE_READS (see bufferCache.cpp).
+	[[nodiscard]] bool     TryRaceRead(uint64_t vaddr, uint64_t size);
 	void                   CompletePendingWriteReadback(size_t index);
 	void                   CompletePendingWriteReadbacks(uint64_t begin, uint64_t end);
 	[[nodiscard]] bool     OverlapsPendingWriteReadback(uint64_t begin, uint64_t end) const;
@@ -274,6 +316,23 @@ private:
 	uint64_t               m_buffers_created    = 0;
 	uint64_t m_gc_tick            = 0;
 	[[nodiscard]] uint64_t LruClock() const noexcept;
+
+	// KYTY_HOST_IMPORT (see bufferCache.cpp): guest ranges whose buffer is the guest memory itself.
+	struct ImportZone {
+		uint64_t begin  = 0;
+		uint64_t size   = 0;
+		BufferId id     = {}; // invalid index (NULL_BUFFER_ID is slot 0, which tests true)
+		bool     failed = false;
+	};
+	void                      PollHostImport();
+	[[nodiscard]] ImportZone* FindImportZone(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool        InActiveImportZone(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool        CreateZoneBuffer(ImportZone& zone);
+	void                      DropZone(ImportZone& zone, bool failed, const char* reason);
+	std::vector<ImportZone>   m_import_zones;
+	bool                      m_import_on   = false;
+	int                       m_udmabuf_fd  = -1;
+	uint64_t                  m_import_skipped_writes = 0;
 };
 
 } // namespace Libs::Graphics

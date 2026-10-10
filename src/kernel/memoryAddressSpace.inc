@@ -74,7 +74,9 @@ public:
 			}
 		}
 #else
-		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+		// Sealable, so slices can become dma-bufs (udmabuf, KYTY_HOST_IMPORT in bufferCache.cpp),
+		// which needs the file sealed against shrinking.
+		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", MFD_ALLOW_SEALING));
 #endif
 		if (m_fd < 0) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
@@ -87,6 +89,11 @@ public:
 			m_fd = -1;
 			return;
 		}
+#if !defined(__APPLE__)
+		if (fcntl(m_fd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+			LOGF("\t direct-memory backing: F_SEAL_SHRINK failed: %d (no host import)\n", errno);
+		}
+#endif
 		auto* backing = mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
 		if (backing == MAP_FAILED) {
 			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: writable alias failed: %d\n",
@@ -159,6 +166,9 @@ public:
 	}
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	[[nodiscard]] int GetBackingFd() const { return m_fd; }
+#endif
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
@@ -188,6 +198,41 @@ public:
 		    vaddr, size, [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			    std::memcpy(destination + data_offset, backing, bytes);
 		    });
+	}
+
+	// The backing slices (offset, bytes) of [vaddr, vaddr + size) in address order, when mappings
+	// cover every byte of it; false on a hole.
+	bool FindBackingSlices(uint64_t vaddr, uint64_t size,
+	                       std::vector<std::pair<uint64_t, uint64_t>>* slices) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		const auto      end     = vaddr + size;
+		auto            mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) {
+			return false;
+		}
+		--mapping;
+		uint64_t current = vaddr;
+		for (; mapping != m_maps.end() && current < end; ++mapping) {
+			const auto& entry = mapping->second;
+			if (entry.vaddr > current || entry.vaddr + entry.size <= current) {
+				return false;
+			}
+			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
+			const auto offset = entry.backing_offset + current - entry.vaddr;
+			if (!RangeOk(offset, bytes)) {
+				return false;
+			}
+			if (!slices->empty() && slices->back().first + slices->back().second == offset) {
+				slices->back().second += bytes;
+			} else {
+				slices->emplace_back(offset, bytes);
+			}
+			current += bytes;
+		}
+		return current == end;
 	}
 
 	// The backing bytes of [vaddr, vaddr + size) when one mapping holds all of them, else nullptr.
@@ -812,6 +857,22 @@ public:
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
+	[[nodiscard]] bool FindBackingSlices(uint64_t vaddr, uint64_t size, int* fd,
+	                                     std::vector<std::pair<uint64_t, uint64_t>>* slices) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+		if (m_backing->GetBackingFd() < 0 || !m_backing->FindBackingSlices(vaddr, size, slices)) {
+			return false;
+		}
+		*fd = m_backing->GetBackingFd();
+		return true;
+#else
+		(void)vaddr;
+		(void)size;
+		(void)fd;
+		(void)slices;
+		return false;
+#endif
+	}
 	[[nodiscard]] const uint8_t* FindBacking(uint64_t vaddr, uint64_t size) {
 		return m_backing->FindBacking(vaddr, size);
 	}

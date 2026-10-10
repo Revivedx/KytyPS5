@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/liveSwitches.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <numeric>
 #include <vk_mem_alloc.h>
+#include <unistd.h>
 
 namespace Libs::Graphics {
 
@@ -177,6 +179,89 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               vk::BufferUsageFlags flags, uint64_t size, ImportedGuestMemory memory)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size) {
+	EXIT_IF(size == 0 || memory.dma_buf_fd < 0);
+	const auto fail = [&](const char* step, int code) {
+		LOGF("Host import 0x%016" PRIx64 "+0x%" PRIx64 ": %s failed (%d)\n", cpu_address, size, step,
+		     code);
+		if (m_buffer != nullptr) {
+			graphics.device.destroyBuffer(m_buffer);
+			m_buffer = nullptr;
+		}
+		if (memory.dma_buf_fd >= 0) {
+			close(memory.dma_buf_fd);
+		}
+	};
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.pNext = &external;
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
+	if (graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) != vk::Result::eSuccess) {
+		m_buffer = nullptr;
+		fail("createBuffer", 0);
+		return;
+	}
+	vk::MemoryFdPropertiesKHR fd_properties {};
+	if (const auto result = graphics.device.getMemoryFdPropertiesKHR(
+	        vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, memory.dma_buf_fd, &fd_properties);
+	    result != vk::Result::eSuccess) {
+		fail("getMemoryFdPropertiesKHR", static_cast<int>(result));
+		return;
+	}
+	const auto requirements = graphics.device.getBufferMemoryRequirements(m_buffer);
+	const auto properties   = graphics.physical_device.getMemoryProperties();
+	uint32_t   type         = UINT32_MAX;
+	for (uint32_t index = 0; index < properties.memoryTypeCount; index++) {
+		const auto flags_here = properties.memoryTypes[index].propertyFlags;
+		if ((fd_properties.memoryTypeBits & requirements.memoryTypeBits & (1u << index)) != 0 &&
+		    (flags_here & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+			type = index;
+			break;
+		}
+	}
+	if (type == UINT32_MAX || requirements.size > size) {
+		fail("memory type", static_cast<int>(requirements.size > size));
+		return;
+	}
+	vk::ImportMemoryFdInfoKHR import_info {};
+	import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+	import_info.fd         = memory.dma_buf_fd;
+	vk::MemoryAllocateFlagsInfo allocate_flags {};
+	allocate_flags.pNext = &import_info;
+	allocate_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &allocate_flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = type;
+	if (const auto result = graphics.device.allocateMemory(&allocate, nullptr, &m_imported_memory);
+	    result != vk::Result::eSuccess) {
+		m_imported_memory = nullptr;
+		fail("allocateMemory", static_cast<int>(result));
+		return;
+	}
+	memory.dma_buf_fd = -1; // owned by the memory now
+	if (graphics.device.bindBufferMemory(m_buffer, m_imported_memory, 0) != vk::Result::eSuccess) {
+		graphics.device.freeMemory(m_imported_memory);
+		m_imported_memory = nullptr;
+		fail("bindBufferMemory", 0);
+		return;
+	}
+	m_coherent = true;
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+		std::scoped_lock lock {g_address_mutex};
+		g_live_addresses[m_device_address] = {size, cpu_address, 0xff, 0};
+	}
+}
+
 void SetGuestPageDescriber(std::function<void(uint64_t address, uint64_t size)> describer) {
 	g_guest_page_describer = std::move(describer);
 }
@@ -233,7 +318,10 @@ Buffer::~Buffer() {
 			}
 		}
 	}
-	if (m_buffer != nullptr) {
+	if (m_imported_memory != nullptr) {
+		m_graphics->device.destroyBuffer(m_buffer);
+		m_graphics->device.freeMemory(m_imported_memory);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

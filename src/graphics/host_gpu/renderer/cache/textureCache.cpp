@@ -36,6 +36,9 @@
 
 namespace Libs::Graphics {
 
+// KYTY_HOT_BIND_STATS (bufferCache.cpp).
+void NoteHotImageTrack(uint64_t vaddr, uint64_t size);
+
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
@@ -456,6 +459,7 @@ void TextureCache::TrackImage(ImageId id) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
 		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
+		NoteHotImageTrack(image_begin, image.info.data.size);
 		return;
 	}
 	if (image_begin < image.track_addr) {

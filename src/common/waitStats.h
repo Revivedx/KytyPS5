@@ -36,6 +36,15 @@ enum Kind : uint32_t {
 	FaultState,    // write fault: ChangeState under the lock (unprotect, inner)
 	FaultFlush,    // write fault on GPU-written bytes: the readback before the write (inner)
 	CpLockHold,    // CP: region locks held across a written upload (CpPart, CP only)
+	ReadHop,       // read fault, async path: waiting for the CP to start the readback (inner)
+	ReadGpu,       // read fault, async path: waiting for the readback's GPU tick + publication (inner)
+	ReadFinish,    // read fault, async path: waiting for the CP to finish the readback (inner)
+	ReadSync,      // read fault, sync path: the CP doing the whole readback (inner)
+	CpBegin,       // CP: BeginWriteReadback for a game thread (CpPart)
+	CpCopyStart,   // CP: StartGuestCopy (CpPart)
+	CpCopySubmit,  // CP: its vkQueueSubmit (CpPart)
+	CpCopyDone,    // CP: CompleteGuestCopy (fence wait + dirty state, CpPart)
+	CpCopyFinish,  // CP: FinishGuestCopy (CpPart)
 	Count,
 };
 
@@ -81,7 +90,9 @@ inline void Report() {
 	                                   "renderer-mutex", "fault-write", "submit", "record-drain", "readback",
 	                                   "fault-read", "command-sync", "  w-buffers", "  w-textures",
 	                                   "  w-ahead", "    lock-wait", "    change-state",
-	                                   "    flush-readback", "cp-written-upload-hold"};
+	                                   "    flush-readback", "cp-written-upload-hold", "  r-hop", "  r-gpu",
+	                                   "  r-finish", "  r-sync", "cp-begin", "cp-copy-start",
+	                                   "cp-copy-submit", "cp-copy-done", "cp-copy-finish"};
 	std::printf("CP waits (%.1f s): cpu %.0f ms;", wall / 1e9,
 	            s.cpu_ns != 0 ? static_cast<double>(cpu - s.cpu_ns) / 1e6 : 0.0);
 	uint64_t listed = 0;

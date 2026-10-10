@@ -328,6 +328,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 				count = drains = skippables = ns = bytes = 0;
 			}
 		}
+		m_buffer_cache.UnmapHostImport(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);

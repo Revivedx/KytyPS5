@@ -49,10 +49,19 @@ void DescribeBufferDeviceAddress(uint64_t address);
 // of the BDA page table), for DescribeBufferDeviceAddress.
 void SetGuestPageDescriber(std::function<void(uint64_t address, uint64_t size)> describer);
 
+// A dma-buf of guest memory pages (udmabuf over the direct-memory memfd, KYTY_HOST_IMPORT): the
+// buffer's memory IS the guest memory, so the GPU reads the guest's writes with no upload.
+struct ImportedGuestMemory {
+	int dma_buf_fd = -1; // ownership passes to the Vulkan memory on success
+};
+
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// Imported guest memory; Handle() is null when the import failed (the fd is then closed).
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       vk::BufferUsageFlags flags, uint64_t size, ImportedGuestMemory memory);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -62,6 +71,7 @@ public:
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
+	[[nodiscard]] bool               IsImported() const noexcept { return m_imported_memory != nullptr; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
 	[[nodiscard]] bool HasDeviceAddress() const noexcept { return m_device_address != 0; }
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
@@ -109,6 +119,7 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
+	vk::DeviceMemory              m_imported_memory = nullptr;
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
