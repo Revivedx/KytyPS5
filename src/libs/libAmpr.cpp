@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/dateTime.h"
 #include "common/file.h"
+#include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/timer.h"
@@ -21,6 +22,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <condition_variable>
@@ -42,6 +46,72 @@
 #endif
 
 namespace Libs {
+
+// KYTY_LOCAL_HACK (crash diagnosis 2026-10-10): the last AMM map/unmap commands, so a guest fault
+// on extended memory can show what was mapped there; failed commands are always printed (the
+// AMPR LOGFs are silent in normal runs).
+namespace AmmHistory {
+struct Entry {
+	uint64_t va     = 0;
+	uint64_t size   = 0;
+	uint64_t dmem   = 0;
+	uint64_t usec   = 0;
+	int32_t  result = 0;
+	uint32_t kind   = 0;
+};
+constexpr size_t                   Capacity = 16384;
+static std::array<Entry, Capacity> g_entries {};
+static std::atomic<uint64_t>       g_count {0};
+static std::atomic<uint64_t>       g_failures {0};
+
+static uint64_t NowMicros() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+static void Note(uint32_t kind, uint64_t va, uint64_t size, uint64_t dmem, int32_t result) {
+	const auto index            = g_count.fetch_add(1, std::memory_order_relaxed);
+	g_entries[index % Capacity] = {va, size, dmem, NowMicros(), result, kind};
+	if (result != 0) {
+		const auto failures = g_failures.fetch_add(1, std::memory_order_relaxed);
+		if (failures < 64 || (failures & (failures - 1)) == 0) {
+			std::printf("AMM command FAILED #%" PRIu64 ": kind=%u va=0x%012" PRIx64 " size=0x%" PRIx64
+			            " dmem=0x%" PRIx64 " result=0x%08x\n",
+			            failures + 1, kind, va, size, dmem, static_cast<uint32_t>(result));
+			std::fflush(stdout);
+		}
+	}
+}
+} // namespace AmmHistory
+
+// Called from the unhandled-exception report: every remembered AMM command touching the 64 KiB
+// page of `address` (oldest first), plus totals.
+void DumpAmmHistory(uint64_t address) {
+	using namespace AmmHistory;
+	const auto count = g_count.load(std::memory_order_relaxed);
+	const auto now   = NowMicros();
+	const auto page  = address & ~uint64_t {0xffff};
+	std::printf("--- AMM history: %" PRIu64 " commands, %" PRIu64 " failed; touching 0x%012" PRIx64
+	            " ---\n",
+	            count, g_failures.load(std::memory_order_relaxed), address);
+	const auto first = count > Capacity ? count - Capacity : 0;
+	int        shown = 0;
+	for (auto i = first; i < count; i++) {
+		const auto& e = g_entries[i % Capacity];
+		if (e.va <= page + 0xffff && page < e.va + e.size) {
+			std::printf("  #%" PRIu64 " %.3f s ago kind=%u va=0x%012" PRIx64 " size=0x%" PRIx64
+			            " dmem=0x%" PRIx64 " result=0x%08x\n",
+			            i, static_cast<double>(now - e.usec) / 1e6, e.kind, e.va, e.size, e.dmem,
+			            static_cast<uint32_t>(e.result));
+			shown++;
+		}
+	}
+	if (shown == 0) {
+		std::printf("  (none of the last %" PRIu64 " commands touch it)\n", count - first);
+	}
+	std::fflush(stdout);
+}
 
 namespace AprShared {
 
@@ -1599,13 +1669,97 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_engine,
                                      int32_t* execution_result, uint32_t* error_offset);
 
+static std::mutex g_apr_execution_mutex;
+static std::mutex g_amm_execution_mutex;
+
+namespace AmmMapAhead {
+static void Unregister(uint64_t token);
+} // namespace AmmMapAhead
+static uint64_t AmmMapAheadPremapped();
+static uint64_t AmmMapAheadBlocked();
+
 namespace {
 
 struct PendingSubmission {
-	CommandBufferState state;
-	uint32_t           id     = 0;
-	uint64_t           result = 0;
+	CommandBufferState                    state;
+	uint32_t                              id     = 0;
+	uint64_t                              result = 0;
+	std::chrono::steady_clock::time_point queued {};
+	uint64_t                              token = 0;  // AmmMapAhead registration
 };
+
+// KYTY_LOCAL_HACK KYTY_AMM_STATS=1 (live, research 2026-10-10, crash 1 = write into a texture page whose
+// map had not run yet): AMM batches per 5 s, run inline vs queued behind a busy ring, and how long
+// queued batches with map commands waited before they ran.
+class AmmQueueStats {
+public:
+	static AmmQueueStats& Get() {
+		static AmmQueueStats stats;
+		return stats;
+	}
+	static bool On() {
+		static auto& on = Common::LiveSwitches::Get("KYTY_AMM_STATS", 0);
+		return on.load(std::memory_order_relaxed) != 0;
+	}
+	void Note(bool inline_run, size_t maps, size_t unmaps, size_t waits, double queued_ms) {
+		std::scoped_lock lock(m_mutex);
+		m_batches++;
+		m_maps += maps;
+		m_unmaps += unmaps;
+		if (inline_run) {
+			m_inline++;
+		} else {
+			m_queued++;
+			m_queued_waits += waits != 0 ? 1 : 0;
+			if (maps != 0) {
+				m_queued_maps++;
+				m_latency_sum += queued_ms;
+				m_latency_max = std::max(m_latency_max, queued_ms);
+				m_latency_over5 += queued_ms > 5.0 ? 1 : 0;
+			}
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_report < std::chrono::seconds(5)) {
+			return;
+		}
+		m_report = now;
+		std::printf("AMM (5 s): %" PRIu64 " batches (%" PRIu64 " maps, %" PRIu64 " unmaps): inline %" PRIu64
+		            ", queued %" PRIu64 " (%" PRIu64 " with waits); queued with maps %" PRIu64
+		            ": wait avg %.2f ms, max %.2f ms, >5 ms %" PRIu64 "\n",
+		            m_batches, m_maps, m_unmaps, m_inline, m_queued, m_queued_waits, m_queued_maps,
+		            m_queued_maps != 0 ? m_latency_sum / static_cast<double>(m_queued_maps) : 0.0,
+		            m_latency_max, m_latency_over5);
+		std::printf("AMM map-ahead (total): %" PRIu64 " maps run early, %" PRIu64 " batches kept (overlap)\n",
+		            AmmMapAheadPremapped(), AmmMapAheadBlocked());
+		std::fflush(stdout);
+		m_batches = m_maps = m_unmaps = m_inline = m_queued = m_queued_waits = m_queued_maps = 0;
+		m_latency_over5 = 0;
+		m_latency_sum = m_latency_max = 0.0;
+	}
+
+private:
+	std::mutex                            m_mutex;
+	std::chrono::steady_clock::time_point m_report = std::chrono::steady_clock::now();
+	uint64_t m_batches = 0, m_maps = 0, m_unmaps = 0, m_inline = 0, m_queued = 0, m_queued_waits = 0;
+	uint64_t m_queued_maps = 0, m_latency_over5 = 0;
+	double   m_latency_sum = 0.0, m_latency_max = 0.0;
+};
+
+static void NoteAmmBatch(const PendingSubmission& submission, bool inline_run) {
+	if (!AmmQueueStats::On()) {
+		return;
+	}
+	size_t maps = 0, unmaps = 0;
+	for (const auto& command: submission.state.amm_map_commands) {
+		(command.kind == AmmCommandKind::Unmap ? unmaps : maps)++;
+	}
+	const auto waits = submission.state.wait_address_commands.size() + submission.state.counter_commands.size();
+	const auto queued_ms = inline_run ? 0.0
+	                                  : std::chrono::duration<double, std::milli>(
+	                                        std::chrono::steady_clock::now() - submission.queued)
+	                                        .count();
+	AmmQueueStats::Get().Note(inline_run, maps, unmaps, waits, queued_ms);
+}
 
 // One in-order engine each for the asset reader and the memory mapper, as on the hardware:
 // a wait in one engine only holds that engine, and the guest keeps submitting to the other.
@@ -1633,7 +1787,7 @@ public:
 			}
 			m_running = true;
 		}
-		Execute(submission);
+		Execute(submission, true);
 		{
 			std::scoped_lock lock(m_mutex);
 			m_running = false;
@@ -1661,11 +1815,15 @@ private:
 		}
 	}
 
-	void Execute(const PendingSubmission& submission) {
+	void Execute(const PendingSubmission& submission, bool inline_run = false) {
+		if (m_amm_engine) {
+			NoteAmmBatch(submission, inline_run);
+		}
 		int32_t  execution_result = OK;
 		uint32_t error_offset     = 0;
 		const auto submit_result = ExecuteCommandBufferState(submission.state, m_amm_engine,
 		                                                     &execution_result, &error_offset);
+		AmmMapAhead::Unregister(submission.token);
 		if (submit_result != OK && execution_result == OK) {
 			execution_result = submit_result;
 		}
@@ -1710,6 +1868,139 @@ SubmissionEngine& Engine(bool amm_engine, uint32_t priority) {
 
 } // namespace
 
+// KYTY_LOCAL_HACK KYTY_AMM_MAP_AHEAD (live, default 1, 2026-10-10): an AMM batch that has to queue behind a
+// busy ring (a wait in an earlier batch, which our slower GPU resolves late) runs its map commands that
+// come before any wait, counter, write or read in record order (and after no unmap of the same range)
+// right away, when no other batch still queued or running touches those addresses. amm1: queued maps waited up to 134 ms (often > 5 ms) while
+// the title writes into a freshly mapped texture 2-6 ms after submitting it (crash 1 of rec1: memcpy
+// into unmapped 0x802b17b8000). Mapping early is invisible to the title; the rest keeps ring order.
+namespace AmmMapAhead {
+struct Range {
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+};
+static std::mutex                                     g_mutex;
+static std::unordered_map<uint64_t, std::vector<Range>> g_pending;  // batch token -> AMM ranges
+static uint64_t                                       g_next_token = 1;
+static std::atomic<uint64_t>                          g_premapped {0};
+static std::atomic<uint64_t>                          g_blocked {0};
+
+static std::vector<Range> RangesOf(const CommandBufferState& state) {
+	std::vector<Range> ranges;
+	for (const auto& command: state.amm_map_commands) {
+		if (command.record_offset < state.write_offset) {
+			ranges.push_back({command.va, command.va + command.size});
+		}
+	}
+	return ranges;
+}
+
+static bool OverlapsLocked(const Range& range) {
+	for (const auto& [token, ranges]: g_pending) {
+		for (const auto& other: ranges) {
+			if (range.begin < other.end && other.begin < range.end) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Registers the batch; returns its token (0 = nothing to track).
+static uint64_t Register(const CommandBufferState& state) {
+	auto ranges = RangesOf(state);
+	if (ranges.empty()) {
+		return 0;
+	}
+	std::scoped_lock lock(g_mutex);
+	const auto       token = g_next_token++;
+	g_pending.emplace(token, std::move(ranges));
+	return token;
+}
+
+static void Unregister(uint64_t token) {
+	if (token == 0) {
+		return;
+	}
+	std::scoped_lock lock(g_mutex);
+	g_pending.erase(token);
+}
+
+// Runs the leading maps of `state` now (removing them from it) when nothing pending overlaps them.
+static void Run(CommandBufferState* state) {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_AMM_MAP_AHEAD", 1);
+	if (enabled.load(std::memory_order_relaxed) == 0 || state->amm_map_commands.empty()) {
+		return;
+	}
+	uint64_t barrier = state->write_offset;
+	const auto note  = [&](uint64_t offset) { barrier = std::min(barrier, offset); };
+	for (const auto& c: state->read_file_commands) note(c.record_offset);
+	for (const auto& c: state->kernel_event_commands) note(c.record_offset);
+	for (const auto& c: state->write_address_commands) note(c.record_offset);
+	for (const auto& c: state->wait_address_commands) note(c.record_offset);
+	for (const auto& c: state->counter_commands) note(c.record_offset);
+	// An unmap earlier in the batch only holds back the maps that overlap it (unmap A; map B is common).
+	std::vector<size_t> leading;
+	for (size_t i = 0; i < state->amm_map_commands.size(); i++) {
+		const auto& c = state->amm_map_commands[i];
+		if (c.kind == AmmCommandKind::Unmap || c.record_offset >= barrier) {
+			continue;
+		}
+		bool after_overlapping_unmap = false;
+		for (const auto& u: state->amm_map_commands) {
+			if (u.kind == AmmCommandKind::Unmap && u.record_offset < c.record_offset &&
+			    u.va < c.va + c.size && c.va < u.va + u.size) {
+				after_overlapping_unmap = true;
+			}
+		}
+		if (!after_overlapping_unmap) {
+			leading.push_back(i);
+		}
+	}
+	if (leading.empty()) {
+		return;
+	}
+	std::vector<bool> done(state->amm_map_commands.size(), false);
+	{
+		std::scoped_lock lock(g_mutex);
+		for (const auto i: leading) {
+			const auto& c = state->amm_map_commands[i];
+			if (OverlapsLocked({c.va, c.va + c.size})) {
+				g_blocked.fetch_add(1, std::memory_order_relaxed);
+				return;  // keep the batch whole: a later map may depend on this one
+			}
+		}
+		// Hold the registry while mapping so no batch registers an overlapping unmap meanwhile.
+		std::scoped_lock execution(g_amm_execution_mutex);
+		for (const auto i: leading) {
+			const auto& c      = state->amm_map_commands[i];
+			const auto  result = ExecuteAmmMapCommand(c);
+			AmmHistory::Note(static_cast<uint32_t>(c.kind) | 0x10u, c.va, c.size, c.dmem_offset, result);
+			if (result != OK) {
+				break;  // leave it and the rest to the ring, which reports the error in order
+			}
+			done[i] = true;
+			g_premapped.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	std::vector<CommandBufferState::AmmMapCommand> rest;
+	rest.reserve(state->amm_map_commands.size());
+	for (size_t i = 0; i < state->amm_map_commands.size(); i++) {
+		if (!done[i]) {
+			rest.push_back(state->amm_map_commands[i]);
+		}
+	}
+	state->amm_map_commands = std::move(rest);
+}
+} // namespace AmmMapAhead
+
+static uint64_t AmmMapAheadPremapped() {
+	return AmmMapAhead::g_premapped.load(std::memory_order_relaxed);
+}
+static uint64_t AmmMapAheadBlocked() {
+	return AmmMapAhead::g_blocked.load(std::memory_order_relaxed);
+}
+
 static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32_t priority,
                                 uint32_t submission_id, uint64_t result_address) {
 	PendingSubmission submission;
@@ -1718,15 +2009,24 @@ static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32
 	}
 	submission.id     = submission_id;
 	submission.result = result_address;
+	submission.queued = std::chrono::steady_clock::now();
 	// The memory mapper finishes a few maps in microseconds on the hardware. A streaming title
 	// wrote into a freshly mapped texture 2-6 ms after submitting the map, while the batch still
 	// sat in its ring, so a batch that cannot block (no waits, counters or file reads) runs on
 	// the submitting thread when its ring is idle. Anything else keeps the ring's order.
 	auto&      engine = Engine(amm_engine, priority);
 	const auto& state = submission.state;
-	if (amm_engine && state.wait_address_commands.empty() && state.counter_commands.empty() &&
-	    state.read_file_commands.empty() && engine.TryRunInline(submission)) {
-		return OK;
+	if (amm_engine) {
+		if (state.wait_address_commands.empty() && state.counter_commands.empty() &&
+		    state.read_file_commands.empty()) {
+			submission.token = AmmMapAhead::Register(state);
+			if (engine.TryRunInline(submission)) {
+				return OK;  // Execute unregistered it
+			}
+			AmmMapAhead::Unregister(submission.token);
+		}
+		AmmMapAhead::Run(&submission.state);
+		submission.token = AmmMapAhead::Register(submission.state);
 	}
 	engine.Enqueue(std::move(submission));
 	return OK;
@@ -1799,9 +2099,7 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 	// never queues behind the asset reader's file reads. Sharing one lock held an AMM batch
 	// (one map) for milliseconds behind an APR read from slow storage, and the title wrote
 	// into the range before the map ran.
-	static std::mutex g_apr_execution_mutex;
-	static std::mutex g_amm_execution_mutex;
-	std::unique_lock  execution_lock(amm_engine ? g_amm_execution_mutex : g_apr_execution_mutex);
+	std::unique_lock execution_lock(amm_engine ? g_amm_execution_mutex : g_apr_execution_mutex);
 
 	for (const auto& entry: ordered) {
 		switch (entry.kind) {
@@ -1903,6 +2201,8 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				} else {
 					result = ExecuteAmmMapCommand(command);
 				}
+				AmmHistory::Note(static_cast<uint32_t>(command.kind), command.va, command.size,
+				                 command.dmem_offset, result);
 
 				if (result != OK) {
 					LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64

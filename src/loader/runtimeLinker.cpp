@@ -53,6 +53,10 @@
 #endif
 #endif
 
+namespace Libs {
+void DumpAmmHistory(uint64_t address);
+} // namespace Libs
+
 namespace Libs::LibKernel {
 void SetProgName(const std::string& name);
 } // namespace Libs::LibKernel
@@ -857,6 +861,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("\n");
 		}
 		std::fflush(stdout);
+		Libs::DumpAmmHistory(info->access_violation_vaddr);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

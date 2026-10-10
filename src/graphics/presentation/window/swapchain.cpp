@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/liveSwitches.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
@@ -17,6 +18,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <string>
+#include <thread>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -717,6 +723,181 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	command.endRendering();
 }
 
+// KYTY_LOCAL_HACK KYTY_FRAME_DUMP=<n> (live, research 2026-10-10, for frame-to-frame flicker): when the
+// value changes to n > 0, the next n presented frames (the prepared frame image, full size, before the
+// swapchain blit scaling) are copied to host memory; 2 s after the last one they are written to
+// KYTY_FRAME_DUMP_DIR (default "framedump", relative to the install dir) as f<seq>.raw (4 bytes per
+// texel, row-major, no padding) plus a line per frame in index.txt (name, width, height, vk format,
+// microseconds since the first frame). Write another value (e.g. n + 1) to dump again.
+namespace {
+class FrameDump {
+public:
+	void Record(GraphicContext& graphics, vk::CommandBuffer command, const VulkanImage& image) {
+		static auto& setting = Common::LiveSwitches::Get("KYTY_FRAME_DUMP", 0);
+		const auto   value   = setting.load(std::memory_order_relaxed);
+		if (value != m_last_value) {
+			m_last_value = value;
+			if (value > 0 && m_frames.empty()) {
+				m_wanted = static_cast<int>(value);
+				m_start  = std::chrono::steady_clock::now();
+				::printf("Frame dump: capturing %d frames\n", m_wanted);
+				std::fflush(stdout);
+			}
+		}
+		if (m_wanted <= 0) {
+			return;
+		}
+		const auto texel = TexelBytes(image.format);
+		if (texel == 0) {
+			::printf("Frame dump: unsupported format %d\n", static_cast<int>(image.format));
+			m_wanted = 0;
+			return;
+		}
+		Captured frame {};
+		frame.width  = image.extent.width;
+		frame.height = image.extent.height;
+		frame.format = static_cast<int>(image.format);
+		frame.usec   = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now() - m_start)
+                                               .count());
+		const vk::DeviceSize size = static_cast<vk::DeviceSize>(frame.width) * frame.height * texel;
+		if (!Allocate(graphics, size, &frame)) {
+			m_wanted = 0;
+			return;
+		}
+		vk::BufferImageCopy region {};
+		region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent                 = vk::Extent3D {frame.width, frame.height, 1};
+		command.copyImageToBuffer(image.image, vk::ImageLayout::eTransferSrcOptimal, frame.buffer, 1,
+		                          &region);
+		vk::BufferMemoryBarrier to_host {};
+		to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.buffer              = frame.buffer;
+		to_host.size                = VK_WHOLE_SIZE;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+		                        vk::DependencyFlags {}, 0, nullptr, 1, &to_host, 0, nullptr);
+		m_frames.push_back(frame);
+		if (--m_wanted == 0) {
+			Flush(graphics.device);
+		}
+	}
+
+private:
+	struct Captured {
+		vk::Buffer       buffer = nullptr;
+		vk::DeviceMemory memory = nullptr;
+		void*            mapped = nullptr;
+		vk::DeviceSize   size   = 0;
+		uint32_t         width  = 0;
+		uint32_t         height = 0;
+		int              format = 0;
+		uint64_t         usec   = 0;
+	};
+
+	static uint32_t TexelBytes(vk::Format format) {
+		switch (format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb:
+			case vk::Format::eR8G8B8A8Unorm:
+			case vk::Format::eR8G8B8A8Srgb:
+			case vk::Format::eA2B10G10R10UnormPack32:
+			case vk::Format::eA2R10G10B10UnormPack32:
+			case vk::Format::eB10G11R11UfloatPack32: return 4;
+			default: return 0;
+		}
+	}
+
+	static bool Allocate(GraphicContext& graphics, vk::DeviceSize size, Captured* frame) {
+		vk::BufferCreateInfo info {};
+		info.size  = size;
+		info.usage = vk::BufferUsageFlagBits::eTransferDst;
+		if (graphics.device.createBuffer(&info, nullptr, &frame->buffer) != vk::Result::eSuccess) {
+			::printf("Frame dump: createBuffer failed\n");
+			return false;
+		}
+		const auto requirements = graphics.device.getBufferMemoryRequirements(frame->buffer);
+		const auto& memory      = graphics.physical_device_memory_properties;
+		uint32_t    type        = UINT32_MAX;
+		for (const auto wanted: {vk::MemoryPropertyFlagBits::eHostVisible |
+		                             vk::MemoryPropertyFlagBits::eHostCoherent |
+		                             vk::MemoryPropertyFlagBits::eHostCached,
+		                         vk::MemoryPropertyFlagBits::eHostVisible |
+		                             vk::MemoryPropertyFlagBits::eHostCoherent}) {
+			for (uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; i++) {
+				if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+				    (memory.memoryTypes[i].propertyFlags & wanted) == wanted) {
+					type = i;
+				}
+			}
+		}
+		vk::MemoryAllocateInfo allocate {};
+		allocate.allocationSize  = requirements.size;
+		allocate.memoryTypeIndex = type;
+		if (type == UINT32_MAX ||
+		    graphics.device.allocateMemory(&allocate, nullptr, &frame->memory) != vk::Result::eSuccess) {
+			::printf("Frame dump: allocateMemory failed\n");
+			graphics.device.destroyBuffer(frame->buffer, nullptr);
+			return false;
+		}
+		graphics.device.bindBufferMemory(frame->buffer, frame->memory, 0);
+		if (graphics.device.mapMemory(frame->memory, 0, size, vk::MemoryMapFlags {}, &frame->mapped) !=
+		    vk::Result::eSuccess) {
+			::printf("Frame dump: mapMemory failed\n");
+			graphics.device.destroyBuffer(frame->buffer, nullptr);
+			graphics.device.freeMemory(frame->memory, nullptr);
+			return false;
+		}
+		frame->size   = size;
+		return true;
+	}
+
+	void Flush(vk::Device device) {
+		std::thread([device, frames = std::move(m_frames)] {
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+			const char*       env = std::getenv("KYTY_FRAME_DUMP_DIR");
+			const std::string dir = env != nullptr ? env : "framedump";
+			(void)std::system(("mkdir -p '" + dir + "'").c_str());
+			static int batch = 0;
+			batch++;
+			auto* index = std::fopen((dir + "/index.txt").c_str(), "a");
+			for (size_t i = 0; i < frames.size(); i++) {
+				const auto& frame = frames[i];
+				char        name[64];
+				std::snprintf(name, sizeof(name), "b%02d_f%03zu.raw", batch, i);
+				if (auto* file = std::fopen((dir + "/" + name).c_str(), "wb"); file != nullptr) {
+					std::fwrite(frame.mapped, 1, frame.size, file);
+					std::fclose(file);
+				}
+				if (index != nullptr) {
+					std::fprintf(index, "%s %u %u %d %" PRIu64 "\n", name, frame.width, frame.height,
+					             frame.format, frame.usec);
+				}
+				device.unmapMemory(frame.memory);
+				device.destroyBuffer(frame.buffer, nullptr);
+				device.freeMemory(frame.memory, nullptr);
+			}
+			if (index != nullptr) {
+				std::fclose(index);
+			}
+			::printf("Frame dump: wrote %zu frames to %s (batch %d)\n", frames.size(), dir.c_str(),
+			         batch);
+			std::fflush(stdout);
+		}).detach();
+		m_frames.clear();
+	}
+
+	std::vector<Captured>                 m_frames;
+	std::chrono::steady_clock::time_point m_start {};
+	int64_t                               m_last_value = 0;
+	int                                   m_wanted     = 0;
+};
+FrameDump g_frame_dump;
+} // namespace
+
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
@@ -769,6 +950,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
+		g_frame_dump.Record(m_window.graphic_ctx, vk_command, source->image);
 	} else {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,

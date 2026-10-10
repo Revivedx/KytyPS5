@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
+#include <bit>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -138,6 +139,24 @@ void Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode 
 		                                                  : ReadOperand(operand, type);
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}));
+}
+
+// KYTY_LOCAL_HACK (port of TheCruZ 04abd479): DX fract returns [0, 1); x - floor(x) rounds to 1.0 for
+// tiny negative x and the hardware clamps that to the largest value below one (LLVM matches
+// minnum(x - floor(x), nextafter(1.0, 0.0)) to V_FRACT). Without it index = int(fract(x) * N) can
+// reach N. Clamped in the destination precision; NaN passes through.
+void Translator::V_FRACT(const Decoder::Instruction& inst, bool half) {
+	const auto source = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, IR::Type::F32));
+	auto       result = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {source}));
+	const auto below_one =
+	    IR::F32(IR::Value::F32(std::bit_cast<float>(half ? 0x3f7fe000u : 0x3f7fffffu)));
+	const auto above = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan32, {result, below_one}));
+	result           = SelectF32(above, below_one, result);
+	if (half) {
+		WriteF16(DestinationOperand(inst), result);
+	} else {
+		WriteOperand(DestinationOperand(inst), result);
+	}
 }
 
 void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
