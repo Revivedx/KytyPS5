@@ -744,6 +744,7 @@ struct DrawEmitInfo {
 	vk::Buffer        mesh_groups_buffer = nullptr;
 	vk::DeviceSize    mesh_groups_offset = 0;
 	vk::DeviceAddress mesh_draw_data     = 0;
+	uint32_t          mesh_draw_slices   = 1; // KYTY_MESH_FAST_SLICES: one indirect draw per entry
 };
 
 struct DrawIndexBufferSource {
@@ -1477,6 +1478,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			gpu_emit.mesh_groups_buffer = converted.groups_buffer;
 			gpu_emit.mesh_groups_offset = converted.groups_offset;
 			gpu_emit.mesh_draw_data     = converted.draw_data;
+			gpu_emit.mesh_draw_slices   = converted.slices;
 			ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, gpu_emit,
 			                            index_source, primitive_restart_enable);
 		};
@@ -1687,6 +1689,49 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 			// draws and advance draw(1) by each one's first group.
 			mesh_fast_total = mesh_groups;
 			mesh_groups     = MeshGroupSplitStride;
+		}
+		// KYTY_LOCAL_HACK research: KYTY_MESH_DUMP=<mesh shader hash, hex> (env) prints each new
+		// shape of that shader's draws (group counts, passes, render area) once.
+		static const uint64_t mesh_dump = [] {
+			const char* value = std::getenv("KYTY_MESH_DUMP");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+		}();
+		if (mesh_dump != 0 && state.vertex_info[0].stage.program->shader_hash == mesh_dump) {
+			static std::mutex            dump_mutex;
+			static std::set<std::string> dumped;
+			const auto line = fmt::format(
+			    "MESH DUMP {:016x}: indirect_gpu={} index_count={} primitives={} per_group={} groups={} "
+			    "instances={} slices={} fast_total={} fast_launch={} wave={} passes={} host_threads={} "
+			    "max_vertices={} max_primitives={} lds_dwords={} input_prim={}",
+			    mesh_dump, emit.mesh_draw_data != 0 ? 1 : 0, draw.index_count, primitives,
+			    mesh.primitives_per_group, mesh_groups, draw.instance_count, mesh_slices, mesh_fast_total,
+			    mesh.fast_launch ? 1 : 0, mesh.wave_size, mesh.passes, mesh.HostThreads(), mesh.max_vertices,
+			    mesh.max_primitives, mesh.lds_size_dwords, mesh.input_primitive);
+			std::lock_guard lock(dump_mutex);
+			if (dumped.size() < 64 && dumped.insert(line).second) {
+				std::printf("%s\n", line.c_str());
+				std::fflush(stdout);
+			}
+		}
+		// GPU-converted: the entry an earlier draw of this shader got (~8 draws ago, long finished
+		// in practice), as the GPU computed it: x y z groups, count, first, instance, groups.
+		if (mesh_dump != 0 && emit.mesh_draw_data != 0 && m_mesh_indirect != nullptr &&
+		    state.vertex_info[0].stage.program->shader_hash == mesh_dump) {
+			static std::array<vk::DeviceSize, 16> recent {};
+			static uint32_t                        seen = 0;
+			static uint32_t                        printed = 0;
+			const auto old_offset = recent[seen % recent.size()];
+			recent[seen % recent.size()] = emit.mesh_groups_offset;
+			if (++seen > recent.size() && printed < 80) {
+				if (const auto* e = m_mesh_indirect->EntryHost(old_offset); e != nullptr) {
+					printed++;
+					std::printf("MESH GPU ENTRY: groups %u x %u x %u = %llu, count %u, first %u, instance %u, "
+					            "group count %u\n",
+					            e[0], e[1], e[2],
+					            static_cast<unsigned long long>(e[0]) * e[1] * e[2], e[4], e[5], e[6], e[7]);
+					std::fflush(stdout);
+				}
+			}
 		}
 		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
 		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
@@ -1914,6 +1959,18 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (mesh_active && emit.mesh_draw_data != 0) {
 		vk_buffer.drawMeshTasksIndirectEXT(emit.mesh_groups_buffer, emit.mesh_groups_offset, 1,
 		                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+		// Further slices: their own entry and draw parameters (empty ones draw nothing).
+		for (uint32_t k = 1; k < emit.mesh_draw_slices; k++) {
+			const auto address = emit.mesh_draw_data + k * MeshIndirectDraw::EntryBytes;
+			const std::array<uint32_t, 6> slice_data {static_cast<uint32_t>(address),
+			                                          static_cast<uint32_t>(address >> 32u), 0u, 0u, 0u, 0u};
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			                        vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment,
+			                        0, sizeof(slice_data), slice_data.data());
+			vk_buffer.drawMeshTasksIndirectEXT(emit.mesh_groups_buffer,
+			                                   emit.mesh_groups_offset + k * MeshIndirectDraw::EntryBytes, 1,
+			                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+		}
 	} else if (mesh_active) {
 		if (mesh_fast_total == 0) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, mesh_slices);

@@ -9,13 +9,15 @@ dump of the game (PPSA03671).
 Tested on a Ryzen 7 5800X3D + Radeon RX 7900 XT, Mesa RADV, Linux 7.2, opening jungle area:
 
 - Title, menus and gameplay work; character models render correctly on AMD.
-- About 25 fps standing in the jungle; 7-12 fps in heavy combat (fire, many enemies).
+- About 25 fps standing in the jungle; 7-12 fps in heavy combat (fire, many enemies); main menu ~44 fps.
 - The bottleneck is the single command-processor thread (per-draw resource preparation) and, in heavy
   scenes, GPU serialization (a barrier/render-pass break around most draws). Both are being worked on.
 
 ## What this branch adds
 
 AMD/RADV correctness:
+- GPU-converted fast-launch mesh draws over 65535 groups are issued as several Z = 1 draws
+  (`KYTY_MESH_FAST_SLICES`): RADV ran the Z > 1 layout ~50x slower (main menu shadow pass, 9 -> 44 fps).
 - Guest wave32 mesh shaders run one guest wave per pass, pixel shaders get the guest wave size, wave32
   vertex shaders wrap the lane index at 32 (V_MBCNT, Senaxx d7873b2a): no exploded or cracked geometry,
   no rainbow sparks.

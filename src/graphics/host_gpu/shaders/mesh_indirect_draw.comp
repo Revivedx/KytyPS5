@@ -34,6 +34,7 @@ layout(push_constant) uniform Push {
     uint  split_stride;    // MeshGroupSplitStride
     uint  output_dword;
     uint  fast_launch;     // dword 3 then holds the group count instead of the index size
+    uint  slices;          // fast launch: entries written, one direct-shaped draw each (KYTY_MESH_FAST_SLICES)
 } pc;
 
 void main() {
@@ -61,15 +62,43 @@ void main() {
     const uint groups = primitives == 0u || instances == 0u
                             ? 0u
                             : (primitives - 1u) / pc.primitives_per_group + 1u;
+    // KYTY_MESH_FAST_SLICES: a fast-launch draw becomes `slices` draws of at most one host
+    // dimension each (Z = 1; RADV runs mesh draws with Z > 1 ~50x slower), each with its own
+    // entry: the base vertex advanced by the groups before it and the groups left. Empty slices
+    // draw nothing. The last slice keeps the Z layout below for whatever is left.
+    uint slice_groups = groups;
+    uint slice_first  = offset_or_vertex;
+    if (pc.fast_launch != 0u && pc.slices > 1u) {
+        for (uint k = 0u; k + 1u < pc.slices; k++) {
+            const uint done = k * pc.split_stride;
+            const uint left = groups > done ? groups - done : 0u;
+            const uint sb   = pc.output_dword + k * 16u;
+            entries[sb + 0u] = instances == 0u ? 0u : min(left, pc.split_stride);
+            entries[sb + 1u] = min(instances, pc.max_groups_y);
+            entries[sb + 2u] = 1u;
+            entries[sb + 4u] = count;
+            entries[sb + 5u] = offset_or_vertex + done;
+            entries[sb + 6u] = first_instance;
+            entries[sb + 7u] = left;
+            entries[sb + 8u] = index_address.x;
+            entries[sb + 9u] = index_address.y;
+        }
+        const uint done = (pc.slices - 1u) * pc.split_stride;
+        slice_groups    = groups > done ? groups - done : 0u;
+        slice_first     = offset_or_vertex + done;
+    }
+    const uint out_base = pc.fast_launch != 0u && pc.slices > 1u
+                              ? pc.output_dword + (pc.slices - 1u) * 16u
+                              : pc.output_dword;
     // Groups past one host dimension continue along Z (WorkgroupId.x + WorkgroupId.z * stride);
     // groups past the draw's end emit nothing.
-    uint x = groups;
+    uint x = slice_groups;
     uint z = 1u;
-    if (groups > pc.max_groups_x) {
+    if (slice_groups > pc.max_groups_x) {
         x = pc.split_stride;
-        z = (groups - 1u) / pc.split_stride + 1u;
+        z = (slice_groups - 1u) / pc.split_stride + 1u;
     }
-    uint y = min(instances, pc.max_groups_y);
+    uint y = slice_groups == 0u ? 0u : min(instances, pc.max_groups_y);
     z      = min(z, pc.max_groups_z);
     if (x != 0u && y != 0u) {
         if (x > pc.max_groups_total / y) {
@@ -79,14 +108,14 @@ void main() {
         }
     }
 
-    const uint base = pc.output_dword;
+    const uint base = out_base;
     entries[base + 0u] = x;
     entries[base + 1u] = y;
     entries[base + 2u] = z;
     entries[base + 4u] = count;
-    entries[base + 5u] = offset_or_vertex;
+    entries[base + 5u] = slice_first;
     entries[base + 6u] = first_instance;
-    entries[base + 7u] = pc.fast_launch != 0u ? groups : pc.element_size;
+    entries[base + 7u] = pc.fast_launch != 0u ? slice_groups : pc.element_size;
     entries[base + 8u] = index_address.x;
     entries[base + 9u] = index_address.y;
 }

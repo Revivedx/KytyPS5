@@ -75,7 +75,9 @@ public:
 		vk::Buffer        groups_buffer;
 		vk::DeviceSize    groups_offset = 0;
 		vk::DeviceAddress draw_data     = 0; // the six MeshDrawParameter dwords
+		uint32_t          slices        = 1; // consecutive entries, one draw each (EntryBytes apart)
 	};
+	static constexpr vk::DeviceSize EntryBytes = 16 * sizeof(uint32_t);
 	// Records the conversion; binds a compute pipeline and push state and must run outside a
 	// render pass, before the draw's own bindings are committed.
 	[[nodiscard]] Result Convert(const CommandRecorder& command, const Params& params);
@@ -87,6 +89,13 @@ public:
 	// Conversions recorded so far; an entry stays valid for Entries - 1 later ones.
 	[[nodiscard]] uint64_t Count() const noexcept { return m_count; }
 	static constexpr uint32_t RingEntries = 4096;
+	// KYTY_MESH_DUMP research: the host view of an entry (null unless the ring is host-visible).
+	[[nodiscard]] const uint32_t* EntryHost(vk::DeviceSize groups_offset) const noexcept {
+		const auto mapped = m_entries.Mapped();
+		return mapped.size() >= groups_offset + EntryDwords * sizeof(uint32_t)
+		           ? reinterpret_cast<const uint32_t*>(mapped.data() + groups_offset)
+		           : nullptr;
+	}
 
 private:
 	Result RecordOne(const CommandRecorder& command, const Params& params);

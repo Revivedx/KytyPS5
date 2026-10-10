@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/indirectDispatch.h"
 
 #include "common/assert.h"
+
+#include <algorithm>
 #include "common/liveSwitches.h"
 #include "gpu_tiler_shaders/dispatch_indirect_groups_spv.h"
 #include "gpu_tiler_shaders/mesh_indirect_draw_spv.h"
@@ -136,13 +138,16 @@ struct MeshPushConstants {
 	uint32_t split_stride;
 	uint32_t output_dword;
 	uint32_t fast_launch;
+	uint32_t slices;
 };
 
 } // namespace
 
 MeshIndirectDraw::MeshIndirectDraw(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics),
-      m_entries(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+      // KYTY_MESH_DUMP (research): the entries in host-visible memory, so they can be read back.
+      m_entries(graphics, scheduler,
+                std::getenv("KYTY_MESH_DUMP") != nullptr ? MemoryUsage::Stream : MemoryUsage::DeviceLocal, 0,
                 vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer |
                     vk::BufferUsageFlagBits::eShaderDeviceAddress,
                 Entries * EntryDwords * sizeof(uint32_t)) {
@@ -241,9 +246,21 @@ void MeshIndirectDraw::ConvertBatch(const CommandRecorder& command, std::span<co
 
 MeshIndirectDraw::Result MeshIndirectDraw::RecordOne(const CommandRecorder& command,
                                                      const Params&          params) {
+	// KYTY_LOCAL_HACK KYTY_MESH_FAST_SLICES (live, default 2; 0/1 = one entry with Z slices): a
+	// fast-launch draw gets this many consecutive entries, one Z = 1 draw each (RADV runs mesh draws
+	// with Z > 1 about 50x slower: Wolverine's menu shadow pass 10 ms -> 0.15 ms a draw, 9 -> 44 fps).
+	static auto& fast_slices = Common::LiveSwitches::Get("KYTY_MESH_FAST_SLICES", 2);
+	const uint32_t slices =
+	    params.fast_launch
+	        ? std::clamp<uint32_t>(static_cast<uint32_t>(fast_slices.load(std::memory_order_relaxed)), 1u, 8u)
+	        : 1u;
+	if (m_next + slices > Entries) {
+		m_count += Entries - m_next; // the tail is skipped: entries stay contiguous
+		m_next = 0;
+	}
 	const auto entry  = m_next;
-	m_next            = (m_next + 1u) % Entries;
-	m_count++;
+	m_next            = (m_next + slices) % Entries;
+	m_count += slices;
 	const auto offset = vk::DeviceSize {entry} * EntryDwords * sizeof(uint32_t);
 
 	const auto& limits = m_graphics.mesh_shader_properties;
@@ -260,16 +277,24 @@ MeshIndirectDraw::Result MeshIndirectDraw::RecordOne(const CommandRecorder& comm
 	    std::max(params.primitives_per_group, 1u),
 	    limits.maxMeshWorkGroupCount[0],
 	    limits.maxMeshWorkGroupCount[1],
-	    limits.maxMeshWorkGroupCount[2],
+	    // KYTY_LOCAL_HACK research KYTY_MESH_CONVERT_ZMAX (live, default 0 = the device limit): caps
+	    // the Z slices of a converted draw (diagnostic: draws past the cap lose geometry).
+	    [&] {
+		    static auto& zmax = Common::LiveSwitches::Get("KYTY_MESH_CONVERT_ZMAX", 0);
+		    const auto   cap  = zmax.load(std::memory_order_relaxed);
+		    return cap > 0 ? std::min(static_cast<uint32_t>(cap), limits.maxMeshWorkGroupCount[2])
+		                   : limits.maxMeshWorkGroupCount[2];
+	    }(),
 	    limits.maxMeshWorkGroupTotalCount,
 	    MeshGroupSplitStride,
 	    entry * EntryDwords,
-	    params.fast_launch ? 1u : 0u};
+	    params.fast_launch ? 1u : 0u,
+	    slices};
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch(1, 1, 1);
 	return {m_entries.Handle(), offset,
-	        m_entries.BufferDeviceAddress() + offset + 4u * sizeof(uint32_t)};
+	        m_entries.BufferDeviceAddress() + offset + 4u * sizeof(uint32_t), slices};
 }
 
 } // namespace Libs::Graphics
