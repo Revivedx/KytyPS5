@@ -67,6 +67,30 @@ public:
 			::printf(" 0x%" PRIx64 " w%" PRIu64 "/r%" PRIu64, top[i].first << 12u,
 			         top[i].second.writes, top[i].second.reads);
 		}
+		{
+			// Write faults per 4 MiB region (tracker region): how much memory holds them.
+			std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> regions; // writes, pages
+			for (const auto& [page, c]: m_pages) {
+				if (c.writes != 0) {
+					auto& r = regions[page >> 10u];
+					r.first += c.writes;
+					r.second++;
+				}
+			}
+			std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> sorted(regions.begin(),
+			                                                                     regions.end());
+			std::sort(sorted.begin(), sorted.end(),
+			          [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+			uint64_t covered = 0;
+			::printf("; write regions %zu:", sorted.size());
+			for (size_t i = 0; i < sorted.size() && i < 12; i++) {
+				covered += sorted[i].second.first;
+				::printf(" 0x%" PRIx64 " w%" PRIu64 "/p%" PRIu64 " (%.0f%%)", sorted[i].first << 22u,
+				         sorted[i].second.first, sorted[i].second.second,
+				         m_writes != 0 ? 100.0 * static_cast<double>(covered) / static_cast<double>(m_writes)
+				                       : 0.0);
+			}
+		}
 		std::vector<std::pair<uint64_t, uint64_t>> blocks(m_cp_blocks.begin(), m_cp_blocks.end());
 		const auto bcount = std::min<size_t>(blocks.size(), 6);
 		std::partial_sort(blocks.begin(), blocks.begin() + static_cast<ptrdiff_t>(bcount), blocks.end(),
