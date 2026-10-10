@@ -9,7 +9,7 @@ dump of the game (PPSA03671).
 Tested on a Ryzen 7 5800X3D + Radeon RX 7900 XT, Mesa RADV, Linux 7.2, opening jungle area:
 
 - Title, menus and gameplay work; character models render correctly on AMD.
-- About 25 fps standing in the jungle; ~11-14 fps in heavy combat (fire, many enemies; was 7-9); main menu
+- About 27 fps standing in the jungle; ~11-14 fps in heavy combat (fire, many enemies; was 7-9); main menu
   ~44 fps.
 - The bottleneck is the single command-processor thread (per-draw resource preparation) and, in heavy
   scenes, GPU serialization (a barrier/render-pass break around most draws). Both are being worked on.
@@ -31,6 +31,10 @@ Performance (game threads in combat), measured with same-process A/B switches:
   finished, the window is copied on a compute queue instead of behind all pending graphics work, and the
   faulting game thread waits for that copy only (threads faulting in the same window share it).
   Heavy combat 8.3 -> 10.7 and 8.7 -> 13.6 fps (two runs), idle unchanged.
+- Host-imported guest memory (`KYTY_HOST_IMPORT`, default on): the few guest ranges the game rewrites from
+  many job threads every frame (per-object constants, GPU-read only) get one buffer each whose memory is
+  the guest pages themselves (a udmabuf of the direct-memory memfd imported as a dma-buf): no write
+  protection, no faults, no uploads. Write faults -72%; idle 25.1 -> 27.4 fps, combat steady scene +7%.
 
 Performance (command processor), each measured with same-process A/B switches:
 - Draw prep (`KYTY_DRAW_PREP`, port of Senaxx 6632a241 onto this branch's resource memo): a scanner

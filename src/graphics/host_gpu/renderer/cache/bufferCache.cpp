@@ -1822,7 +1822,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t size);
 
-// KYTY_HOST_IMPORT=1 (live, default 0; 2026-10-10): heavy combat is bound by the game's job
+// KYTY_HOST_IMPORT=1 (live, default 1; 2026-10-10): heavy combat is bound by the game's job
 // threads writing CPU-only data (per-object constants in 0x10a0000000 and 0x11e0000000..): every
 // write after a sync faults (write protection), the command processor re-uploads the page at the
 // next sync (~1 GB per 5 s) and protects it again (hb1: ~150k write faults per 5 s, ~75% there).
@@ -1961,7 +1961,9 @@ bool BufferCache::CreateZoneBuffer(ImportZone& zone) {
 }
 
 void BufferCache::PollHostImport() {
-	static auto& host_import = Common::LiveSwitches::Get("KYTY_HOST_IMPORT", 0);
+	// Default 1 since 2026-10-10 on top of KYTY_GUEST_COPY_QUEUE: combat ac1 write faults -72%, steady
+	// scene 24.5 -> 26.2 fps; idle ai1 25.1 -> 27.4 -> 25.5, ai2 (on from boot) 27.4 / 25.6 off / 27.4.
+	static auto& host_import = Common::LiveSwitches::Get("KYTY_HOST_IMPORT", 1);
 	const bool   on = host_import.load(std::memory_order_relaxed) != 0 && m_graphics.dma_buf_import;
 	if (on == m_import_on) {
 		return;
