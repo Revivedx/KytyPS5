@@ -45,6 +45,8 @@ enum Kind : uint32_t {
 	CpCopySubmit,  // CP: its vkQueueSubmit (CpPart)
 	CpCopyDone,    // CP: CompleteGuestCopy (fence wait + dirty state, CpPart)
 	CpCopyFinish,  // CP: FinishGuestCopy (CpPart)
+	ReadCopyFence, // read fault: the game thread waiting for its guest copy's fence (inner)
+	ReadCopyPub,   // read fault: the game thread publishing the copy into guest memory (inner)
 	Count,
 };
 
@@ -92,7 +94,8 @@ inline void Report() {
 	                                   "  w-ahead", "    lock-wait", "    change-state",
 	                                   "    flush-readback", "cp-written-upload-hold", "  r-hop", "  r-gpu",
 	                                   "  r-finish", "  r-sync", "cp-begin", "cp-copy-start",
-	                                   "cp-copy-submit", "cp-copy-done", "cp-copy-finish"};
+	                                   "cp-copy-submit", "cp-copy-done", "cp-copy-finish",
+	                                   "  r-copy-fence", "  r-copy-pub"};
 	std::printf("CP waits (%.1f s): cpu %.0f ms;", wall / 1e9,
 	            s.cpu_ns != 0 ? static_cast<double>(cpu - s.cpu_ns) / 1e6 : 0.0);
 	uint64_t listed = 0;

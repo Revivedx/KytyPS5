@@ -168,6 +168,8 @@ public:
 				                      offset, saved.buffer->Size());
 			}
 		}
+		RenderContext::t_bda_caller_hash    = 0xfa017;
+		RenderContext::t_bda_caller_reasons = 0;
 		m_context.PrepareBda();
 		return true;
 	}
@@ -409,6 +411,36 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	// KYTY_DISPATCH_CHAIN=1 (live, default 0; port of TheCruZ 55c94c57 to this inline command
+	// processor, 2026-10-10): every direct dispatch recorded a hazard barrier before it (when it
+	// writes) and an access barrier after it, each waiting for all earlier GPU work (combat gp5:
+	// ~13k dispatches and ~94k barriers per second, GPU 67-77% busy). On the guest's GPU the
+	// dispatches of a queue overlap unless the guest orders them (WAIT_REG_MEM, ACQUIRE_MEM, any
+	// other operation). The barrier after a direct dispatch is deferred on the command buffer:
+	// anything else recorded first records it; when the next operation is a direct dispatch of the
+	// same queue with only register writes in between, neither barrier is recorded (the barrier
+	// before the earlier dispatch already ordered everything before it).
+	static auto& dispatch_chain = Common::LiveSwitches::Get("KYTY_DISPATCH_CHAIN", 0);
+	const bool   chain_on       = dispatch_chain.load(std::memory_order_relaxed) != 0;
+	const bool   chained =
+	    chain_on && m_chain_unordered && buffer.TakeDeferredDispatchBarrier(m_chain_queue);
+	{
+		static uint64_t total = 0, linked = 0;
+		static auto     at    = std::chrono::steady_clock::now();
+		if (chain_on) {
+			total++;
+			linked += chained ? 1u : 0u;
+			if (const auto now = std::chrono::steady_clock::now();
+			    now - at >= std::chrono::seconds(5)) {
+				::printf("Dispatch chain (5 s): %" PRIu64 " of %" PRIu64 " direct dispatches chained\n",
+				         linked, total);
+				std::fflush(stdout);
+				total = linked = 0;
+				at             = now;
+			}
+		}
+	}
+
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
@@ -566,6 +598,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
+		RenderContext::t_bda_caller_hash    = program.shader_hash;
+		RenderContext::t_bda_caller_reasons = program.info.dma_reasons;
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
@@ -587,7 +621,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 		                }) ||
 		    has_storage_writes;
-		if (has_storage_writes) {
+		if (has_storage_writes && !chained) {
 			// A host fence used to serialize every dispatch. Preserve its read-before-write
 			// ordering while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -597,7 +631,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		FlushShadowWritebacks(vk_buffer);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (chain_on && m_chain_queue != nullptr) {
+			buffer.DeferDispatchBarrier(m_chain_queue);
+		} else {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 		m_context.GetCommandScheduler().ProfileMark(0, program.shader_hash, 0);
 	} while (recovery.Retry());
 	ResetBindings();
@@ -659,6 +697,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
+		RenderContext::t_bda_caller_hash    = program.shader_hash;
+		RenderContext::t_bda_caller_reasons = program.info.dma_reasons;
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);

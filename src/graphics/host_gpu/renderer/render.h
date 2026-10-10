@@ -128,6 +128,18 @@ public:
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	// Records directly, or through the recording thread when the command buffer is threaded.
 	[[nodiscard]] CommandRecorder Recorder() const;
+	// KYTY_DISPATCH_CHAIN (renderCompute.cpp): the barrier after a direct dispatch of guest queue
+	// `owner`, recorded before anything else is recorded (Recorder(), Handle(), submit), unless
+	// the next operation is a direct dispatch of that queue the guest did not order after it.
+	void DeferDispatchBarrier(const void* owner) const noexcept { m_deferred_barrier_owner = owner; }
+	[[nodiscard]] bool TakeDeferredDispatchBarrier(const void* owner) const noexcept {
+		if (owner == nullptr || m_deferred_barrier_owner != owner) {
+			return false;
+		}
+		m_deferred_barrier_owner = nullptr;
+		return true;
+	}
+	void FlushDeferredDispatchBarrier() const;
 	[[nodiscard]] GraphicContext& GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&  GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&    GetRegisters() const noexcept { return *m_registers; }
@@ -187,6 +199,7 @@ private:
 	bool                 m_threaded        = false;
 	vk::CommandBuffer    m_buffer          = nullptr;
 	uint32_t             m_debug_op        = 0;
+	mutable const void*  m_deferred_barrier_owner = nullptr; // KYTY_DISPATCH_CHAIN
 	uint64_t             m_debug_submit_id = 0;
 	uint32_t             m_debug_arg0      = 0;
 	uint32_t             m_debug_arg1      = 0;
@@ -207,6 +220,12 @@ private:
 
 class RenderExecutor {
 public:
+	// KYTY_DISPATCH_CHAIN: the guest queue (its command processor) of the next DispatchDirect, and
+	// whether the guest left it unordered after that queue's previous direct dispatch.
+	void SetDispatchChain(const void* queue, bool unordered) noexcept {
+		m_chain_queue     = queue;
+		m_chain_unordered = unordered;
+	}
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
@@ -232,6 +251,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	const void* m_chain_queue     = nullptr; // KYTY_DISPATCH_CHAIN
+	bool        m_chain_unordered = false;
+
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 

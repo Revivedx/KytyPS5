@@ -188,6 +188,8 @@ private:
 	uint64_t         m_index_base_addr                  = 0;
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
+	// KYTY_DISPATCH_CHAIN: only register writes since this queue's last direct dispatch.
+	bool             m_dispatch_chain = false;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
 

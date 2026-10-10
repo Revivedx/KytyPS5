@@ -1610,6 +1610,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		// KYTY_DISPATCH_CHAIN: register writes, IB calls and debug markers leave two direct
+		// dispatches unordered; anything else (waits, ACQUIRE_MEM, draws, copies, labels...) orders.
+		if (!(opcode == Pm4::IT_DISPATCH_DIRECT || opcode == Pm4::IT_SET_SH_REG ||
+		      opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_UCONFIG_REG ||
+		      opcode == Pm4::IT_SET_UCONFIG_REG_INDEX || opcode == Pm4::IT_INDIRECT_BUFFER ||
+		      (opcode == Pm4::IT_NOP && (KYTY_PM4_R(packet_header) == Pm4::R_ZERO ||
+		                                 KYTY_PM4_R(packet_header) == Pm4::R_PUSH_MARKER ||
+		                                 KYTY_PM4_R(packet_header) == Pm4::R_POP_MARKER)))) {
+			m_dispatch_chain = false;
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -1982,6 +1992,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
 		// local_z        = std::max(cs.num_thread_z, 1u);
+		// KYTY_DISPATCH_CHAIN: unordered after this queue's previous direct dispatch when only
+		// register writes came between (m_dispatch_chain, cleared by every other packet).
+		m_renderer.GetRenderExecutor().SetDispatchChain(this, std::exchange(m_dispatch_chain, true));
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 	}

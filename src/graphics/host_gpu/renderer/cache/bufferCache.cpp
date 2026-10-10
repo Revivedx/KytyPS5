@@ -1209,11 +1209,37 @@ bool BufferCache::TryCopyQueueReadback(Buffer& buffer, uint64_t window_begin, ui
 	return true;
 }
 
+// KYTY_GUEST_COPY_STATS=1 (live, research): why guest copies fall back and how big they are.
+static std::array<uint64_t, 8> g_guest_copy_outcomes {}; // started, joined, running, downloading,
+                                                         // empty, too big, slots full, no queue
+static uint64_t g_guest_copy_bytes = 0;
+
 int BufferCache::StartGuestCopy(Buffer& buffer, uint64_t window_begin, uint64_t window_end) {
 	Common::WaitStats::CpPart part(Common::WaitStats::CpCopyStart);
 	constexpr uint64_t StagingSize = 4ull * 1024 * 1024;
-	if (m_graphics.readback_queue == nullptr || !m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
-		return -1; // no second queue, or the writer is still running: the main queue orders it
+	static auto& copy_stats = Common::LiveSwitches::Get("KYTY_GUEST_COPY_STATS", 0);
+	if (copy_stats.load(std::memory_order_relaxed) != 0) {
+		static auto at = std::chrono::steady_clock::now();
+		if (const auto now = std::chrono::steady_clock::now(); now - at >= std::chrono::seconds(5)) {
+			const auto& o = g_guest_copy_outcomes;
+			::printf("Guest copy stats (5 s): started %" PRIu64 " (avg %.0f KiB), joined %" PRIu64
+			         "; fallbacks: writer running %" PRIu64 ", downloading %" PRIu64 ", nothing %" PRIu64
+			         ", too big %" PRIu64 ", slots full %" PRIu64 ", no queue %" PRIu64 "\n",
+			         o[0], o[0] != 0 ? static_cast<double>(g_guest_copy_bytes) / 1024.0 / static_cast<double>(o[0]) : 0.0,
+			         o[1], o[2], o[3], o[4], o[5], o[6], o[7]);
+			std::fflush(stdout);
+			g_guest_copy_outcomes = {};
+			g_guest_copy_bytes    = 0;
+			at                    = now;
+		}
+	}
+	if (m_graphics.readback_queue == nullptr) {
+		g_guest_copy_outcomes[7]++;
+		return -1;
+	}
+	if (!m_scheduler.IsFree(buffer.last_gpu_write_tick)) {
+		g_guest_copy_outcomes[2]++;
+		return -1; // the writer is still running: the main queue orders it
 	}
 	// gc4: the CP spent ~1.2 s per 5 s completing (waiting for) copies of the same window that
 	// another game thread had started: join that copy instead; this thread waits for its fence.
@@ -1223,6 +1249,7 @@ int BufferCache::StartGuestCopy(Buffer& buffer, uint64_t window_begin, uint64_t 
 		    slot.buffer_handle == buffer.Handle() &&
 		    slot.writer_tick == buffer.last_gpu_write_tick) {
 			slot.waiters.fetch_add(1, std::memory_order_acq_rel);
+			g_guest_copy_outcomes[1]++;
 			return static_cast<int>(i);
 		}
 	}
@@ -1233,6 +1260,7 @@ int BufferCache::StartGuestCopy(Buffer& buffer, uint64_t window_begin, uint64_t 
 	{
 		std::shared_lock lock(m_dirty_ranges_mutex);
 		if (m_downloading_ranges.Intersects(window_begin, window_end - window_begin)) {
+			g_guest_copy_outcomes[3]++;
 			return -1;
 		}
 		m_memory_tracker.ForEachDownloadRange<false>(
@@ -1246,6 +1274,7 @@ int BufferCache::StartGuestCopy(Buffer& buffer, uint64_t window_begin, uint64_t 
 		    });
 	}
 	if (copies.empty() || total_size > StagingSize) {
+		g_guest_copy_outcomes[copies.empty() ? 4 : 5]++;
 		return -1;
 	}
 	auto device = m_graphics.device;
@@ -1265,8 +1294,11 @@ int BufferCache::StartGuestCopy(Buffer& buffer, uint64_t window_begin, uint64_t 
 		}
 	}
 	if (index == GuestCopySlots) {
+		g_guest_copy_outcomes[6]++;
 		return -1;
 	}
+	g_guest_copy_outcomes[0]++;
+	g_guest_copy_bytes += total_size;
 	auto& slot = m_guest_copy_slots[index];
 	if (slot.command == nullptr) {
 		vk::CommandBufferAllocateInfo allocate {};
@@ -1384,8 +1416,12 @@ void BufferCache::WaitGuestCopy(int index) {
 	auto& slot   = m_guest_copy_slots[static_cast<size_t>(index)];
 	auto  device = m_graphics.device;
 	// The slot cannot be reused (its fence reset) while this thread is counted as a waiter.
-	RequireVulkanSuccess(device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX),
-	                     "wait for guest copy (game thread)");
+	{
+		Common::WaitStats::Inner fence_part(Common::WaitStats::ReadCopyFence);
+		RequireVulkanSuccess(device.waitForFences(1, &slot.fence, VK_TRUE, UINT64_MAX),
+		                     "wait for guest copy (game thread)");
+	}
+	Common::WaitStats::Inner publish_part(Common::WaitStats::ReadCopyPub);
 	// The game thread copies the bytes into guest memory itself (gc2: on the CP it cost ~1.3 s
 	// per 5 s and starved the CP); the CP's FinishGuestCopy only updates the dirty state.
 	PublishGuestCopy(slot);
@@ -2084,6 +2120,10 @@ void WaitUploadWorker() {
 }
 // Bytes uploaded through staging copies [0] and direct writes [1] (KYTY_SYNC_STATS).
 static std::array<std::atomic<uint64_t>, 2> g_upload_bytes {};
+static uint64_t                             g_bda_walk_bytes = 0; // KYTY_BDA_STATS (GPU thread)
+uint64_t BufferCache::TakeBdaWalkUploadedBytes() {
+	return std::exchange(g_bda_walk_bytes, 0);
+}
 
 // KYTY_HOT_BIND_STATS=1 (live, research, 2026-10-10): how the guest ranges where the game's write
 // faults concentrate (KYTY_HOT_RANGES=<hex addr>+<hex size>[,...], default the combat ones) are
@@ -2325,6 +2365,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 		    if (hot_stats) {
 			    HotBindStats::NoteUpload(address, bytes);
+		    }
+		    if (t_in_bda_walk) {
+			    g_bda_walk_bytes += bytes;
 		    }
 	    },
 	    [&]() noexcept {

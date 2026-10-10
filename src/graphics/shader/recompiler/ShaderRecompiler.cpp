@@ -1091,6 +1091,25 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	ir.info.watchdog_reports = ir.bindless_images && ir.info.uses_dma;
+	// KYTY_DMA_FOOTPRINT_LOG=1 (environment): the DMA footprint of every DMA program as compiled.
+	if (static const bool footprint_log = [] {
+		    const char* value = std::getenv("KYTY_DMA_FOOTPRINT_LOG");
+		    return value != nullptr && value[0] == '1';
+	    }();
+	    footprint_log && ir.info.uses_dma) {
+		std::string text = fmt::format("DMA footprint 0x{:016x}: reasons {} bounded {} ({}; address writes {})",
+		                               ir.shader_hash, ir.info.dma_reasons, ir.info.dma_bounded,
+		                               ir.info.dma_unbounded_reason, ir.has_address_writes);
+		for (const auto& window: ir.info.dma_windows) {
+			text += fmt::format(" window(ud{} {}..{})", window.base_register, window.first, window.last);
+		}
+		for (const auto& table: ir.info.dma_tables) {
+			text += fmt::format(" table(ud{} +{} bits 0x{:x})", table.base_register, table.immediate,
+			                    table.offset_bits);
+		}
+		::printf("%s\n", text.c_str());
+		std::fflush(stdout);
+	}
 	IR::AllocateBindings(ir, push_data_start_dword);
 	WriteResourceSummary(ir);
 	// KYTY_IR_DUMP_DIR=<dir> (environment): the IR of every program with a bindless sampler plan

@@ -66,6 +66,9 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// KYTY_BDA_STATS: the program asking for PrepareBda (set by the caller, GPU thread).
+	static thread_local uint64_t t_bda_caller_hash;
+	static thread_local uint32_t t_bda_caller_reasons;
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

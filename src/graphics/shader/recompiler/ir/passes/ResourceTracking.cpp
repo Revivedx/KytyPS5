@@ -317,6 +317,11 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_info.dma_reasons = 0;
+		m_info.dma_windows.clear();
+		m_info.dma_tables.clear();
+		m_info.dma_bounded = false;
+		m_info.dma_unbounded_reason.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -340,6 +345,11 @@ public:
 					return;
 				}
 			}
+		}
+		m_info.dma_bounded = m_info.uses_dma && !m_dma_unbounded && !m_program.has_address_writes;
+		if (!m_info.dma_bounded) {
+			m_info.dma_windows.clear();
+			m_info.dma_tables.clear();
 		}
 		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
@@ -2990,11 +3000,120 @@ private:
 		m_memory_patches.push_back({index, resource, sampler, has_sampler});
 	}
 
+	// KYTY_DMA_FOOTPRINT (TheCruZ f978c1e1). The user-data register N of a
+	// GetAddressResource(user data N, user data N + 1) base pair.
+	static bool UserDataBasePair(const Inst& handle, uint32_t& reg) {
+		if (handle.GetOpcode() != ValueOpcode::GetAddressResource || handle.NumArgs() != 2u) {
+			return false;
+		}
+		const auto* low  = handle.Arg(0).Resolve().TryInstruction();
+		const auto* high = handle.Arg(1).Resolve().TryInstruction();
+		if (low == nullptr || high == nullptr || low->GetOpcode() != ValueOpcode::GetUserData ||
+		    high->GetOpcode() != ValueOpcode::GetUserData ||
+		    low->Arg(0).GetType() != Type::ScalarReg || high->Arg(0).GetType() != Type::ScalarReg) {
+			return false;
+		}
+		reg = RegIndex(low->Arg(0).ScalarRegister());
+		return RegIndex(high->Arg(0).ScalarRegister()) == reg + 1u;
+	}
+
+	// An address read at base + offset + immediate, where the base is a user-data pair and the
+	// offset has known possible bits, reads a bounded window from the base. Anything else leaves
+	// the footprint unknown.
+	void NoteDmaWindow(const Inst& inst, const MemoryInfo& memory) {
+		constexpr uint64_t MaxAccessBytes = 16;        // the widest address read
+		constexpr uint64_t MaxWindowBytes = 16u << 20u; // larger is no better than everything
+		const auto*        handle         = inst.Arg(0).Resolve().TryInstruction();
+		uint32_t           reg            = 0;
+		if (memory.address_is_full || inst.NumArgs() < 2u || handle == nullptr ||
+		    !UserDataBasePair(*handle, reg)) {
+			m_dma_unbounded = true;
+			m_info.dma_unbounded_reason =
+			    memory.address_is_full ? "full address"
+			    : handle == nullptr    ? "no handle"
+			                           : fmt::format("base {} args {} ({} {})",
+			                                         static_cast<uint32_t>(handle->GetOpcode()),
+			                                         handle->NumArgs(),
+			                                         handle->NumArgs() > 0 && handle->Arg(0).Resolve().TryInstruction()
+			                                             ? static_cast<int>(handle->Arg(0).Resolve().TryInstruction()->GetOpcode())
+			                                             : -1,
+			                                         handle->NumArgs() > 1 && handle->Arg(1).Resolve().TryInstruction()
+			                                             ? static_cast<int>(handle->Arg(1).Resolve().TryInstruction()->GetOpcode())
+			                                             : -1);
+			return;
+		}
+		const auto bits = PossibleU32Bits(inst.Arg(1));
+		if (bits >= MaxWindowBytes) {
+			m_dma_unbounded = true;
+			m_info.dma_unbounded_reason = fmt::format("offset bits 0x{:x} (ud{})", bits, reg);
+			return;
+		}
+		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(memory.offset));
+		const auto first     = std::min<int64_t>(immediate, 0);
+		const auto last =
+		    static_cast<uint64_t>(std::max<int64_t>(immediate, 0)) + bits + MaxAccessBytes;
+		for (auto& window: m_info.dma_windows) {
+			if (window.base_register == reg) {
+				window.first = std::min(window.first, first);
+				window.last  = std::max(window.last, last);
+				return;
+			}
+		}
+		m_info.dma_windows.push_back({reg, first, last});
+	}
+
+	// A V# of an indirect buffer access whose first three DWORDs are scalar address reads of one
+	// table entry at base + offset + immediate (+4, +8): the shader reads the buffer the entry
+	// describes.
+	void NoteDmaDescriptorTable(const Inst& handle) {
+		constexpr uint32_t MaxOffsetBits = 12;
+		const Inst*        first_read    = nullptr;
+		uint32_t           first_offset  = 0;
+		for (uint32_t dword = 0; dword < 3u && handle.NumArgs() == 4u; dword++) {
+			const auto* read   = handle.Arg(dword).Resolve().TryInstruction();
+			uint32_t    index  = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, index) : nullptr;
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarAddress) {
+				break;
+			}
+			if (dword == 0u) {
+				first_read   = read;
+				first_offset = memory->offset;
+			} else if (!EquivalentValue(m_program, read->Arg(0), first_read->Arg(0)) ||
+			           !EquivalentValue(m_program, read->Arg(1), first_read->Arg(1)) ||
+			           memory->offset != first_offset + dword * 4u) {
+				break;
+			}
+			if (dword != 2u) {
+				continue;
+			}
+			const auto* address = first_read->Arg(0).Resolve().TryInstruction();
+			uint32_t    reg     = 0;
+			const auto  bits    = PossibleU32Bits(first_read->Arg(1)) & ~3u;
+			if (address == nullptr || !UserDataBasePair(*address, reg) ||
+			    std::popcount(bits) > static_cast<int>(MaxOffsetBits)) {
+				break;
+			}
+			const ShaderInfo::DmaDescriptorTable table {
+			    reg, static_cast<int64_t>(static_cast<int32_t>(first_offset & ~3u)), bits};
+			if (std::ranges::find(m_info.dma_tables, table) == m_info.dma_tables.end()) {
+				m_info.dma_tables.push_back(table);
+			}
+			return;
+		}
+		m_dma_unbounded = true;
+		if (m_info.dma_unbounded_reason.empty()) {
+			m_info.dma_unbounded_reason = "descriptor table not from a user-data base";
+		}
+	}
+
 	void Collect(Inst& inst) {
 		const auto op = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::ShaderTrap ||
 		    op == ValueOpcode::DebugProbe) {
 			m_info.uses_dma = true;
+			m_info.dma_reasons |= 8u;
+			m_dma_unbounded = true;
 			return;
 		}
 		const auto buffer       = BufferAccessOf(op);
@@ -3015,6 +3134,14 @@ private:
 		}
 		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
+			// The planned descriptor reads that stay in the shader read through device addresses.
+			if (!memory.planning_only && address_info.access == AddressAccess::Read &&
+			    IsAddressResourceKind(memory.kind)) {
+				NoteDmaWindow(inst, memory);
+			} else if (!memory.planning_only && address_info.access != AddressAccess::None) {
+				m_dma_unbounded = true;
+				m_info.dma_unbounded_reason = "planned address write";
+			}
 			return;
 		}
 		Inst*    handle   = nullptr;
@@ -3043,6 +3170,12 @@ private:
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
+				m_info.dma_reasons |= 1u;
+				if (handle != nullptr) {
+					NoteDmaDescriptorTable(*handle);
+				} else {
+					m_dma_unbounded = true;
+				}
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
@@ -3089,6 +3222,12 @@ private:
 				m_program.has_address_writes = true;
 			}
 			m_info.uses_dma = true;
+			m_info.dma_reasons |= address_info.access == AddressAccess::Write ? 4u : 2u;
+			if (address_info.access == AddressAccess::Read) {
+				NoteDmaWindow(inst, memory);
+			} else {
+				m_dma_unbounded = true;
+			}
 			return;
 		}
 
@@ -3203,6 +3342,8 @@ private:
 	std::vector<const Inst*>                   m_default_sampler_reads;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	// KYTY_DMA_FOOTPRINT: a DMA access whose footprint is not bounded (see NoteDmaWindow()).
+	bool                                       m_dma_unbounded = false;
 
 	// MemoryIndexBelongsTo's count of memory accesses per memory_info index, built on first use.
 	mutable std::unordered_map<uint32_t, uint32_t> m_memory_users;

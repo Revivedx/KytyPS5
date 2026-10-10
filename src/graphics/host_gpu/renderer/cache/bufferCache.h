@@ -127,6 +127,9 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
+	// KYTY_BDA_STATS: set during PrepareBda's walk; bytes the walk uploaded since the last take.
+	inline static thread_local bool t_in_bda_walk = false;
+	[[nodiscard]] static uint64_t   TakeBdaWalkUploadedBytes();
 	// Bytes of the cached buffers.
 	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }
 	// GPU thread, before the guest range is unmapped: drops the host-imported zones on it

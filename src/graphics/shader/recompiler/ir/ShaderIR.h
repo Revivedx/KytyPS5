@@ -487,6 +487,33 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// KYTY_BDA_STATS: why uses_dma (1 GPU-selected V#, 2 address read, 4 address write, 8 BVH/trap).
+	uint8_t                          dma_reasons        = 0;
+	// KYTY_DMA_FOOTPRINT (port of TheCruZ f978c1e1): the guest memory DMA reads, when every DMA
+	// access is a read whose address is a user-data base pair plus an offset with known possible
+	// bits (dma_windows), or a V# read from such a table entry (dma_tables). dma_bounded: these
+	// hold everything DMA can read (only with uses_dma).
+	struct DmaWindow {
+		// Bytes [base + first, base + last) from the base in registers base_register and +1.
+		uint32_t base_register = 0;
+		int64_t  first         = 0;
+		uint64_t last          = 0;
+
+		bool operator==(const DmaWindow& other) const = default;
+	};
+	// V#s read from base + immediate + offset, for every offset whose set bits lie within
+	// offset_bits; the shader reads buffer memory through them.
+	struct DmaDescriptorTable {
+		uint32_t base_register = 0;
+		int64_t  immediate     = 0;
+		uint32_t offset_bits   = 0;
+
+		bool operator==(const DmaDescriptorTable& other) const = default;
+	};
+	std::vector<DmaWindow>          dma_windows;
+	std::vector<DmaDescriptorTable> dma_tables;
+	bool                            dma_bounded = false;
+	std::string                     dma_unbounded_reason; // KYTY_DMA_FOOTPRINT_LOG (first reason)
 	// Research: loop watchdogs report their trips into the bindless feedback buffer (set 1).
 	bool                             watchdog_reports   = false;
 

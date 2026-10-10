@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -26,8 +27,18 @@ bool CommandBuffer::IsInvalid() const {
 	return !m_open;
 }
 
+void CommandBuffer::FlushDeferredDispatchBarrier() const {
+	if (m_deferred_barrier_owner == nullptr || IsInvalid()) {
+		return;
+	}
+	m_deferred_barrier_owner = nullptr;
+	ShaderAccessBarrier(m_threaded ? CommandRecorder(m_scheduler, nullptr) : CommandRecorder(m_buffer),
+	                    vk::PipelineStageFlagBits::eComputeShader);
+}
+
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	FlushDeferredDispatchBarrier();
 	if (m_threaded) {
 		// Recording directly: the recording thread must have executed everything queued first.
 		return m_scheduler.DrainRecording();
@@ -37,6 +48,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 CommandRecorder CommandBuffer::Recorder() const {
 	EXIT_IF(IsInvalid());
+	FlushDeferredDispatchBarrier();
 	return m_threaded ? CommandRecorder(m_scheduler, nullptr) : CommandRecorder(m_buffer);
 }
 

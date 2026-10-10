@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -343,7 +344,52 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+// KYTY_BDA_STATS=1 (live, research, 2026-10-10): every 5 s, PrepareBda calls, full walks, their
+// time and the bytes they uploaded (BufferCache::BdaWalkUploadedBytes), and the programs that
+// started the walks with their DMA reasons (TheCruZ f978c1e1: GTA V uploaded all cached CPU writes
+// at every DMA program; the reach of each program bounds it).
+thread_local uint64_t RenderContext::t_bda_caller_hash    = 0;
+thread_local uint32_t RenderContext::t_bda_caller_reasons = 0;
+
 void RenderContext::PrepareBda() {
+	static auto& stats_on = Common::LiveSwitches::Get("KYTY_BDA_STATS", 0);
+	struct BdaStats {
+		uint64_t calls = 0, walks = 0, walk_ns = 0;
+		std::map<uint64_t, std::pair<uint64_t, uint32_t>> walkers; // hash -> (walks, reasons)
+		std::map<uint32_t, uint64_t>                      reason_calls;
+		std::chrono::steady_clock::time_point             at = std::chrono::steady_clock::now();
+	};
+	static BdaStats bda_stats;
+	const bool      stats = stats_on.load(std::memory_order_relaxed) != 0;
+	if (stats) {
+		bda_stats.calls++;
+		bda_stats.reason_calls[t_bda_caller_reasons]++;
+		const auto now = std::chrono::steady_clock::now();
+		if (now - bda_stats.at >= std::chrono::seconds(5)) {
+			const auto bytes = m_buffer_cache.TakeBdaWalkUploadedBytes();
+			::printf("BDA stats (5 s): %" PRIu64 " calls, %" PRIu64 " walks %.1f ms, uploaded %.1f MiB "
+			         "(%" PRIu64 " pages); calls by reasons:",
+			         bda_stats.calls, bda_stats.walks, static_cast<double>(bda_stats.walk_ns) / 1e6,
+			         static_cast<double>(bytes) / 1048576.0, bytes / 4096);
+			for (const auto& [reasons, count]: bda_stats.reason_calls) {
+				::printf(" r%u x%" PRIu64, reasons, count);
+			}
+			std::vector<std::pair<uint64_t, uint64_t>> top;
+			for (const auto& [hash, entry]: bda_stats.walkers) {
+				top.emplace_back(entry.first, hash);
+			}
+			std::sort(top.rbegin(), top.rend());
+			::printf("; walk starters %zu:", top.size());
+			for (size_t i = 0; i < top.size() && i < 8; i++) {
+				::printf(" %016" PRIx64 "/r%u x%" PRIu64, top[i].second,
+				         bda_stats.walkers[top[i].second].second, top[i].first);
+			}
+			::printf("\n");
+			std::fflush(stdout);
+			bda_stats    = {};
+			bda_stats.at = now;
+		}
+	}
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
@@ -367,11 +413,26 @@ void RenderContext::PrepareBda() {
 	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
 		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
-		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
-		});
+		const auto walk_start = std::chrono::steady_clock::now();
+		BufferCache::t_in_bda_walk = stats;
+		{
+			std::shared_lock lock(m_mapped_ranges_mutex);
+			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
+			});
+		}
+		BufferCache::t_in_bda_walk = false;
 		m_bda_synced_epoch = epoch;
+		if (stats) {
+			bda_stats.walks++;
+			bda_stats.walk_ns += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+			                                                         walk_start)
+			        .count());
+			auto& walker = bda_stats.walkers[t_bda_caller_hash];
+			walker.first++;
+			walker.second |= t_bda_caller_reasons;
+		}
 	}
 	m_fault_process_pending = true;
 }

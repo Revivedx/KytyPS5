@@ -796,6 +796,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	m_command.FlushDeferredDispatchBarrier(); // KYTY_DISPATCH_CHAIN
 	// KYTY_UPLOAD_WORKER: the copies into mapped buffers this submission reads are done.
 	WaitUploadWorker();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||

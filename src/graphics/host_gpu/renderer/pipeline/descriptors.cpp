@@ -1474,9 +1474,14 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
+	RenderContext::t_bda_caller_reasons = 0;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		if (stage->runtime->program->info.uses_dma) {
+			RenderContext::t_bda_caller_hash = stage->runtime->program->shader_hash;
+			RenderContext::t_bda_caller_reasons |= stage->runtime->program->info.dma_reasons;
+		}
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();

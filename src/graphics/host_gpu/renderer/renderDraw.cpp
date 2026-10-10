@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <map>
 #include <cinttypes>
 #include <type_traits>
 #include <atomic>
@@ -364,6 +365,33 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 			// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
 			viewport.width = 1.0f;
 			scissor.extent = {0, 0};
+		}
+	}
+	// KYTY_RES_STATS=1 (live, research, 2026-10-10): every 5 s, draws per (framebuffer, viewport 0,
+	// scissor 0) size: the game's internal render resolution and whether its dynamic resolution
+	// scales it (a full-size target drawn through a smaller viewport, or smaller targets).
+	if (static auto& res_stats = Common::LiveSwitches::Get("KYTY_RES_STATS", 0);
+	    res_stats.load(std::memory_order_relaxed) != 0 && viewport_count > 0) {
+		static std::map<std::array<uint32_t, 6>, uint64_t> sizes;
+		static auto                                          at = std::chrono::steady_clock::now();
+		sizes[{framebuffer_extent.width, framebuffer_extent.height,
+		       static_cast<uint32_t>(viewports[0].width), static_cast<uint32_t>(std::abs(viewports[0].height)),
+		       scissors[0].extent.width, scissors[0].extent.height}]++;
+		if (const auto now = std::chrono::steady_clock::now(); now - at >= std::chrono::seconds(5)) {
+			std::vector<std::pair<uint64_t, std::array<uint32_t, 6>>> top;
+			for (const auto& [key, count]: sizes) {
+				top.emplace_back(count, key);
+			}
+			std::sort(top.rbegin(), top.rend());
+			::printf("Render sizes (5 s, draws: framebuffer / viewport / scissor):");
+			for (size_t i = 0; i < top.size() && i < 10; i++) {
+				const auto& k = top[i].second;
+				::printf(" %ux%u/%ux%u/%ux%u x%" PRIu64, k[0], k[1], k[2], k[3], k[4], k[5], top[i].first);
+			}
+			::printf("\n");
+			std::fflush(stdout);
+			sizes.clear();
+			at = now;
 		}
 	}
 	// KYTY_STATE_CACHE: record only the dynamic state that differs from what this command buffer
