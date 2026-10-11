@@ -239,7 +239,9 @@ public:
 	// the keys shaders flagged as pending.
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void ResolveBindlessRequests();
-	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// replace (a settled key whose T# changed): the key keeps its slot and image until the new
+	// T# resolves, and keeps them if it does not.
+	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key, bool replace = false);
 	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
 	// they were settled; returns how many it resolved.
 	uint32_t RevalidateBindlessKeys(uint32_t budget);

@@ -38,6 +38,7 @@
 #include <xxhash.h>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <unordered_map>
@@ -971,41 +972,109 @@ static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t
 	}
 }
 
-bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key) {
+bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key, bool replace) {
 	auto&                                 table = m_context.GetBindlessTable();
 	ShaderRecompiler::IR::DescriptorValue value {};
 	value.dword_count  = 8u;
 	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
-	heap.settled[key]  = 1;
-	heap.descriptors[key] = {};
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
-		table.SetTranslation(heap, key, 0u);
+	// Revalidation used to release the key first: until the new T# resolved (or for good, when
+	// it failed) every draw sampled the placeholder, so streamed textures (Logan, a barrel) went
+	// black or white for a frame or more as the camera moved. A replaced key now keeps its old
+	// slot until the new one is written, and its old T# so a failure is retried.
+	// KYTY_BINDLESS_RESOLVE_STATS=1 (live): every 5 s, resolves by outcome and slot use.
+	static auto&           stats_on = Common::LiveSwitches::Get("KYTY_BINDLESS_RESOLVE_STATS", 0);
+	static uint64_t        outcome[7] {}; // ok, read, compat, image, view, slot, replaced
+	static auto            stats_at = std::chrono::steady_clock::now();
+	int                    reason   = 0;
+	const auto             report   = [&] {
+        if (stats_on.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        outcome[reason]++;
+        if (const auto now = std::chrono::steady_clock::now(); now - stats_at >= std::chrono::seconds(5)) {
+            ::printf("Bindless resolve (5 s): ok %" PRIu64 " (replaced %" PRIu64 "), failed: read %" PRIu64
+                     " compat %" PRIu64 " image %" PRIu64 " view %" PRIu64 " slot %" PRIu64 ";",
+                     outcome[0], outcome[6], outcome[1], outcome[2], outcome[3], outcome[4], outcome[5]);
+            for (uint32_t b = 0; b < BindlessTable::ImageArrays; b++) {
+                ::printf(" array %u: %u/%u used, %zu free", b, table.SlotsUsed(b), table.ImagesPerArray(),
+                         table.SlotsFree(b));
+            }
+            ::printf("\n");
+            std::fflush(stdout);
+            std::fill(std::begin(outcome), std::end(outcome), 0);
+            stats_at = now;
+        }
+	};
+	const auto fail = [&] {
+		report();
+		if (!replace) {
+			table.SetTranslation(heap, key, 0u);
+		}
 		return false;
+	};
+	if (!replace) {
+		heap.settled[key]     = 1;
+		heap.descriptors[key] = {};
 	}
-	std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+		reason = 1;
+		return fail();
+	}
+	if (!replace) {
+		std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
+	}
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	auto& texture_cache = m_context.GetTextureCache();
+	// Releases a replaced key's old slot and image (the new T# is in, or a null/incompatible T#
+	// the game streamed out, which is settled to the placeholder as before).
+	const auto release_old = [&] {
+		const auto old_image = heap.images[key];
+		if (table.ReleaseKey(heap, key)) {
+			if (auto* old = texture_cache.m_slot_images.try_get(old_image);
+			    old != nullptr && old->bindless_pinned) {
+				NoteBindlessStateChange(*old);
+				old->bindless_pinned = false;
+			}
+		}
+		heap.settled[key] = 1;
+		std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
+	};
 	if (!BindlessCompatible(descriptor, heap.binding)) {
-		table.SetTranslation(heap, key, 0u);
-		return false;
+		reason = 2;
+		if (replace) {
+			release_old();
+			table.SetTranslation(heap, key, 0u);
+			report();
+			return false;
+		}
+		return fail();
 	}
 	auto binding = ResolveTexture(heap.resource, value);
-	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
-		table.SetTranslation(heap, key, 0u);
-		return false;
+		reason = 3;
+		return fail();
 	}
 	BindImage(binding.image_id, false);
 	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
 	image           = texture_cache.m_slot_images.try_get(binding.image_id);
 	const auto slot = table.AllocateSlot(heap.binding);
 	if (image == nullptr || view == nullptr || slot == 0) {
-		table.SetTranslation(heap, key, 0u);
-		return false;
+		reason = slot == 0 ? 5 : 4;
+		return fail();
 	}
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
 	table.WriteSlot(heap.binding, slot, view, layout);
+	if (replace) {
+		// Recorded command buffers may still sample the old slot; ReleaseKey frees it by tick.
+		release_old();
+		image = texture_cache.m_slot_images.try_get(binding.image_id);
+		if (image == nullptr) {
+			table.SetTranslation(heap, key, 0u);
+			return false;
+		}
+	}
 	heap.slots[key]         = slot;
 	heap.images[key]        = binding.image_id;
 	image->bindless_pinned  = true;
@@ -1013,6 +1082,8 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	heap.resolved.push_back(binding.image_id);
 	table.AddImageReference(binding.image_id, heap, key);
 	table.SetTranslation(heap, key, slot);
+	reason = replace ? 6 : 0;
+	report();
 	return true;
 }
 
@@ -1047,6 +1118,14 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 			if (resolved >= budget) {
 				next = key; // look at it again next frame
 				break;
+			}
+			// KYTY_BINDLESS_REPLACE=1 (live, default 0 until a user session confirms it): keep
+			// the old slot until the new T# resolves; 0 releases first, as before.
+			static auto& replace = Common::LiveSwitches::Get("KYTY_BINDLESS_REPLACE", 0);
+			if (replace.load(std::memory_order_relaxed) != 0) {
+				(void)ResolveBindlessKey(heap, key, true);
+				resolved++; // a failed attempt costs as much; it is retried next pass
+				continue;
 			}
 			const auto old_image = heap.images[key];
 			if (table.ReleaseKey(heap, key)) {

@@ -95,6 +95,9 @@ public:
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
 	// 0 when the array is full. Slots of dropped images are reused once the GPU is past them.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
+	// Slots handed out so far and slots waiting in the free list, per image array.
+	[[nodiscard]] uint32_t SlotsUsed(uint32_t binding) const noexcept { return m_next_slot[binding]; }
+	[[nodiscard]] size_t   SlotsFree(uint32_t binding) const noexcept { return m_free_slots[binding].size(); }
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
 	void SetTranslation(const Heap& heap, uint32_t key, uint32_t slot);
