@@ -705,6 +705,24 @@ void EmitPixelHistory(ValueEmitContext& ctx, uint32_t data, uint32_t mrt) {
 	if (state.pixel_history_frag_coord == 0 || !PixelHistoryEnabled(&x, &y, &w, &h)) {
 		return;
 	}
+	// KYTY_PIXEL_HISTORY_SKIP=<hex low dword>[,...]: shaders left out of the records (heavy
+	// overdraw such as volumetric fog would fill the ring in one frame).
+	static const std::vector<uint32_t> skip = [] {
+		std::vector<uint32_t> list;
+		if (const char* value = std::getenv("KYTY_PIXEL_HISTORY_SKIP"); value != nullptr) {
+			for (const char* p = value; *p != 0;) {
+				char* end = nullptr;
+				list.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+				p = (*end == ',') ? end + 1 : end;
+				if (end == p && *p != 0) break;
+			}
+		}
+		return list;
+	}();
+	if (std::find(skip.begin(), skip.end(), static_cast<uint32_t>(state.program.shader_hash)) !=
+	    skip.end()) {
+		return;
+	}
 	const auto coord = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), coord,
 	                          state.pixel_history_frag_coord);

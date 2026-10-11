@@ -39,6 +39,7 @@
 #include <mutex>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstdio>
 #include <unordered_map>
@@ -1098,10 +1099,20 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 	auto&              table         = m_context.GetBindlessTable();
 	auto&              texture_cache = m_context.GetTextureCache();
 	uint32_t           resolved      = 0;
+	// KYTY_BINDLESS_ENGINE_VERIFY=1 (env): the scan also covers watched heaps and logs every
+	// rewrite the write watch did not report.
+	static const bool verify = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_ENGINE_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
 	for (auto& heap: table.Heaps()) {
 		const auto keys = static_cast<uint32_t>(heap.settled.size());
 		if (keys == 0) {
 			continue;
+		}
+		const bool watched = BindlessEngineEnabled() && heap.watched_entries != 0 && !heap.watch_excluded;
+		if (watched && !verify) {
+			continue; // SyncBindlessHeaps follows its rewrites
 		}
 		const uint32_t begin = heap.revalidate_cursor < keys ? heap.revalidate_cursor : 0u;
 		const uint32_t count = std::min(Window, keys - begin);
@@ -1118,6 +1129,14 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 			if (resolved >= budget) {
 				next = key; // look at it again next frame
 				break;
+			}
+			if (watched && key < heap.watched_entries) {
+				static std::atomic<uint32_t> missed = 0;
+				if (missed.fetch_add(1) < 64) {
+					::printf("Bindless engine: write not reported, heap=0x%" PRIx64 "+0x%x binding=%u "
+					         "key=%u\n",
+					         heap.base, heap.table_offset, heap.binding, key);
+				}
 			}
 			// KYTY_BINDLESS_REPLACE=1 (live, default 0 until a user session confirms it): keep
 			// the old slot until the new T# resolves; 0 releases first, as before.
@@ -1140,6 +1159,91 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 		heap.revalidate_cursor = next >= keys ? 0u : next;
 	}
 	return resolved;
+}
+
+// KYTY_BINDLESS_ENGINE (port of Senaxx c5a6961b, E2): the entries in the heap pages the guest
+// wrote since the last submission are compared with the T# their keys were settled from; changed
+// keys are settled again now, before this submission's draws. KYTY_BINDLESS_RESOLVE_STATS=1
+// (live) adds the watch's totals every 5 s.
+void RenderExecutor::SyncBindlessHeaps() {
+	auto& table = m_context.GetBindlessTable();
+	if (!BindlessEngineEnabled() || !table.Enabled() || !table.HasWrittenRanges()) {
+		return;
+	}
+	KYTY_PROFILER_FUNCTION();
+	table.TakeWrittenRanges(m_bindless_written);
+	// T# bits that select a view of the same texture (RDNA 2 ISA 8.2.6): min LOD, swizzle, base and
+	// last level, base array, mip statistics. Everything else describes the texture itself.
+	constexpr std::array<uint32_t, 8> ViewMask {0u,          0x000fff00u, 0u,          0x0e0fffffu,
+	                                            0x1fff0000u, 0x027fff00u, 0x000003ffu, 0u};
+	static auto& replace  = Common::LiveSwitches::Get("KYTY_BINDLESS_REPLACE", 0);
+	static auto& stats_on = Common::LiveSwitches::Get("KYTY_BINDLESS_RESOLVE_STATS", 0);
+	auto&        texture_cache = m_context.GetTextureCache();
+	uint32_t     view_changes = 0, resource_changes = 0, resettled = 0;
+	for (auto& heap: table.Heaps()) {
+		if (heap.watched_entries == 0 || heap.watch_excluded) {
+			continue;
+		}
+		const auto heap_begin = heap.base + heap.table_offset;
+		const auto keys = std::min(heap.watched_entries, static_cast<uint32_t>(heap.settled.size()));
+		const auto heap_end = heap_begin + uint64_t {keys} * 32u;
+		for (const auto& [begin, end]: m_bindless_written) {
+			const auto from = std::max(begin, heap_begin);
+			const auto to   = std::min(end, heap_end);
+			if (from >= to) {
+				continue;
+			}
+			const auto first = static_cast<uint32_t>((from - heap_begin) / 32u);
+			const auto last  = static_cast<uint32_t>((to - heap_begin + 31u) / 32u);
+			m_bindless_window.resize(last - first);
+			if (!Libs::LibKernel::Memory::TryReadBacking(heap_begin + uint64_t {first} * 32u,
+			                                              m_bindless_window.data(),
+			                                              uint64_t {last - first} * 32u)) {
+				continue;
+			}
+			for (uint32_t key = first; key < last; key++) {
+				const auto& words = m_bindless_window[key - first];
+				if (heap.settled[key] == 0 || heap.descriptors[key] == words) {
+					continue;
+				}
+				bool resource = false;
+				for (uint32_t i = 0; i < 8; i++) {
+					resource |= ((heap.descriptors[key][i] ^ words[i]) & ~ViewMask[i]) != 0;
+				}
+				(resource ? resource_changes : view_changes)++;
+				if (replace.load(std::memory_order_relaxed) != 0) {
+					resettled += ResolveBindlessKey(heap, key, true) ? 1u : 0u;
+					continue;
+				}
+				const auto old_image = heap.images[key];
+				if (table.ReleaseKey(heap, key)) {
+					if (auto* image = texture_cache.m_slot_images.try_get(old_image);
+					    image != nullptr && image->bindless_pinned) {
+						NoteBindlessStateChange(*image);
+						image->bindless_pinned = false;
+					}
+				}
+				resettled += ResolveBindlessKey(heap, key) ? 1u : 0u;
+			}
+		}
+	}
+	if (stats_on.load(std::memory_order_relaxed) != 0) {
+		static uint64_t syncs = 0, bytes = 0, views = 0, resources = 0, settled = 0;
+		static auto     report = std::chrono::steady_clock::now();
+		syncs++;
+		for (const auto& [begin, end]: m_bindless_written) bytes += end - begin;
+		views += view_changes;
+		resources += resource_changes;
+		settled += resettled;
+		if (const auto now = std::chrono::steady_clock::now(); now - report >= std::chrono::seconds(5)) {
+			::printf("Bindless engine (5 s): syncs %" PRIu64 ", written %" PRIu64 " KiB, changed keys: "
+			         "view %" PRIu64 " resource %" PRIu64 ", settled again %" PRIu64 "\n",
+			         syncs, bytes >> 10u, views, resources, settled);
+			std::fflush(stdout);
+			syncs = bytes = views = resources = settled = 0;
+			report = now;
+		}
+	}
 }
 
 void RenderExecutor::ResolveBindlessRequests() {
@@ -1306,6 +1410,25 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		                                    entries, resource);
 		if (heap == nullptr) {
 			continue; // region 0, count 0: every key samples the placeholder
+		}
+		if (BindlessEngineEnabled() && !heap->watch_excluded && table.NeedsWatch(*heap)) {
+			// KYTY_BINDLESS_ENGINE_ZONES=0 (env; default 1): heaps in host-imported zones keep the
+			// scan. With 1 they are watched too: the page watch write-protects only the heap's pages
+			// (the zone itself stays unprotected), so the guest faults once per written heap page
+			// per submission.
+			static const bool zones = [] {
+				const char* value = std::getenv("KYTY_BINDLESS_ENGINE_ZONES");
+				return value == nullptr || value[0] != '0';
+			}();
+			const auto table_begin = heap->base + heap->table_offset;
+			if (!zones && m_context.GetBufferCache().IsHostImported(
+			        table_begin, uint64_t {std::max(heap->guest_entries, 1u)} * 32u)) {
+				heap->watch_excluded = true;
+				::printf("Bindless engine: heap 0x%016" PRIx64 "+0x%x in a host-imported zone, scanned\n",
+				         heap->base, heap->table_offset);
+			} else {
+				table.WatchHeap(*heap);
+			}
 		}
 		prepared.bindless_patches.push_back(
 		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});

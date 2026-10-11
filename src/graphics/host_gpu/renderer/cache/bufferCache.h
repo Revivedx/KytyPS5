@@ -255,6 +255,10 @@ public:
 	// GPU thread, after WaitGuestCopy: publishes the copy (unless done) and resolves the fault.
 	void FinishGuestCopy(int slot, uint64_t generation, uint64_t vaddr, uint64_t size,
 	                     bool is_write);
+	// GPU thread: whether the range is in an imported host zone (never write-protected).
+	[[nodiscard]] bool IsHostImported(uint64_t vaddr, uint64_t size) {
+		return InActiveImportZone(vaddr, size);
+	}
 
 private:
 	// KYTY_RACE_READS (see bufferCache.cpp).

@@ -140,7 +140,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_bindless_table(graphics, m_command_scheduler) {
+      m_bindless_table(graphics, m_command_scheduler, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
@@ -213,6 +213,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			Common::WaitStats::Inner part(Common::WaitStats::FaultTextures);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		}
+		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 		Common::WaitStats::Inner part(Common::WaitStats::FaultAheadK);
 		FaultAhead(fault_vaddr);
 	} else {
@@ -262,6 +263,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_bindless_table.OnCpuWrite(vaddr, size);
 	return true;
 }
 
@@ -332,6 +334,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_buffer_cache.UnmapHostImport(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_bindless_table.UnwatchRange(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};

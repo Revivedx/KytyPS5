@@ -245,6 +245,9 @@ public:
 	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
 	// they were settled; returns how many it resolved.
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
+	// KYTY_BINDLESS_ENGINE, at the start of a guest submission: the heap entries the guest wrote
+	// since the last one are compared and their keys settled again.
+	void SyncBindlessHeaps();
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -317,6 +320,7 @@ private:
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
+	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
 	std::vector<ImageId>                  m_bindless_used;
 	std::vector<uint32_t>                 m_bindless_srt;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;

@@ -37,6 +37,10 @@ size_t DownloadAreaSize(const GraphicContext& graphics) {
 
 } // namespace
 
+// KYTY_LOCAL_HACK (pixel history per frame): the debug probe buffer, copied with every frame dump.
+vk::Buffer g_debug_probe_buffer = nullptr;
+uint64_t   g_debug_probe_size   = 0;
+
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
@@ -101,6 +105,8 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
 				}
 			}
 		}).detach();
+		g_debug_probe_buffer = m_probe_buffer->Handle();
+		g_debug_probe_size   = size;
 		std::printf("Debug probe: buffer at 0x%016" PRIx64 ", dumping to %s\n",
 		            static_cast<uint64_t>(m_probe_buffer->BufferDeviceAddress()), path.c_str());
 	}

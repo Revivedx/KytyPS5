@@ -9,8 +9,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -20,7 +22,18 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class PageManager;
 class SamplerCache;
+
+// KYTY_LOCAL_HACK KYTY_BINDLESS_ENGINE (env, default 1, 2026-10-11; port of Senaxx c5a6961b, the
+// write-watch part "E2"): the guest pages holding a heap's entries are write-watched; at the start
+// of each guest submission the entries in pages the guest wrote are compared with the T# their
+// keys were settled from, and changed keys are settled again before the submission's draws (on
+// the console the guest's writes before a submit are visible to all of it). Replaces the rolling
+// RevalidateBindlessKeys scan (2048 keys a frame: up to 32 frames to notice a rewrite, sampling
+// the old texture or the placeholder meanwhile) for watched heaps; heaps in host-imported zones
+// (no write faults there) keep the scan. 0 = scan only, as before.
+[[nodiscard]] bool BindlessEngineEnabled();
 
 // Descriptor set 1 of every pipeline that samples bindless images: typed arrays of sampled
 // images a shader indexes with a slot it looks up per pixel, the key -> slot translation the
@@ -51,7 +64,7 @@ public:
 	static constexpr uint32_t TranslationEntries = 1u << 20u;
 	static constexpr uint32_t MaxSamplers        = 4096;
 
-	BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler);
+	BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager);
 	~BindlessTable();
 	KYTY_CLASS_NO_COPY(BindlessTable);
 
@@ -84,6 +97,12 @@ public:
 		// how many resolved images. Unchanged since, only the images resolved after need a look.
 		uint64_t checked_generation = 0;
 		size_t   checked_count      = 0;
+		// Engine method: the most keys a draw's descriptor declared (the guest's heap; entries
+		// includes headroom), and what the write watch covers.
+		uint32_t guest_entries    = 0;
+		uint32_t watched_entries  = 0;
+		uint64_t watch_generation = 0;
+		bool     watch_excluded   = false; // in a host-imported zone: the scan keeps it
 	};
 
 	// The heap for (base, table offset, view binding), created with every entry pending and
@@ -154,6 +173,23 @@ public:
 	// Device-loss triage (addressBindingReport.h): the slots holding a view of the image.
 	static void ReportImageUsers(uint64_t image);
 
+	// Engine method (write watch). NeedsWatch: the heap grew, or its watch was dropped by an
+	// unmap, since WatchHeap last covered it.
+	[[nodiscard]] bool NeedsWatch(const Heap& heap) const noexcept {
+		return heap.watched_entries != heap.guest_entries ||
+		       heap.watch_generation != m_watch_generation.load(std::memory_order_acquire);
+	}
+	void WatchHeap(Heap& heap);
+	// A CPU write fault or an emulator write: stop watching the written heap pages (the write
+	// must go through) and record them. Cheap outside the watched span.
+	void OnCpuWrite(uint64_t vaddr, uint64_t size);
+	void UnwatchRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasWrittenRanges() const noexcept {
+		return m_heap_writes.load(std::memory_order_acquire);
+	}
+	// The written pages since the last call, watched again before this returns.
+	void TakeWrittenRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+
 private:
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
 public:
@@ -169,7 +205,20 @@ private:
 
 	GraphicContext&         m_graphics;
 	CommandScheduler&       m_scheduler;
+	PageManager&            m_page_manager;
 	std::deque<Heap>        m_heaps;
+	struct Watch {
+		uint64_t             begin = 0;
+		uint64_t             end   = 0;
+		std::vector<uint8_t> watched; // per page
+		std::vector<uint8_t> written; // per page
+	};
+	std::mutex            m_watch_mutex;
+	std::vector<Watch>    m_watches;
+	std::atomic<uint64_t> m_watch_low {UINT64_MAX};
+	std::atomic<uint64_t> m_watch_high {0};
+	std::atomic<uint64_t> m_watch_generation {1};
+	std::atomic<bool>     m_heap_writes {false};
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
 	uint32_t                m_next_region = 1; // translation[0] is the out-of-range entry
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,

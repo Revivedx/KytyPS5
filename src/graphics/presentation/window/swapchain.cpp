@@ -723,6 +723,9 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	command.endRendering();
 }
 
+extern vk::Buffer g_debug_probe_buffer; // faultManager.cpp
+extern uint64_t   g_debug_probe_size;
+
 // KYTY_LOCAL_HACK KYTY_FRAME_DUMP=<n> (live, research 2026-10-10, for frame-to-frame flicker): when the
 // value changes to n > 0, the next n presented frames (the prepared frame image, full size, before the
 // swapchain blit scaling) are copied to host memory; 2 s after the last one they are written to
@@ -760,7 +763,12 @@ public:
 		frame.usec   = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                std::chrono::steady_clock::now() - m_start)
                                                .count());
-		const vk::DeviceSize size = static_cast<vk::DeviceSize>(frame.width) * frame.height * texel;
+		// With KYTY_PIXEL_HISTORY + KYTY_PROBE_HASH, the probe ring is copied too, after the frame's
+		// rendering: <frame>.px holds it (records since the previous frame's copy = this frame).
+		const vk::DeviceSize image_size =
+		    static_cast<vk::DeviceSize>(frame.width) * frame.height * texel;
+		frame.probe_offset        = image_size;
+		const vk::DeviceSize size = image_size + (g_debug_probe_buffer ? g_debug_probe_size : 0);
 		if (!Allocate(graphics, size, &frame)) {
 			m_wanted = 0;
 			return;
@@ -771,6 +779,16 @@ public:
 		region.imageExtent                 = vk::Extent3D {frame.width, frame.height, 1};
 		command.copyImageToBuffer(image.image, vk::ImageLayout::eTransferSrcOptimal, frame.buffer, 1,
 		                          &region);
+		if (g_debug_probe_buffer) {
+			vk::MemoryBarrier shader_writes {};
+			shader_writes.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			shader_writes.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+			command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 1,
+			                        &shader_writes, 0, nullptr, 0, nullptr);
+			vk::BufferCopy copy {0, frame.probe_offset, g_debug_probe_size};
+			command.copyBuffer(g_debug_probe_buffer, frame.buffer, 1, &copy);
+		}
 		vk::BufferMemoryBarrier to_host {};
 		to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
 		to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
@@ -796,6 +814,7 @@ private:
 		uint32_t         height = 0;
 		int              format = 0;
 		uint64_t         usec   = 0;
+		vk::DeviceSize   probe_offset = 0;
 	};
 
 	static uint32_t TexelBytes(vk::Format format) {
@@ -869,8 +888,17 @@ private:
 				char        name[64];
 				std::snprintf(name, sizeof(name), "b%02d_f%03zu.raw", batch, i);
 				if (auto* file = std::fopen((dir + "/" + name).c_str(), "wb"); file != nullptr) {
-					std::fwrite(frame.mapped, 1, frame.size, file);
+					std::fwrite(frame.mapped, 1, frame.probe_offset, file);
 					std::fclose(file);
+				}
+				if (frame.size > frame.probe_offset) {
+					std::string px = dir + "/" + name;
+					px.replace(px.size() - 4, 4, ".px");
+					if (auto* file = std::fopen(px.c_str(), "wb"); file != nullptr) {
+						std::fwrite(static_cast<const uint8_t*>(frame.mapped) + frame.probe_offset, 1,
+						            frame.size - frame.probe_offset, file);
+						std::fclose(file);
+					}
 				}
 				if (index != nullptr) {
 					std::fprintf(index, "%s %u %u %d %" PRIu64 "\n", name, frame.width, frame.height,

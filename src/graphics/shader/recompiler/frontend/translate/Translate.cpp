@@ -1119,9 +1119,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
-		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_mask, 0));
-		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
-		                                            : IR::U32(IR::Value(0u)));
+		const auto initial_lo   = entry_ir.CompositeExtract(initial_mask, 0);
+		const auto initial_hi   = options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
+		                                                   : IR::U32(IR::Value(0u));
+		entry_ir.SetExecLo(initial_lo);
+		entry_ir.SetExecHi(initial_hi);
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1343,11 +1345,29 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
+			// KYTY_LOCAL_HACK KYTY_NGG_ACTIVE_COUNT (env, default 1, 2026-10-11; port of upstream
+			// cf77fb43): s3's ESVertCount is the number of active input vertices, not the wave
+			// width. A partial last wave told "wave_size" vertices runs the guest's EXEC
+			// reconstruction (waterfall loops) over lanes that do not exist and can leave real
+			// vertices unprocessed (position W = 0). 0 = the old full-width count.
+			static const bool active_count = [] {
+				const char* value = std::getenv("KYTY_NGG_ACTIVE_COUNT");
+				return value == nullptr || value[0] != '0';
+			}();
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
-			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
+			if (active_count) {
+				auto vertex_count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
+				if (options.wave_size == 64u) {
+					vertex_count = entry_ir.IAdd(
+					    vertex_count, IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_hi})));
+				}
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+				                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
+			} else {
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+				                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
+			}
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
