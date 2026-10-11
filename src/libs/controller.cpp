@@ -247,6 +247,11 @@ float GameController::GetSettingScale(Setting setting) const {
 	if (setting != Setting::SpeakerVolume && no_rumble.load(std::memory_order_relaxed) != 0) {
 		return 0.0f;
 	}
+	// KYTY_LOCAL_HACK: KYTY_NO_PAD_SPEAKER (live switch) mutes the controller speaker for test runs.
+	static auto& no_pad_speaker = Common::LiveSwitches::Get("KYTY_NO_PAD_SPEAKER", 0);
+	if (setting == Setting::SpeakerVolume && no_pad_speaker.load(std::memory_order_relaxed) != 0) {
+		return 0.0f;
+	}
 	const auto step = m_setting_steps[static_cast<size_t>(setting)].load(std::memory_order_relaxed);
 	return setting == Setting::SpeakerVolume ? SPEAKER_VOLUME[step] : INTENSITY[step];
 }

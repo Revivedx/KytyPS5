@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
@@ -74,8 +75,17 @@ void Translator::EmitDebugProbe(uint32_t pc, const std::array<uint32_t, 7>& vgpr
 		}
 		return IR::Value(ir.GetVectorReg(static_cast<IR::VectorReg>(vgprs[index])));
 	};
+	// KYTY_PROBE_EXEC=1 (research 2026-10-11): the last value is the lane's EXEC bit (1/0)
+	// instead of the 7th register, so inactive lanes (whose exports never happen) can be told apart.
+	static const bool with_exec = [] {
+		const char* value = std::getenv("KYTY_PROBE_EXEC");
+		return value != nullptr && value[0] == '1';
+	}();
+	const IR::Value last =
+	    with_exec ? IR::Value(ir.Select(ir.GetExec(), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u))))
+	              : reg(6);
 	ir.Emit(IR::ValueOpcode::DebugProbe,
-	        {IR::Value(pc), reg(0), reg(1), reg(2), reg(3), reg(4), reg(5), reg(6)});
+	        {IR::Value(pc), reg(0), reg(1), reg(2), reg(3), reg(4), reg(5), last});
 }
 
 void Translator::StashDebugProbe(const std::array<uint32_t, 3>& vgprs) {

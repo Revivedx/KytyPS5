@@ -1159,7 +1159,18 @@ void EmitDebugProbe(EmitterState& state, uint32_t pc, uint32_t v0, uint32_t v1, 
 		const char* filter = std::getenv("KYTY_PROBE_FILTER");
 		return filter != nullptr && std::strcmp(filter, "clip") == 0;
 	}();
+	// KYTY_PROBE_FILTER=neq (research 2026-10-11): only records where v0 != v1 or v2 != v3 (a lane's
+	// own value against the wave's READFIRSTLANE copy).
+	static const bool neq_filter = [] {
+		const char* filter = std::getenv("KYTY_PROBE_FILTER");
+		return filter != nullptr && std::strcmp(filter, "neq") == 0;
+	}();
 	uint32_t condition = ConstantBool(state, true);
+	if (neq_filter) {
+		condition = Binary(state, spv::OpLogicalOr, TypeBool(state),
+		                   Binary(state, spv::OpINotEqual, TypeBool(state), v0, v1),
+		                   Binary(state, spv::OpINotEqual, TypeBool(state), v2, v3));
+	}
 	if (clip_filter) {
 		const auto f = [&](uint32_t value) { return Unary(state, spv::OpBitcast, TypeF32(state), value); };
 		const auto x = f(v0), y = f(v1), z = f(v2), w = f(v3);
