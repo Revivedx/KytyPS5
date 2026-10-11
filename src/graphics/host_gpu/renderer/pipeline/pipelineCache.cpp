@@ -4541,6 +4541,24 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 				            primitive_restart_enable ? 1u : 0u);
 			}
 		}
+		// KYTY_LOCAL_HACK KYTY_PAIR_PS=<hex low dword> (research 2026-10-11): logs the vertex-stage
+		// program of each pipeline built with that pixel shader (the stretched-laser PS 1724dfcb).
+		static const uint32_t pair_ps = [] {
+			const char* value = std::getenv("KYTY_PAIR_PS");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 16)) : 0u;
+		}();
+		if (pair_ps != 0 && ps_input_info != nullptr && ps_input_info->stage.program != nullptr &&
+		    static_cast<uint32_t>(ps_input_info->stage.program->shader_hash) == pair_ps) {
+			std::printf("Pair PS %016" PRIx64 ": vertex stage %016" PRIx64 " (type %u) topology=%s\n",
+			            ps_input_info->stage.program->shader_hash,
+			            vs_input_info.stage.program != nullptr ? vs_input_info.stage.program->shader_hash
+			                                                   : 0ull,
+			            vs_input_info.stage.program != nullptr
+			                ? static_cast<uint32_t>(vs_input_info.stage.program->stage)
+			                : 99u,
+			            vk::to_string(topology).c_str());
+			std::fflush(stdout);
+		}
 		if ((seen.fetch_or(1u << combo) & (1u << combo)) == 0) {
 			std::printf("ZClip: guest near_disable=%u far_disable=%u dx_clip_space=%u\n",
 			            combo & 1u, combo >> 1u, clip_control.dx_clip_space ? 1u : 0u);
