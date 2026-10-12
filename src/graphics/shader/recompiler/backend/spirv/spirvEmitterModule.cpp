@@ -906,7 +906,10 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
-		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
+		// KYTY_PROBE_LATE_Z=1 (env, research 2026-10-12): no early fragment tests, so the pixel
+		// history also records the fragments that then fail the depth / stencil test.
+		static const bool late_z = std::getenv("KYTY_PROBE_LATE_Z") != nullptr;
+		if (!late_z && state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);

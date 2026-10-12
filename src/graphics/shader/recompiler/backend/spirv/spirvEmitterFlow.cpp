@@ -1197,6 +1197,30 @@ void EmitDebugProbe(EmitterState& state, uint32_t pc, uint32_t v0, uint32_t v1, 
 		           Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), abs(y), limit)));
 		condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), all_finite, outside);
 	}
+	// KYTY_PROBE_FILTER=bright (research 2026-10-12): only records where v0, v1 or v2 (as floats)
+	// is NaN, infinite or above KYTY_PROBE_BRIGHT (default 4).
+	static const bool bright_filter = [] {
+		const char* filter = std::getenv("KYTY_PROBE_FILTER");
+		return filter != nullptr && std::strcmp(filter, "bright") == 0;
+	}();
+	if (bright_filter) {
+		static const float limit = [] {
+			const char* value = std::getenv("KYTY_PROBE_BRIGHT");
+			return value != nullptr ? std::strtof(value, nullptr) : 4.0f;
+		}();
+		const auto f = [&](uint32_t value) { return Unary(state, spv::OpBitcast, TypeF32(state), value); };
+		const auto odd = [&](uint32_t value) {
+			const auto x = f(value);
+			return Binary(state, spv::OpLogicalOr, TypeBool(state),
+			              Binary(state, spv::OpLogicalOr, TypeBool(state),
+			                     Unary(state, spv::OpIsNan, TypeBool(state), x),
+			                     Unary(state, spv::OpIsInf, TypeBool(state), x)),
+			              Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), x,
+			                     ConstantF32Value(state, limit)));
+		};
+		condition = Binary(state, spv::OpLogicalOr, TypeBool(state),
+		                   Binary(state, spv::OpLogicalOr, TypeBool(state), odd(v0), odd(v1)), odd(v2));
+	}
 	EmitIfCondition(state, condition, [&]() {
 	const auto counter = pointer_at(ConstantDeviceAddress(state, base));
 	const auto record  = state.builder.AllocateId();

@@ -800,6 +800,12 @@ public:
 		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
 		                        vk::DependencyFlags {}, 0, nullptr, 1, &to_host, 0, nullptr);
 		m_frames.push_back(frame);
+		// Research: a marker per captured frame, to line up other per-draw logs with the dump.
+		static const bool markers = std::getenv("KYTY_FRAME_DUMP_MARKERS") != nullptr;
+		if (markers) {
+			::printf("Frame dump: captured %zu presented %" PRIu64 "\n", m_frames.size(),
+			         graphics.presented_frames.load(std::memory_order_relaxed));
+		}
 		if (--m_wanted == 0) {
 			Flush(graphics.device);
 		}

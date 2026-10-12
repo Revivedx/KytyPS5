@@ -495,6 +495,105 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	// KYTY_CS_CB_LOG=<hash> (env) + KYTY_CS_CB_LOG_N=<n> (live), research 2026-10-12: for n dispatches of
+	// that compute shader, each buffer's base and its first 16 dwords in guest memory at CP time.
+	{
+		static const uint64_t cb_hash = [] {
+			const char* value = std::getenv("KYTY_CS_CB_LOG");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+		}();
+		static auto& left = Common::LiveSwitches::Get("KYTY_CS_CB_LOG_N", 0);
+		if (cb_hash != 0 && program.shader_hash == cb_hash && left.load(std::memory_order_relaxed) > 0) {
+			left.fetch_sub(1, std::memory_order_relaxed);
+			::printf("CSCB frame=%" PRIu64 " groups=%ux%ux%u\n",
+			         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed), thread_group_x,
+			         thread_group_y, thread_group_z);
+			for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+				const auto d = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				std::array<uint32_t, 16> words {};
+				const auto n = std::min<uint64_t>(d.GetSize(), sizeof(words));
+				if (n != 0) (void)Libs::LibKernel::Memory::TryReadBacking(d.Base48(), words.data(), n);
+				std::string text;
+				for (const auto w: words) text += fmt::format(" {:08x}", w);
+				::printf("  cb%u base=0x%010" PRIx64 " size=0x%" PRIx64 "%s\n", i, d.Base48(), d.GetSize(), text.c_str());
+			}
+		}
+	}
+	// KYTY_WATCH_RANGES=<addr>:<size>[,...] (env) + KYTY_WATCH_LOG=<n> (live), research 2026-10-12:
+	// logs n compute dispatches whose buffers or images touch one of the ranges.
+	{
+		static const std::vector<std::pair<uint64_t, uint64_t>> ranges = [] {
+			std::vector<std::pair<uint64_t, uint64_t>> list;
+			if (const char* value = std::getenv("KYTY_WATCH_RANGES"); value != nullptr) {
+				const char* p = value;
+				while (*p != 0) {
+					char* end = nullptr;
+					const auto a = std::strtoull(p, &end, 16);
+					if (end == p || *end != ':') break;
+					p = end + 1;
+					const auto n = std::strtoull(p, &end, 16);
+					list.emplace_back(a, n);
+					if (end == p) break;
+					p = *end == ',' ? end + 1 : end;
+				}
+			}
+			return list;
+		}();
+		static auto& left = Common::LiveSwitches::Get("KYTY_WATCH_LOG", 0);
+		if (!ranges.empty() && left.load(std::memory_order_relaxed) > 0) {
+			const auto hit = [&](uint64_t base, uint64_t size) {
+				for (const auto& [a, n]: ranges) {
+					if (base < a + n && a < base + std::max<uint64_t>(size, 1)) return a;
+				}
+				return uint64_t {0};
+			};
+			for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+				const auto d = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				if (const auto a = hit(d.Base48(), d.GetSize()); a != 0) {
+					left.fetch_sub(1, std::memory_order_relaxed);
+					::printf("Watch: frame=%" PRIu64 " cs=%016" PRIx64 " buffer%u base=0x%010" PRIx64 " size=0x%" PRIx64
+					         " range=0x%010" PRIx64 " read=%d written=%d\n",
+					         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+					         program.shader_hash, i, d.Base48(), d.GetSize(), a,
+					         program.info.buffers[i].read ? 1 : 0, program.info.buffers[i].written ? 1 : 0);
+				}
+			}
+			for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
+				if (resources.images[i].dword_count < 8) continue;
+				const auto t = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+				if (const auto a = hit(t.Base40(), 1); a != 0) {
+					left.fetch_sub(1, std::memory_order_relaxed);
+					::printf("Watch: frame=%" PRIu64 " cs=%016" PRIx64 " image%u base=0x%010" PRIx64 " type=%u fmt=%u"
+					         " range=0x%010" PRIx64 " written=%d class=%u\n",
+					         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+					         program.shader_hash, i, t.Base40(), static_cast<uint32_t>(t.Type()),
+					         static_cast<uint32_t>(t.Format()), a, program.info.images[i].written ? 1 : 0,
+					         static_cast<uint32_t>(program.info.images[i].resource_class));
+				}
+			}
+		}
+	}
+	// KYTY_HTILE_READ_LOG=<n> (live, research 2026-10-12): logs n compute dispatches whose buffers
+	// cover a depth HTile (the host renders depth into its own image: guest HTile memory is never
+	// updated, so a shader reading it for coarse depth / occlusion culling sees stale data).
+	{
+		static auto& left = Common::LiveSwitches::Get("KYTY_HTILE_READ_LOG", 0);
+		if (left.load(std::memory_order_relaxed) > 0 &&
+		    resources.buffers.size() == program.info.buffers.size()) {
+			auto& cache = buffer.GetContext().GetTextureCache();
+			for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+				const auto d = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				if (const auto htile = cache.OverlappedHtile(d.Base48(), d.GetSize()); htile != 0) {
+					left.fetch_sub(1, std::memory_order_relaxed);
+					::printf("HTile buffer access: frame=%" PRIu64 " cs=%016" PRIx64 " buffer=%u base=0x%010" PRIx64
+					         " size=0x%" PRIx64 " htile=0x%010" PRIx64 " read=%d written=%d\n",
+					         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+					         program.shader_hash, i, d.Base48(), d.GetSize(), htile,
+					         program.info.buffers[i].read ? 1 : 0, program.info.buffers[i].written ? 1 : 0);
+				}
+			}
+		}
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,

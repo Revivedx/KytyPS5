@@ -712,6 +712,43 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.depth_clear    = depth.depth_load_clear_enable;
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
+		// KYTY_META_CLEAR_STENCIL (live, research, default 0, 2026-10-12): an HTile clear with stencil
+		// compression on also clears the stencil (DB_STENCIL_CLEAR). Never triggered in Wolverine
+		// (no stencil-compressed HTile clears seen), so it stays off until a title needs it.
+		{
+			static auto& meta_stencil = Common::LiveSwitches::Get("KYTY_META_CLEAR_STENCIL", 0);
+			if (meta_clear && attachment.has_stencil && metadata.stencil_compressed &&
+			    meta_stencil.load(std::memory_order_relaxed) != 0) {
+				attachment.stencil_clear  = true;
+				attachment.clear_value[1] = depth.stencil_clear_value;
+				static uint64_t count = 0;
+				static auto     at    = std::chrono::steady_clock::now();
+				count++;
+				if (const auto now = std::chrono::steady_clock::now(); now - at >= std::chrono::seconds(5)) {
+					::printf("Meta stencil clears (5 s): %" PRIu64 " (last value %u, depth 0x%010" PRIx64 ")\n",
+					         count, depth.stencil_clear_value, depth.desc.info.data.address);
+					count = 0;
+					at    = now;
+				}
+			}
+		}
+		// KYTY_DEPTH_CLEAR_AREA_LOG=<n> (live, research 2026-10-11): logs n depth clears (load op
+		// clear) whose render area is smaller than the depth image: only that area is cleared.
+		{
+			static auto& left = Common::LiveSwitches::Get("KYTY_DEPTH_CLEAR_AREA_LOG", 0);
+			const auto   full = depth.desc.info.extent;
+			if ((attachment.depth_clear || attachment.stencil_clear) &&
+			    left.load(std::memory_order_relaxed) > 0 &&
+			    (state.width < full.width || state.height < full.height)) {
+				left.fetch_sub(1, std::memory_order_relaxed);
+				::printf("Depth clear area: frame=%" PRIu64 " depth=0x%010" PRIx64 " %ux%u cleared %ux%u "
+				         "(meta_clear=%d draw_clear=%d stencil_clear=%d colors=%u)\n",
+				         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+				         depth.desc.info.data.address, full.width, full.height, state.width, state.height,
+				         meta_clear ? 1 : 0, depth.depth_clear_enable ? 1 : 0,
+				         depth.stencil_clear_enable ? 1 : 0, color_count);
+			}
+		}
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -761,6 +798,9 @@ static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
 	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
+
+// KYTY_MESH_ARGS_TRACE (research): the guest args address of the mesh-indirect draw being resolved.
+static thread_local uint64_t g_traced_guest_args = 0;
 
 struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
@@ -1411,12 +1451,39 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			const auto ps = static_cast<uint32_t>(state.ps_input_info.stage.program->shader_hash);
 			if (std::find(trace.begin(), trace.end(), ps) != trace.end()) {
 				left.fetch_sub(1, std::memory_order_relaxed);
-				::printf("DrawPS frame=%" PRIu64 " ps=%08x vs=%016" PRIx64 " mesh=%d quad=%d indirect=0x%" PRIx64
+				::printf("DrawPS frame=%" PRIu64 " gframe=%d ps=%08x vs=%016" PRIx64 " mesh=%d quad=%d indirect=0x%" PRIx64
 				         " %s count=%u instances=%u first_instance=%u\n",
-				         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed), ps,
+				         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+				         static_cast<int>(buffer.GetContext().GetGpu().GetFrameNum()), ps,
 				         state.vertex_info[0].stage.program->shader_hash, mesh ? 1 : 0, quad ? 1 : 0,
 				         emit.indirect_args, draw.Name(), draw.index_count, draw.instance_count,
 				         draw.first_instance);
+				// KYTY_DRAW_PS_TRACE_BUFFERS=1 (env): the vertex stage's buffers (V# base, size) and
+				// whether the GPU last wrote them.
+				static const bool images = std::getenv("KYTY_DRAW_PS_TRACE_IMAGES") != nullptr;
+				const auto&       pst    = state.ps_input_info.stage;
+				if (images && pst.resources != nullptr) {
+					for (size_t i = 0; i < pst.resources->images.size() && i < 16; i++) {
+						if (pst.resources->images[i].dword_count < 8) continue;
+						const auto t = DecodeNativeDescriptor<ShaderTextureResource>(pst.resources->images[i]);
+						::printf("  psimg%zu base=0x%010" PRIx64 " type=%u fmt=%u %ux%ux%u\n", i, t.Base40(),
+						         static_cast<uint32_t>(t.Type()), static_cast<uint32_t>(t.Format()),
+						         static_cast<uint32_t>(t.Width5()) + 1u, static_cast<uint32_t>(t.Height5()) + 1u,
+						         static_cast<uint32_t>(t.Depth()) + 1u);
+					}
+				}
+				static const bool buffers = std::getenv("KYTY_DRAW_PS_TRACE_BUFFERS") != nullptr;
+				const auto&       vs      = state.vertex_info[0].stage;
+				if (buffers && vs.resources != nullptr && vs.program != nullptr) {
+					auto& cache = m_context.GetBufferCache();
+					for (size_t i = 0; i < vs.resources->buffers.size() && i < 8; i++) {
+						const auto d = DecodeNativeDescriptor<ShaderBufferResource>(vs.resources->buffers[i]);
+						const auto size = d.GetSize();
+						::printf("  vsbuf%zu base=0x%010" PRIx64 " size=0x%" PRIx64 " stride=%u gpu=%d\n", i,
+						         d.Base48(), size, static_cast<uint32_t>(d.Stride()),
+						         size != 0 && cache.IsRegionGpuModified(d.Base48(), size) ? 1 : 0);
+					}
+				}
 			}
 		}
 	}
@@ -1537,6 +1604,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		};
 		const auto run = [&](const MeshIndirectDraw::Result& converted) {
 			auto gpu_emit               = emit;
+			g_traced_guest_args         = emit.indirect_args; // KYTY_MESH_ARGS_TRACE (research)
 			gpu_emit.indirect_args      = 0; // consumed by the conversion
 			gpu_emit.mesh_groups_buffer = converted.groups_buffer;
 			gpu_emit.mesh_groups_offset = converted.groups_offset;
@@ -1846,7 +1914,7 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 				if (std::find(trace.begin(), trace.end(), ps) != trace.end()) {
 					left.fetch_sub(1, std::memory_order_relaxed);
 					pending.push_back({m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
-					                   emit.indirect_args, scheduler.CurrentTick(), m_mesh_indirect->Count(),
+					                   g_traced_guest_args, scheduler.CurrentTick(), m_mesh_indirect->Count(),
 					                   ps, emit.mesh_groups_offset});
 				}
 			}

@@ -1,5 +1,13 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
+#include "common/liveSwitches.h"
+
+#include <cinttypes>
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <tuple>
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -307,6 +315,25 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		DepthFatal("unsupported depth register state");
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
+	// KYTY_DEPTH_HTILE_LOG=1 (live, research 2026-10-12): each new (depth address, HTile base, HTile
+	// acceleration) combination bound, once.
+	{
+		static auto& log = Common::LiveSwitches::Get("KYTY_DEPTH_HTILE_LOG", 0);
+		if (log.load(std::memory_order_relaxed) != 0) {
+			static std::mutex                                             mutex;
+			static std::set<std::tuple<uint64_t, uint64_t, int, int, int>> seen;
+			std::lock_guard lock(mutex);
+			const auto key = std::make_tuple(r.desc.info.data.address, static_cast<uint64_t>(z.htile_data_base_addr),
+			                                 z.z_info.htile_acceleration ? 1 : 0, static_cast<int>(rc.depth_clear_enable),
+			                                 static_cast<int>(r.desc.info.extent.width));
+			if (seen.insert(key).second) {
+				::printf("Depth bind: depth=0x%010" PRIx64 " htile_base=0x%010" PRIx64 " htile_acc=%d clear_draw=%d %ux%u\n",
+				         r.desc.info.data.address, static_cast<uint64_t>(z.htile_data_base_addr),
+				         z.z_info.htile_acceleration ? 1 : 0, rc.depth_clear_enable ? 1 : 0,
+				         r.desc.info.extent.width, r.desc.info.extent.height);
+			}
+		}
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();

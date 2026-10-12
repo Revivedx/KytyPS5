@@ -39,6 +39,9 @@ namespace Libs::Graphics {
 
 // KYTY_HOT_BIND_STATS (bufferCache.cpp).
 void NoteHotImageTrack(uint64_t vaddr, uint64_t size);
+// KYTY_META_CLEAR_LOG (below).
+static void LogMetaClear(GraphicContext& graphics, const char* what, uint64_t address, bool known);
+static std::unordered_set<uint64_t> g_htile_addresses; // ever registered as a depth HTILE (m_lock held)
 
 namespace {
 
@@ -424,6 +427,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		    image->info.metadata.kind == ImageMetadataKind::Htile &&
 		    metadata->second.type == MetaDataInfo::Type::HTile) {
 			// A later binding may have reused this address for another metadata type.
+			LogMetaClear(m_graphics, "htile erased (image deleted)", metadata->first, true);
 			m_surface_metas.erase(metadata);
 		}
 	}
@@ -1279,7 +1283,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
-		m_surface_metas.erase(range.address);
+		if (m_surface_metas.erase(range.address) != 0) {
+			LogMetaClear(m_graphics, "meta erased (color reuse)", range.address, true);
+		}
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
@@ -1631,6 +1637,32 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
+	// KYTY_DEPTH_TARGET_STATS=1 (live, research 2026-10-11): every 5 s, the depth targets bound
+	// (data and metadata address, size, format, metadata kind) and how often.
+	{
+		static auto& stats = Common::LiveSwitches::Get("KYTY_DEPTH_TARGET_STATS", 0);
+		if (stats.load(std::memory_order_relaxed) != 0) {
+			static std::map<std::tuple<uint64_t, uint64_t, uint32_t, uint32_t, int, int, uint64_t>, uint64_t> seen;
+			static auto at = std::chrono::steady_clock::now();
+			seen[{desc.info.data.address, desc.info.metadata.range.address, desc.info.extent.width,
+			      desc.info.extent.height, static_cast<int>(desc.info.pixel_format),
+			      static_cast<int>(desc.info.metadata.kind), static_cast<uint64_t>(id.index)}]++;
+			if (const auto now = std::chrono::steady_clock::now(); now - at >= std::chrono::seconds(5)) {
+				::printf("Depth targets (5 s) frame=%" PRIu64 ":\n",
+				         m_graphics.presented_frames.load(std::memory_order_relaxed));
+				for (const auto& [k, n]: seen) {
+					const auto [data, meta, w, h, fmt, kind, index] = k;
+					::printf("  %6" PRIu64 "x data=0x%010" PRIx64 " meta=0x%010" PRIx64 " kind=%d %ux%u %s image=%" PRIu64
+					         " entry=%s\n",
+					         n, data, meta, kind, w, h, vk::to_string(static_cast<vk::Format>(fmt)).c_str(), index,
+					         meta != 0 && m_surface_metas.contains(meta) ? "yes" : "no");
+				}
+				std::fflush(stdout);
+				seen.clear();
+				at = now;
+			}
+		}
+	}
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
@@ -1640,9 +1672,14 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		const auto [entry, inserted] = m_surface_metas.emplace(
+		    desc.info.metadata.range.address,
+		    MetaDataInfo {.type = MetaDataInfo::Type::HTile, .clear_mask = image.info.htile_clear_mask});
+		if (inserted) {
+			g_htile_addresses.insert(desc.info.metadata.range.address);
+			LogMetaClear(m_graphics, "htile registered", desc.info.metadata.range.address,
+			             entry->second.clear_mask != 0);
+		}
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2116,6 +2153,16 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	}
 }
 
+uint64_t TextureCache::OverlappedHtile(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	for (const auto htile: g_htile_addresses) {
+		if (htile >= address && htile < address + size) {
+			return htile;
+		}
+	}
+	return 0;
+}
+
 bool TextureCache::IsMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
@@ -2131,12 +2178,31 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
+// KYTY_META_CLEAR_LOG=<n> (live, research 2026-10-11 geometry missing for a frame while the camera
+// turns): logs n metadata clears (fills, compute clears, clear draws) with the frame and whether a
+// registered surface took them.
+static void LogMetaClear(GraphicContext& graphics, const char* what, uint64_t address, bool known) {
+	static auto& left = Common::LiveSwitches::Get("KYTY_META_CLEAR_LOG", 0);
+	if (left.load(std::memory_order_relaxed) <= 0) {
+		return;
+	}
+	if (!known && !g_htile_addresses.contains(address)) {
+		return; // a fill of ordinary memory
+	}
+	left.fetch_sub(1, std::memory_order_relaxed);
+	::printf("Meta %s: frame=%" PRIu64 " address=0x%010" PRIx64 " %s\n", what,
+	         graphics.presented_frames.load(std::memory_order_relaxed), address,
+	         known ? "taken" : "NO SURFACE (dropped)");
+}
+
 bool TextureCache::ClearMeta(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
+		LogMetaClear(m_graphics, "clear", address, false);
 		return false;
 	}
+	LogMetaClear(m_graphics, "clear", address, true);
 	found->second.clear_mask = UINT32_MAX;
 	return true;
 }
