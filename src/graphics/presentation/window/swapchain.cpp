@@ -743,7 +743,8 @@ public:
 			if (value > 0 && m_frames.empty()) {
 				m_wanted = static_cast<int>(value);
 				m_start  = std::chrono::steady_clock::now();
-				::printf("Frame dump: capturing %d frames\n", m_wanted);
+				::printf("Frame dump: capturing %d frames from presented frame %" PRIu64 "\n", m_wanted,
+				         graphics.presented_frames.load(std::memory_order_relaxed));
 				std::fflush(stdout);
 			}
 		}

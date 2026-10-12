@@ -319,6 +319,7 @@ private:
 	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<std::pair<BindlessTable::Heap*, uint32_t>> m_bindless_eager;
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
 	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
 	std::vector<ImageId>                  m_bindless_used;

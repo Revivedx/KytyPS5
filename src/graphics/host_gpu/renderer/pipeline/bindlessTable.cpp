@@ -15,6 +15,8 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <atomic>
 #include <cinttypes>
 #include <array>
@@ -365,15 +367,17 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 0, nullptr,
 	                        Placeholders, to_transfer.data());
-	// Transparent black by default. KYTY_BINDLESS_DEBUG_COLORS=1: slot 0 grey (not resident), slot
-	// 1 red (key outside its heap), slot 2 blue (pending), to see which case a surface is in.
+	// Transparent black by default. KYTY_BINDLESS_DEBUG_COLORS=1: slot 0 magenta (not resident), slot
+	// 1 red (key outside its heap), slot 2 blue (pending), slot 3 green (a dropped image's slot), to
+	// see which case a surface is in.
 	const bool debug_colors = std::getenv("KYTY_BINDLESS_DEBUG_COLORS") != nullptr;
 	const auto color        = [debug_colors](float r, float g, float b) {
         return debug_colors ? vk::ClearColorValue {std::array<float, 4> {r, g, b, 1.0f}}
 		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
 	};
 	const std::array<vk::ClearColorValue, PlaceholderColors> colors {
-	    color(0.5f, 0.5f, 0.5f), color(0.8f, 0.1f, 0.1f), color(0.1f, 0.2f, 0.8f)};
+	    color(1.0f, 0.0f, 1.0f), color(0.8f, 0.1f, 0.1f), color(0.1f, 0.2f, 0.8f),
+	    color(0.1f, 0.8f, 0.1f)};
 	for (uint32_t i = 0; i < Placeholders; i++) {
 		command.clearColorImage(m_placeholders[i].image, vk::ImageLayout::eTransferDstOptimal,
 		                        &colors[i / ImageArrays], 1, &to_transfer[i].subresourceRange);
@@ -729,7 +733,121 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
 }
 
+// A host write of the mapped translation table was seen at once by command buffers recorded (or
+// submitted) earlier: frames still in flight then sampled the placeholder of a key released for a
+// later frame, or a new slot whose image upload was recorded after them (one or two frames of
+// missing or garbage textures and decals while the camera moves). The ordered path records each
+// change at the current point of the command stream instead.
+static bool OrderedTranslations() {
+	static auto& ordered = Common::LiveSwitches::Get("KYTY_BINDLESS_ORDERED", 1);
+	return ordered.load(std::memory_order_relaxed) != 0;
+}
+
+void BindlessTable::FlushTranslations() {
+	if (m_pending_translations.empty() || !m_scheduler.Active()) {
+		return;
+	}
+	// The last change of an entry wins; runs of consecutive entries become one update.
+	std::stable_sort(m_pending_translations.begin(), m_pending_translations.end(),
+	                 [](const auto& a, const auto& b) { return a.first < b.first; });
+	std::vector<std::pair<uint32_t, uint32_t>> changes;
+	changes.reserve(m_pending_translations.size());
+	for (const auto& change: m_pending_translations) {
+		if (!changes.empty() && changes.back().first == change.first) {
+			changes.back().second = change.second;
+		} else {
+			changes.push_back(change);
+		}
+	}
+	m_pending_translations.clear();
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eShaderRead;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = m_translation->Handle();
+	before.offset              = 0;
+	before.size                = VK_WHOLE_SIZE;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                        nullptr);
+	std::vector<uint32_t> run;
+	for (size_t i = 0; i < changes.size();) {
+		size_t end = i + 1;
+		while (end < changes.size() && changes[end].first == changes[end - 1].first + 1 &&
+		       end - i < 16384) {
+			end++;
+		}
+		run.clear();
+		for (size_t j = i; j < end; j++) {
+			run.push_back(changes[j].second);
+		}
+		command.updateBuffer(m_translation->Handle(),
+		                     vk::DeviceSize {changes[i].first} * sizeof(uint32_t),
+		                     run.size() * sizeof(uint32_t), run.data());
+		i = end;
+	}
+	vk::BufferMemoryBarrier after = before;
+	after.srcAccessMask           = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask           = vk::AccessFlagBits::eShaderRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &after, 0,
+	                        nullptr);
+	ReleaseQueuedSlots();
+}
+
+// KYTY_BINDLESS_FLUSH_TICK_FREE (live, default 1; with KYTY_BINDLESS_ORDERED): a released slot is
+// reused only after the GPU is past the tick in which the key's new translation entry was
+// recorded. Freed at the release tick, the slot could be handed to another texture while work
+// recorded between the release and the flush (often the next tick) still mapped the key to it:
+// a frame of the wrong texture. A dropped image's slot is still repointed to the placeholder at
+// the release tick, before the texture cache's deferred destruction of the image.
+void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot, bool placeholder) {
+	static auto& at_flush = Common::LiveSwitches::Get("KYTY_BINDLESS_FLUSH_TICK_FREE", 1);
+	const bool   queue    = OrderedTranslations() && m_scheduler.Active() &&
+	                   at_flush.load(std::memory_order_relaxed) != 0;
+	if (placeholder) {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.DeferOperation([this, binding, slot, tick, queue] {
+			WriteSlot(binding, slot, m_placeholder_views[DroppedPlaceholder * ImageArrays + binding],
+			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			if (!queue) {
+				m_free_slots[binding].emplace_back(tick, slot);
+			}
+		});
+	}
+	if (queue) {
+		m_queued_frees.push_back({binding, slot, placeholder});
+		return;
+	}
+	if (!placeholder) {
+		m_free_slots[binding].emplace_back(m_scheduler.CurrentTick(), slot);
+	}
+}
+
+void BindlessTable::ReleaseQueuedSlots() {
+	const auto tick = m_scheduler.CurrentTick();
+	for (const auto& free: m_queued_frees) {
+		if (!free.placeholder) {
+			m_free_slots[free.binding].emplace_back(tick, free.slot);
+			continue;
+		}
+		// After the placeholder write queued at the release (deferred operations run in order).
+		const auto binding = free.binding;
+		const auto slot    = free.slot;
+		m_scheduler.DeferOperation(
+		    [this, binding, slot, tick] { m_free_slots[binding].emplace_back(tick, slot); });
+	}
+	m_queued_frees.clear();
+}
+
 void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot) {
+	if (OrderedTranslations()) {
+		m_pending_translations.emplace_back(heap.region + key, slot);
+		return;
+	}
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
 	translation[heap.region + key] = slot;
 	if (!m_translation->IsCoherent()) {
@@ -876,8 +994,9 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 		}
 	}
 	if (heap.slots[key] != 0) {
-		// Command buffers recorded so far may still sample the slot.
-		m_free_slots[heap.binding].emplace_back(m_scheduler.CurrentTick(), heap.slots[key]);
+		// Command buffers recorded so far may still sample the slot; with ordered translations,
+		// so may the ones recorded until the key's new entry reaches the command stream.
+		FreeSlot(heap.binding, heap.slots[key], false);
 	}
 	heap.slots[key]   = 0;
 	heap.settled[key] = 0;
@@ -891,9 +1010,39 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 	if (found == m_image_refs.end()) {
 		return;
 	}
+	// KYTY_BINDLESS_RESOLVE_STATS=1: every 5 s, images dropped while keys used them, and the keys
+	// sent back to pending (research 2026-10-11, textures flickering while the camera moves).
+	{
+		static auto&                 stats_on = Common::LiveSwitches::Get("KYTY_BINDLESS_RESOLVE_STATS", 0);
+		static uint64_t              images = 0, keys = 0;
+		static auto                  report = std::chrono::steady_clock::now();
+		if (stats_on.load(std::memory_order_relaxed) != 0) {
+			images++;
+			keys += found->second.size();
+			const auto now = std::chrono::steady_clock::now();
+			if (now - report >= std::chrono::seconds(5)) {
+				std::printf("Bindless unregister (5 s): %" PRIu64 " images, %" PRIu64 " keys back to pending\n",
+				            images, keys);
+				std::fflush(stdout);
+				images = keys = 0;
+				report = now;
+			}
+		}
+	}
+	// KYTY_BINDLESS_LATE_PLACEHOLDER (live, default 1; with KYTY_BINDLESS_ORDERED): the slot keeps
+	// the dropped image's view until the GPU is past the work recorded so far, which was recorded
+	// with the key still mapped to it (the image itself is destroyed by a deferred operation queued
+	// after this one). Writing the placeholder at once made those frames sample it: one or two
+	// frames of flat or white textures each time the texture cache merged or re-created an image.
+	static auto& late = Common::LiveSwitches::Get("KYTY_BINDLESS_LATE_PLACEHOLDER", 1);
+	const bool   late_placeholder = late.load(std::memory_order_relaxed) != 0 &&
+	                              OrderedTranslations() && m_scheduler.Active();
 	for (const auto& [heap, key]: found->second) {
-		if (heap->slots[key] != 0) {
-			WriteSlot(heap->binding, heap->slots[key], m_placeholder_views[heap->binding],
+		if (heap->slots[key] != 0 && late_placeholder) {
+			FreeSlot(heap->binding, heap->slots[key], true);
+		} else if (heap->slots[key] != 0) {
+			WriteSlot(heap->binding, heap->slots[key],
+			          m_placeholder_views[DroppedPlaceholder * ImageArrays + heap->binding],
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
 			// Command buffers recorded so far may still sample the slot.
 			m_free_slots[heap->binding].emplace_back(m_scheduler.CurrentTick(), heap->slots[key]);
@@ -903,6 +1052,10 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		heap->settled[key] = 0;
 		SetTranslation(*heap, key, ShaderRecompiler::IR::BindlessPending);
 		std::erase(heap->resolved, id);
+		static auto& eager = Common::LiveSwitches::Get("KYTY_BINDLESS_EAGER", 1);
+		if (eager.load(std::memory_order_relaxed) != 0 && m_eager_keys.size() < 65536) {
+			m_eager_keys.emplace_back(heap, key);
+		}
 	}
 	m_image_refs.erase(found);
 }

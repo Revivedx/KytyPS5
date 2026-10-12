@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -50,9 +51,29 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
-		return desc.type == TextureCache::BindingType::RenderTarget &&
-		       metadata.clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.clear_word, clear);
+		if (desc.type != TextureCache::BindingType::RenderTarget || !metadata.clear_register_valid) {
+			return false;
+		}
+		if (DecodePackedColorClear(format, metadata.clear_word, clear)) {
+			return true;
+		}
+		// KYTY_CLEAR_REGISTER_WIDE: 64-bit, 16-bit-channel and B10G11R11 targets (both words).
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint32_t> logged;
+		if (!DecodePackedColorClear64(format, metadata.clear_word, metadata.clear_word1, clear)) {
+			// Census (2026-10-11): formats whose register clears are still dropped.
+			if (std::lock_guard lock(logged_mutex);
+			    logged.insert(static_cast<uint32_t>(format) | 0x80000000u).second) {
+				::printf("Register clear of format %u (%s) NOT decoded: dropped\n",
+				         static_cast<uint32_t>(format), vk::to_string(format).c_str());
+			}
+			return false;
+		}
+		if (std::lock_guard lock(logged_mutex); logged.insert(static_cast<uint32_t>(format)).second) {
+			::printf("Register clear of format %u (%s) decoded with both clear words (was dropped)\n",
+			         static_cast<uint32_t>(format), vk::to_string(format).c_str());
+		}
+		return true;
 	}
 	if (cmask) {
 		return false;

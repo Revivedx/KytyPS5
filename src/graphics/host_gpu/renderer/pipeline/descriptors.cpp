@@ -967,11 +967,26 @@ static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t
 		case Prospero::ImageType::kColor2DArray:
 			return binding == ShaderRecompiler::IR::BindlessImages2D ||
 			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
-		case Prospero::ImageType::kCube: return binding == ShaderRecompiler::IR::BindlessImagesCube;
+		case Prospero::ImageType::kCube: {
+			// KYTY_BINDLESS_CUBE_AS_ARRAY (live, default 1, 2026-10-11): shaders that sample a cube
+			// T# with 2D / 2D-array instructions (face as layer) get the cube as its 6-layer array,
+			// as the non-bindless path does (TextureType). Rejected, Wolverine's reflection-probe
+			// cubes sampled that way stayed on the placeholder for good: flat, washed-out surfaces in
+			// screen regions with straight edges that changed as the camera turned.
+			static auto& cube_as_array = Common::LiveSwitches::Get("KYTY_BINDLESS_CUBE_AS_ARRAY", 1);
+			return binding == ShaderRecompiler::IR::BindlessImagesCube ||
+			       (cube_as_array.load(std::memory_order_relaxed) != 0 &&
+			        (binding == ShaderRecompiler::IR::BindlessImages2DArray ||
+			         binding == ShaderRecompiler::IR::BindlessImages2D));
+		}
 		case Prospero::ImageType::kColor3D: return binding == ShaderRecompiler::IR::BindlessImages3D;
 		default: return false;
 	}
 }
+
+// Research (KYTY_BINDLESS_COMPAT_LOG): which caller resolved a key (1 scan, 2 submission sync,
+// 3 shader feedback, 4 eager after an image drop).
+static int g_bindless_resolve_path = 0;
 
 bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key, bool replace) {
 	auto&                                 table = m_context.GetBindlessTable();
@@ -1041,6 +1056,19 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 		std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	};
 	if (!BindlessCompatible(descriptor, heap.binding)) {
+		// KYTY_BINDLESS_COMPAT_LOG=<n> (live, research 2026-10-11): logs n rejected heap entries.
+		static auto& compat_log = Common::LiveSwitches::Get("KYTY_BINDLESS_COMPAT_LOG", 0);
+		if (const auto left = compat_log.load(std::memory_order_relaxed); left > 0) {
+			compat_log.store(left - 1, std::memory_order_relaxed);
+			::printf("Bindless compat reject: frame=%" PRIu64 " path=%d heap=0x%" PRIx64 " binding=%u key=%u null=%d type=%u format=%u "
+			         "numeric=%u base=0x%" PRIx64 " words=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+			         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+			         g_bindless_resolve_path, heap.base, heap.binding, key, descriptor.IsNull() ? 1 : 0,
+			         static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(descriptor.Format()),
+			         static_cast<uint32_t>(Prospero::SampledTextureNumericClass(descriptor.Format())),
+			         descriptor.Base40(), value.dwords[0], value.dwords[1], value.dwords[2],
+			         value.dwords[3], value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+		}
 		reason = 2;
 		if (replace) {
 			release_old();
@@ -1066,6 +1094,44 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 	}
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
+	// KYTY_BINDLESS_FE_CHECK=<n> (live, research 2026-10-11 white/flat textures): logs n resolved
+	// keys whose accessible mips (from base level + min LOD on) start with the title's 0xfe fill
+	// of not-yet-loaded memory in guest memory.
+	{
+		static auto& fe_check = Common::LiveSwitches::Get("KYTY_BINDLESS_FE_CHECK", 0);
+		if (const auto left = fe_check.load(std::memory_order_relaxed); left > 0) {
+			const auto& vi    = binding.desc.view_info;
+			const auto  first = vi.base_level + vi.min_lod / 256u;
+			std::string filled;
+			uint32_t    count = 0;
+			for (uint32_t level = vi.base_level; level < vi.base_level + vi.level_count &&
+			                                     level < image->info.resources.levels &&
+			                                     level < image->info.mip_layout.size();
+			     level++) {
+				std::array<uint8_t, 256> bytes {};
+				const auto&              mip = image->info.mip_layout[level];
+				const auto               n   = std::min<uint64_t>(bytes.size(), mip.size);
+				if (n == 0 || !Libs::LibKernel::Memory::TryReadBacking(image->info.data.address + mip.offset,
+				                                                       bytes.data(), n)) {
+					continue;
+				}
+				if (std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(n),
+				                [](uint8_t b) { return b == 0xfe; })) {
+					filled += fmt::format(" {}{}", level, level >= first ? "!" : "");
+					count += level >= first ? 1u : 0u;
+				}
+			}
+			if (count != 0) {
+				fe_check.store(left - 1, std::memory_order_relaxed);
+				::printf("Bindless 0xfe mips: frame=%" PRIu64 " path=%d key=%u image=0x%" PRIx64
+				         " levels=%u view=%u+%u min_lod=%u fe-filled:%s\n",
+				         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+				         g_bindless_resolve_path, key, image->info.data.address,
+				         image->info.resources.levels, vi.base_level, vi.level_count, vi.min_lod,
+				         filled.c_str());
+			}
+		}
+	}
 	table.WriteSlot(heap.binding, slot, view, layout);
 	if (replace) {
 		// Recorded command buffers may still sample the old slot; ReleaseKey frees it by tick.
@@ -1142,6 +1208,7 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 			// the old slot until the new T# resolves; 0 releases first, as before.
 			static auto& replace = Common::LiveSwitches::Get("KYTY_BINDLESS_REPLACE", 0);
 			if (replace.load(std::memory_order_relaxed) != 0) {
+				g_bindless_resolve_path = 1;
 				(void)ResolveBindlessKey(heap, key, true);
 				resolved++; // a failed attempt costs as much; it is retried next pass
 				continue;
@@ -1154,6 +1221,7 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 					image->bindless_pinned = false;
 				}
 			}
+			g_bindless_resolve_path = 1;
 			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
 		}
 		heap.revalidate_cursor = next >= keys ? 0u : next;
@@ -1211,7 +1279,21 @@ void RenderExecutor::SyncBindlessHeaps() {
 					resource |= ((heap.descriptors[key][i] ^ words[i]) & ~ViewMask[i]) != 0;
 				}
 				(resource ? resource_changes : view_changes)++;
+				// KYTY_BINDLESS_VIEW_LOG=<n> (live, research 2026-10-11 white albedo frames): logs the
+				// first n changed keys with the old and new T# words and the frame they changed in.
+				static auto& view_log = Common::LiveSwitches::Get("KYTY_BINDLESS_VIEW_LOG", 0);
+				if (const auto left = view_log.load(std::memory_order_relaxed); left > 0) {
+					view_log.store(left - 1, std::memory_order_relaxed);
+					const auto& o = heap.descriptors[key];
+					::printf("Bindless T# change frame=%" PRIu64 " heap=0x%" PRIx64 " key=%u %s old=%08x %08x "
+					         "%08x %08x %08x %08x %08x %08x new=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+					         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+					         heap.base, key, resource ? "resource" : "view", o[0], o[1], o[2], o[3], o[4],
+					         o[5], o[6], o[7], words[0], words[1], words[2], words[3], words[4], words[5],
+					         words[6], words[7]);
+				}
 				if (replace.load(std::memory_order_relaxed) != 0) {
+					g_bindless_resolve_path = 2;
 					resettled += ResolveBindlessKey(heap, key, true) ? 1u : 0u;
 					continue;
 				}
@@ -1223,6 +1305,7 @@ void RenderExecutor::SyncBindlessHeaps() {
 						image->bindless_pinned = false;
 					}
 				}
+				g_bindless_resolve_path = 2;
 				resettled += ResolveBindlessKey(heap, key) ? 1u : 0u;
 			}
 		}
@@ -1245,6 +1328,10 @@ void RenderExecutor::SyncBindlessHeaps() {
 		}
 	}
 }
+
+// KYTY_BINDLESS_RESOLVE_STATS counters (GPU thread).
+static uint64_t g_bindless_feedback_resolves = 0;
+static uint64_t g_bindless_eager_resolves    = 0;
 
 void RenderExecutor::ResolveBindlessRequests() {
 	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
@@ -1282,7 +1369,22 @@ void RenderExecutor::ResolveBindlessRequests() {
 			if (resolved >= Budget) {
 				break; // still pending: the next frame flags it again
 			}
+			g_bindless_resolve_path = 3;
 			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+			g_bindless_feedback_resolves++;
+		}
+	}
+	{
+		static auto& stats_on = Common::LiveSwitches::Get("KYTY_BINDLESS_RESOLVE_STATS", 0);
+		static auto  at       = std::chrono::steady_clock::now();
+		const auto   now      = std::chrono::steady_clock::now();
+		if (stats_on.load(std::memory_order_relaxed) != 0 && now - at >= std::chrono::seconds(5)) {
+			::printf("Bindless keys (5 s): %" PRIu64 " resolved from feedback (sampled while pending), %" PRIu64
+			         " resolved eagerly after an image drop\n",
+			         g_bindless_feedback_resolves, g_bindless_eager_resolves);
+			std::fflush(stdout);
+			g_bindless_feedback_resolves = g_bindless_eager_resolves = 0;
+			at = now;
 		}
 	}
 	// Shaders sampled these since the last snapshot; draws never bind them, so this is the only
@@ -1399,6 +1501,42 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		return;
 	}
 	ResolveBindlessRequests();
+	// Keys whose image was dropped since the last bindless draw (KYTY_BINDLESS_EAGER): their T#
+	// is read and resolved again now, so the replacement image is sampled from this draw on.
+	m_bindless_eager.clear();
+	table.TakeEagerKeys(m_bindless_eager);
+	if (!m_bindless_eager.empty()) {
+		constexpr size_t EagerBudget = 256;
+		size_t           done        = 0;
+		// Two overlapping images can drop each other on every resolve (merge, re-create): a key
+		// resolves eagerly at most twice a frame, then waits for shader feedback.
+		static std::unordered_map<uint32_t, uint8_t> per_key;
+		static uint64_t                              per_key_frame = UINT64_MAX;
+		if (const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+		    frame != per_key_frame) {
+			per_key.clear();
+			per_key_frame = frame;
+		}
+		for (size_t i = 0; i < m_bindless_eager.size(); i++) {
+			auto& [heap, key] = m_bindless_eager[i];
+			if (done >= EagerBudget) {
+				// The rest waits for the next draw (or for feedback, if dropped again).
+				std::vector<std::pair<BindlessTable::Heap*, uint32_t>> rest(
+				    m_bindless_eager.begin() + static_cast<std::ptrdiff_t>(i), m_bindless_eager.end());
+				std::vector<std::pair<BindlessTable::Heap*, uint32_t>> fresh;
+				table.TakeEagerKeys(fresh);
+				rest.insert(rest.end(), fresh.begin(), fresh.end());
+				table.TakeEagerKeys(rest);
+				break;
+			}
+			if (key < heap->entries && heap->settled[key] == 0 && per_key[heap->region + key]++ < 2) {
+				g_bindless_resolve_path = 4;
+				(void)ResolveBindlessKey(*heap, key);
+				done++;
+				g_bindless_eager_resolves++;
+			}
+		}
+	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		if (use.image >= program.info.images.size()) {
 			continue;
@@ -1434,6 +1572,9 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});
 		prepared.bindless_heaps.push_back(heap);
 	}
+	// Key changes made since the last bindless draw (resolves, revalidation, submission syncs)
+	// land in the command stream here, before this draw (KYTY_BINDLESS_ORDERED).
+	table.FlushTranslations();
 }
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,

@@ -58,7 +58,10 @@ public:
 	              Feedback == ShaderRecompiler::IR::BindlessFeedback &&
 	              Samplers == ShaderRecompiler::IR::BindlessSamplers);
 	static constexpr uint32_t ImageArrays        = 4;
-	static constexpr uint32_t PlaceholderColors  = 3;
+	// Slots 0-2: not resident (grey), outside the heap (red), pending (blue); slot 3 (green): what a
+	// slot of an image the texture cache dropped is repointed to (KYTY_BINDLESS_DEBUG_COLORS).
+	static constexpr uint32_t PlaceholderColors  = 4;
+	static constexpr uint32_t DroppedPlaceholder = 3;
 	static constexpr uint32_t Placeholders       = ImageArrays * PlaceholderColors;
 	static constexpr uint32_t MaxImagesPerArray  = 16384;
 	static constexpr uint32_t TranslationEntries = 1u << 20u;
@@ -120,6 +123,14 @@ public:
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
 	void SetTranslation(const Heap& heap, uint32_t key, uint32_t slot);
+	// KYTY_BINDLESS_ORDERED (live, default 1): SetTranslation only queues the change, and this
+	// records the queued changes into the command stream (before the next bindless draw), so
+	// work recorded earlier keeps the mapping it was recorded with. Called by RenderExecutor.
+	void FlushTranslations();
+	// KYTY_BINDLESS_EAGER (live, default 1): keys whose image the texture cache dropped (merged
+	// into a bigger image as the guest streams mips, re-created, unmapped) are resolved again at
+	// the next bindless draw instead of waiting for shader feedback a few frames later.
+	void TakeEagerKeys(std::vector<std::pair<Heap*, uint32_t>>& keys) { keys.swap(m_eager_keys); }
 	// The host reads the feedback flags from a copy in host-cached memory. The feedback buffer
 	// itself is device memory, and reading every key of three heaps from it uncached took a
 	// fifth of the GPU thread. Records that copy at the current point of the command stream.
@@ -242,6 +253,16 @@ private:
 	bool                    m_default_sampler_written = false;
 	std::deque<SamplerHeap> m_sampler_heaps;
 	std::unique_ptr<Buffer> m_translation;
+	std::vector<std::pair<uint32_t, uint32_t>> m_pending_translations; // (entry, value)
+	struct QueuedFree {
+		uint32_t binding     = 0;
+		uint32_t slot        = 0;
+		bool     placeholder = false; // a dropped image's slot: repoint it before reuse
+	};
+	std::vector<QueuedFree> m_queued_frees; // released with the next FlushTranslations
+	void FreeSlot(uint32_t binding, uint32_t slot, bool placeholder);
+	void ReleaseQueuedSlots();
+	std::vector<std::pair<Heap*, uint32_t>>    m_eager_keys;
 	std::unique_ptr<Buffer> m_feedback;
 	std::unique_ptr<Buffer> m_feedback_snapshot;
 	uint64_t                m_snapshot_tick = 0; // 0 = none recorded

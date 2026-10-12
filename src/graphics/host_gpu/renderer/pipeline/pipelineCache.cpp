@@ -4622,7 +4622,45 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 	}
 
-	const auto defer = [this] {
+	// KYTY_PIPELINE_SKIP_STATS=1 (live, research 2026-10-11 white albedo / missing decal frames):
+	// every 5 s, new graphics pipelines, draws skipped while one compiled, and the pixel shaders
+	// of the skipped draws.
+	static auto& skip_stats = Common::LiveSwitches::Get("KYTY_PIPELINE_SKIP_STATS", 0);
+	const uint64_t ps_hash  = ps_active && ps_input_info->stage.program != nullptr
+	                              ? ps_input_info->stage.program->shader_hash
+	                              : 0;
+	const auto report_skips = [&](bool skipped, bool created) {
+		if (skip_stats.load(std::memory_order_relaxed) == 0) {
+			return;
+		}
+		static std::mutex                             mutex;
+		static std::unordered_map<uint64_t, uint32_t> by_ps;
+		static uint64_t                               skips = 0, news = 0;
+		static auto                                   at    = std::chrono::steady_clock::now();
+		std::lock_guard                               lock(mutex);
+		if (skipped) {
+			skips++;
+			by_ps[ps_hash]++;
+		}
+		news += created ? 1u : 0u;
+		if (const auto now = std::chrono::steady_clock::now(); now - at >= std::chrono::seconds(5)) {
+			std::vector<std::pair<uint32_t, uint64_t>> top;
+			for (const auto& [hash, count]: by_ps) top.emplace_back(count, hash);
+			std::sort(top.rbegin(), top.rend());
+			std::string list;
+			for (size_t i = 0; i < top.size() && i < 8; i++) {
+				list += fmt::format(" {:016x}:{}", top[i].second, top[i].first);
+			}
+			::printf("Pipelines (5 s): %" PRIu64 " new, %" PRIu64 " draws skipped while compiling; PS%s\n",
+			         news, skips, list.c_str());
+			std::fflush(stdout);
+			by_ps.clear();
+			skips = news = 0;
+			at          = now;
+		}
+	};
+	const auto defer = [this, &report_skips] {
+		report_skips(true, false);
 		if (++m_deferred_draws % 256 == 1) {
 			LOGF("PipelineCache: %" PRIu64 " draws skipped while their pipeline compiled in the "
 			     "background\n",
@@ -4648,6 +4686,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		     static_cast<void*>(pixel_program.module));
 	}
 
+	report_skips(false, true);
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,

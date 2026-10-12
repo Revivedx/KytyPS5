@@ -1385,6 +1385,40 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool mesh = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	const bool quad =
 	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy;
+	// KYTY_DRAW_PS_TRACE=<hex lo>[,<hex lo>...] (env) + KYTY_DRAW_PS_TRACE_N=<n> (live): logs n draws
+	// of those pixel shaders with their frame, stage kind and counts (research 2026-10-11: Logan's
+	// colour-layer draws missing in some frames while the camera turns).
+	{
+		static const std::vector<uint32_t> trace = [] {
+			std::vector<uint32_t> list;
+			if (const char* value = std::getenv("KYTY_DRAW_PS_TRACE"); value != nullptr) {
+				const char* p = value;
+				while (*p != 0) {
+					char* end = nullptr;
+					list.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+					if (end == p) {
+						break;
+					}
+					p = *end == ',' ? end + 1 : end;
+				}
+			}
+			return list;
+		}();
+		static auto& left = Common::LiveSwitches::Get("KYTY_DRAW_PS_TRACE_N", 0);
+		if (!trace.empty() && left.load(std::memory_order_relaxed) > 0 &&
+		    state.ps_input_info.stage.program != nullptr) {
+			const auto ps = static_cast<uint32_t>(state.ps_input_info.stage.program->shader_hash);
+			if (std::find(trace.begin(), trace.end(), ps) != trace.end()) {
+				left.fetch_sub(1, std::memory_order_relaxed);
+				::printf("DrawPS frame=%" PRIu64 " ps=%08x vs=%016" PRIx64 " mesh=%d quad=%d indirect=0x%" PRIx64
+				         " %s count=%u instances=%u first_instance=%u\n",
+				         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed), ps,
+				         state.vertex_info[0].stage.program->shader_hash, mesh ? 1 : 0, quad ? 1 : 0,
+				         emit.indirect_args, draw.Name(), draw.index_count, draw.instance_count,
+				         draw.first_instance);
+			}
+		}
+	}
 	if (emit.indirect_args == 0 || (!mesh && !quad)) {
 		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, emit, index_source,
 		                            primitive_restart_enable);
