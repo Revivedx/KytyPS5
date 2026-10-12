@@ -4570,6 +4570,16 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		if (partial && combo != 3u) {
 			static_params.depth_clip_enable = true;
 		}
+		// KYTY_FORCE_ZCLIP_ALL=1 (env, research 2026-10-11): every draw clips depth (the title
+		// collapses culled vertices onto the camera, w = 0, with depth clipping off: wedges from the
+		// screen centre while the camera turns?).
+		static const bool force_all = [] {
+			const char* value = std::getenv("KYTY_FORCE_ZCLIP_ALL");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (force_all) {
+			static_params.depth_clip_enable = true;
+		}
 		// KYTY_FORCE_ZCLIP_HASH=<hex>: draws of that vertex shader always clip depth.
 		static const uint64_t force_hash = [] {
 			const char* value = std::getenv("KYTY_FORCE_ZCLIP_HASH");

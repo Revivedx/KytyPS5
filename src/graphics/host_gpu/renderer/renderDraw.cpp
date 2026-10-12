@@ -34,6 +34,7 @@
 #include "libs/errno.h"
 
 #include <string>
+#include <deque>
 #include <set>
 #include <unordered_set>
 #include <algorithm>
@@ -1792,6 +1793,61 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 					            e[0], e[1], e[2],
 					            static_cast<unsigned long long>(e[0]) * e[1] * e[2], e[4], e[5], e[6], e[7]);
 					std::fflush(stdout);
+				}
+			}
+		}
+		// KYTY_MESH_ARGS_TRACE=<n> (live; needs KYTY_MESH_DUMP set so the entry ring is host-visible,
+		// and KYTY_DRAW_PS_TRACE for the pixel shaders): logs n converted entries of those draws once
+		// the GPU is past them, with the frame, the guest args address and the groups the GPU
+		// computed (research 2026-10-11: colour layers missing in some frames while the camera turns).
+		{
+			struct Pending {
+				uint64_t       frame = 0, args = 0, tick = 0, count = 0;
+				uint32_t       ps    = 0;
+				vk::DeviceSize offset = 0;
+			};
+			static std::deque<Pending> pending;
+			static auto&               left = Common::LiveSwitches::Get("KYTY_MESH_ARGS_TRACE", 0);
+			static const std::vector<uint32_t> trace = [] {
+				std::vector<uint32_t> list;
+				if (const char* value = std::getenv("KYTY_DRAW_PS_TRACE"); value != nullptr) {
+					const char* p = value;
+					while (*p != 0) {
+						char* end = nullptr;
+						list.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+						if (end == p) {
+							break;
+						}
+						p = *end == ',' ? end + 1 : end;
+					}
+				}
+				return list;
+			}();
+			auto& scheduler = m_context.GetCommandScheduler();
+			while (!pending.empty() && m_mesh_indirect != nullptr) {
+				const auto& front = pending.front();
+				if (m_mesh_indirect->Count() - front.count >= MeshIndirectDraw::RingEntries - 64) {
+					pending.pop_front(); // rewritten already
+					continue;
+				}
+				if (!scheduler.IsFree(front.tick)) {
+					break;
+				}
+				if (const auto* e = m_mesh_indirect->EntryHost(front.offset); e != nullptr) {
+					std::printf("MESHARGS frame=%" PRIu64 " ps=%08x args=0x%" PRIx64
+					            " groups=%u,%u,%u count=%u first=%u instance=%u group_count=%u\n",
+					            front.frame, front.ps, front.args, e[0], e[1], e[2], e[4], e[5], e[6], e[7]);
+				}
+				pending.pop_front();
+			}
+			if (left.load(std::memory_order_relaxed) > 0 && emit.mesh_draw_data != 0 &&
+			    m_mesh_indirect != nullptr && state.ps_input_info.stage.program != nullptr) {
+				const auto ps = static_cast<uint32_t>(state.ps_input_info.stage.program->shader_hash);
+				if (std::find(trace.begin(), trace.end(), ps) != trace.end()) {
+					left.fetch_sub(1, std::memory_order_relaxed);
+					pending.push_back({m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+					                   emit.indirect_args, scheduler.CurrentTick(), m_mesh_indirect->Count(),
+					                   ps, emit.mesh_groups_offset});
 				}
 			}
 		}
