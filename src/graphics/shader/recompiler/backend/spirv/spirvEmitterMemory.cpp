@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -53,6 +54,22 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 	if (immediate != 0u) {
 		offset = add(offset, ConstantU32(state, immediate));
 	}
+	// KYTY_LOCAL_HACK KYTY_BUFFER_INDEX_OOB=1 (env, research 2026-10-12): the hardware range-checks a
+	// structured access by index (index >= num_records is out of range); here only the 32-bit byte
+	// address is checked, so an index whose index * stride wraps (fog VS 4d2a3a54: s38 = 0x80000000,
+	// stride 16 -> record 0) reads valid data instead of zero. A wrapped product is made out of range.
+	static const bool index_oob = [] {
+		const char* value = std::getenv("KYTY_BUFFER_INDEX_OOB");
+		return value != nullptr && value[0] == '1';
+	}();
+	uint32_t overflow = 0;
+	if (index_oob && index != zero && stride != zero && stride != one) {
+		const auto extended = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUMulExtended, TypeU32Pair(state), extended, index, stride);
+		const auto high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, extended, 1);
+		overflow = Binary(state, spv::OpINotEqual, TypeBool(state), high, zero);
+	}
 	auto address = add(mul(index, stride), offset);
 	if (swizzle != 0u) {
 		const auto index_shift =
@@ -73,6 +90,10 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 		                            ConstantU32(state, 2u)),
 		                     offset_lsb);
 		address        = Select(state, TypeU32(state), swizzle, add(msb, lsb), address);
+	}
+	if (overflow != 0u) {
+		return {offset, Select(state, TypeU32(state), overflow, ConstantU32(state, UINT32_MAX),
+		                       add(address, soffset))};
 	}
 	return {offset, add(address, soffset)};
 }

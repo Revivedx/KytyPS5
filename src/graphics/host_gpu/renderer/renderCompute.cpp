@@ -42,6 +42,8 @@
 
 namespace Libs::Graphics {
 
+extern thread_local uint64_t g_cp_cs_code; // renderContext.cpp (research, KYTY_CP_READ_FAULT_LOG)
+
 namespace {
 
 // Research: the rollback below drains the GPU twice per dispatch and almost never fires once a
@@ -479,8 +481,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderProgram compute_program;
 	{
 		KYTY_PROFILER_BLOCK("Dispatch::GetComputeProgram");
+		g_cp_cs_code = cs_regs.cs_regs.data_addr;
 		compute_program =
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+		g_cp_cs_code = 0;
 	}
 	if (!compute_program) {
 		// Temporary until RT is implemented.
@@ -778,8 +782,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	input_info.dispatch_thread_dimensions   = use_thread_dimensions;
 	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
+	g_cp_cs_code = cs_regs.cs_regs.data_addr;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	g_cp_cs_code = 0;
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		ResetBindings();

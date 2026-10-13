@@ -64,6 +64,8 @@ extern std::array<GsUserDataPacket, 16> g_gs_user_data_packets;     // graphicsR
 extern uint32_t                         g_gs_user_data_packet_head; // graphicsRun.cpp (research)
 extern std::array<uint32_t, 9>          g_last_draw_packet;         // graphicsRun.cpp (research)
 extern const bool                       g_trace_user_data;          // graphicsRun.cpp (research)
+extern const bool                       g_ud_patch_check;           // graphicsRun.cpp (research)
+void                                    UdPatchCheck(uint64_t addr, uint32_t value); // graphicsRun.cpp
 
 namespace {
 
@@ -1167,6 +1169,9 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
+	if (g_ud_patch_check && slot == 0 && write_num == 31u) {
+		UdPatchCheck(reinterpret_cast<uint64_t>(&buffer[30]), buffer[30]);
+	}
 	if (g_trace_user_data) {
 		auto& packet  = g_gs_user_data_packets[g_gs_user_data_packet_head++ & 15u];
 		packet.serial = g_cp_draw_serial.load(std::memory_order_relaxed);

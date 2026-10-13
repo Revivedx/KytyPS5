@@ -64,6 +64,90 @@ extern const bool                g_trace_user_data = std::getenv("KYTY_DRAW_PS_T
 std::array<std::array<uint32_t, 4>, 32> g_cp_packet_ring {};
 uint32_t                                g_cp_packet_ring_head = 0;
 
+// Research 2026-10-12 late (fog s38, KYTY_UD_PATCH_CHECK=1): the fog VS reads GS user-data slot 30, the 31st
+// value of a SET_SH_REG that looks like stale command-ring data. Is that dword patched by the stream itself
+// (WRITE_DATA / DMA_DATA / COPY_DATA before it) or rewritten after the CP parsed it?
+struct CpWriteRecord {
+	uint64_t dst   = 0;
+	uint64_t src   = 0;
+	uint32_t bytes = 0;
+	uint32_t kind  = 0;
+};
+std::array<CpWriteRecord, 256> g_cp_write_ring {};
+uint32_t                       g_cp_write_head  = 0;
+extern const bool              g_ud_patch_check = std::getenv("KYTY_UD_PATCH_CHECK") != nullptr;
+
+static void RecordCpWrite(uint64_t dst, uint64_t src, uint32_t bytes, uint32_t kind) {
+	if (g_ud_patch_check) {
+		g_cp_write_ring[g_cp_write_head++ & 255u] = {dst, src, bytes, kind};
+	}
+}
+
+void UdPatchCheck(uint64_t addr, uint32_t value) {
+	struct Pending {
+		uint64_t                              addr;
+		uint32_t                              value;
+		std::chrono::steady_clock::time_point at;
+	};
+	static std::mutex          mutex;
+	static std::deque<Pending> early;
+	static std::deque<Pending> late;
+	static uint64_t            total = 0, inside = 0, changed_early = 0, small_early = 0, changed_late = 0,
+	                small_late = 0;
+	static uint32_t            examples = 0;
+	static auto                report   = std::chrono::steady_clock::now();
+	std::lock_guard            lock(mutex);
+	const auto                 now = std::chrono::steady_clock::now();
+	const auto age_ms = [&](const Pending& p) { return std::chrono::duration<double, std::milli>(now - p.at).count(); };
+	total++;
+	for (const auto& w: g_cp_write_ring) {
+		if (w.bytes != 0 && addr + 4u > w.dst && addr < w.dst + w.bytes) {
+			inside++;
+			if (examples++ < 40) {
+				::printf("UdPatch: dword 0x%010" PRIx64 " = 0x%08" PRIx32 " lies in a CP write kind 0x%x dst 0x%010" PRIx64
+				         " bytes %u src 0x%010" PRIx64 "\n",
+				         addr, value, w.kind, w.dst, w.bytes, w.src);
+			}
+			break;
+		}
+	}
+	if (total <= 3) {
+		::printf("UdPatch: watching dword 0x%010" PRIx64 " = 0x%08" PRIx32 "\n", addr, value);
+	}
+	early.push_back({addr, value, now});
+	while (!early.empty() && age_ms(early.front()) >= 3.0) {
+		const auto& p = early.front();
+		const auto  v = *reinterpret_cast<const volatile uint32_t*>(p.addr);
+		if (v != p.value) {
+			changed_early++;
+			small_early += v < 16u ? 1u : 0u;
+			if (examples++ < 40) {
+				::printf("UdPatch: dword 0x%010" PRIx64 " changed after %.1f ms: 0x%08" PRIx32 " -> 0x%08" PRIx32 "\n",
+				         p.addr, age_ms(p), p.value, v);
+			}
+		}
+		late.push_back(p);
+		early.pop_front();
+	}
+	while (!late.empty() && age_ms(late.front()) >= 60.0) {
+		const auto& p = late.front();
+		const auto  v = *reinterpret_cast<const volatile uint32_t*>(p.addr);
+		if (v != p.value) {
+			changed_late++;
+			small_late += v < 16u ? 1u : 0u;
+		}
+		late.pop_front();
+	}
+	if (now - report >= std::chrono::seconds(5)) {
+		::printf("UdPatch (5 s): %" PRIu64 " 31-value GS SET_SH_REGs, %" PRIu64 " inside a recent CP write, changed after "
+		         ">=3 ms %" PRIu64 " (to <16: %" PRIu64 "), after >=60 ms %" PRIu64 " (to <16: %" PRIu64 ")\n",
+		         total, inside, changed_early, small_early, changed_late, small_late);
+		std::fflush(stdout);
+		total = inside = changed_early = small_early = changed_late = small_late = 0;
+		report = now;
+	}
+}
+
 // KYTY_OCCLUSION_STATS=1 (live): every 5 s, how the guest uses occlusion: counter dumps
 // (ZPASS_DONE), SET_PREDICATION by op, and the packets (draws/dispatches among them) that obey
 // predication, executed or skipped. Occlusion results are synthetic (always visible), so every
@@ -729,6 +813,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	RecordCpWrite(reinterpret_cast<uint64_t>(dst), src[0], write_one_address ? 4u : dw_num * 4u, 1u);
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
 	// the page, draining the GPU; WriteClean writes both copies instead.
@@ -784,6 +869,8 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
 		return;
 	}
+	RecordCpWrite(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
+	              2u | (static_cast<uint32_t>(src_sel) << 4u) | (static_cast<uint32_t>(dst_sel) << 8u));
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
 		switch (selector) {
 			case 0:

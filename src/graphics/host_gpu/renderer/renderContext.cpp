@@ -8,18 +8,25 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/shader.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Research 2026-10-13: the compute program the CP is preparing (renderCompute.cpp), for KYTY_CP_READ_FAULT_LOG.
+thread_local uint64_t g_cp_cs_code = 0;
 
 namespace {
 
@@ -132,6 +139,40 @@ private:
 
 FaultStats g_fault_stats;
 
+// KYTY_CP_READ_FAULT_LOG=<n> (live, research 2026-10-13): the GPU thread's next n read faults (the CP reading
+// GPU-written memory: ~4 per frame, ~1 ms each in static rec5) with the caller chain as module+offset for
+// addr2line. backtrace() is warmed up at start so the fault path does not load the unwinder.
+[[maybe_unused]] const int g_backtrace_warm = [] {
+	void* frames[2];
+	return backtrace(frames, 2);
+}();
+
+void LogCpReadFault(uint64_t fault_vaddr) {
+	static auto& left = Common::LiveSwitches::Get("KYTY_CP_READ_FAULT_LOG", 0);
+	if (left.load(std::memory_order_relaxed) <= 0) {
+		return;
+	}
+	left.fetch_sub(1, std::memory_order_relaxed);
+	void*     frames[20];
+	const int count = backtrace(frames, 20);
+	::printf("CP read fault 0x%010" PRIx64 " cs=%016" PRIx64 ":", fault_vaddr,
+	         g_cp_cs_code != 0 ? ShaderDeclaredHash(g_cp_cs_code) : 0);
+	for (int i = 1; i < count; i++) {
+		Dl_info info {};
+		if (dladdr(frames[i], &info) != 0 && info.dli_fbase != nullptr) {
+			const char* name  = info.dli_fname != nullptr ? info.dli_fname : "?";
+			const char* slash = std::strrchr(name, '/');
+			::printf(" %s+0x%" PRIx64, slash != nullptr ? slash + 1 : name,
+			         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(frames[i]) -
+			                               reinterpret_cast<uintptr_t>(info.dli_fbase)));
+		} else {
+			::printf(" %p", frames[i]);
+		}
+	}
+	::printf("\n");
+	std::fflush(stdout);
+}
+
 } // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
@@ -217,6 +258,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		Common::WaitStats::Inner part(Common::WaitStats::FaultAheadK);
 		FaultAhead(fault_vaddr);
 	} else {
+		if (GuestGpu::IsGpuThread()) {
+			LogCpReadFault(fault_vaddr);
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
