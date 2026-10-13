@@ -1040,6 +1040,33 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 		std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	}
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	// KYTY_BINDLESS_KEY_LOG=<key>[,<key>...] (hex, env; research 2026-10-12 fog slabs): logs every
+	// resolve of those keys (any heap) with the T# it read.
+	{
+		static const std::vector<uint32_t> keys = [] {
+			std::vector<uint32_t> list;
+			if (const char* text = std::getenv("KYTY_BINDLESS_KEY_LOG"); text != nullptr) {
+				const char* p = text;
+				while (*p != 0) {
+					char* end = nullptr;
+					list.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+					if (end == p) break;
+					p = *end == ',' ? end + 1 : end;
+				}
+			}
+			return list;
+		}();
+		if (!keys.empty() && std::find(keys.begin(), keys.end(), key) != keys.end()) {
+			::printf("Bindless key: frame=%" PRIu64 " path=%d replace=%d heap=0x%" PRIx64 " binding=%u key=0x%x "
+			         "base=0x%" PRIx64 " type=%u fmt=%u %ux%u words=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+			         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+			         g_bindless_resolve_path, replace ? 1 : 0, heap.base, heap.binding, key, descriptor.Base40(),
+			         static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(descriptor.Format()),
+			         static_cast<uint32_t>(descriptor.Width5()) + 1u, static_cast<uint32_t>(descriptor.Height5()) + 1u,
+			         value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3], value.dwords[4],
+			         value.dwords[5], value.dwords[6], value.dwords[7]);
+		}
+	}
 	auto& texture_cache = m_context.GetTextureCache();
 	// Releases a replaced key's old slot and image (the new T# is in, or a null/incompatible T#
 	// the game streamed out, which is settled to the placeholder as before).

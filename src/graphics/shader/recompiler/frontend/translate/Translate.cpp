@@ -1402,41 +1402,53 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			translator.TranslateInstruction(instruction);
 			// KYTY_LOCAL_HACK (debug probe): KYTY_PROBE_HASH=<hex> KYTY_PROBE_PC=<hex>
 			// KYTY_PROBE_VGPRS=<n,n,...> records those VGPRs after the instruction at that pc.
+			// KYTY_PROBE_PC2=<hex> KYTY_PROBE_VGPRS2=<n,n,...> (research 2026-10-12): a second probe
+			// point in the same shader (e.g. the other side of a branch).
 			static const auto probe = [] {
 				struct Probe {
-					uint64_t                hash = 0;
-					uint32_t                pc   = UINT32_MAX;
-					std::array<uint32_t, 7> vgprs {};
+					uint64_t                                     hash = 0;
+					std::array<uint32_t, 2>                      pc {UINT32_MAX, UINT32_MAX};
+					std::array<std::array<uint32_t, 7>, 2>       vgprs {};
 				} result;
-				result.vgprs.fill(UINT32_MAX);
+				for (auto& list: result.vgprs) {
+					list.fill(UINT32_MAX);
+				}
 				const char* hash = std::getenv("KYTY_PROBE_HASH");
-				const char* pc   = std::getenv("KYTY_PROBE_PC");
-				const char* regs = std::getenv("KYTY_PROBE_VGPRS");
-				if (hash == nullptr || pc == nullptr || regs == nullptr) {
+				if (hash == nullptr) {
 					return result;
 				}
 				result.hash = std::strtoull(hash, nullptr, 16);
-				result.pc   = static_cast<uint32_t>(std::strtoul(pc, nullptr, 16));
-				const char* cursor = regs;
-				for (auto& reg: result.vgprs) {
-					char* end = nullptr;
-					const auto value = std::strtoul(cursor, &end, 10);
-					if (end == cursor) {
-						break;
+				for (int point = 0; point < 2; point++) {
+					const char* pc   = std::getenv(point == 0 ? "KYTY_PROBE_PC" : "KYTY_PROBE_PC2");
+					const char* regs = std::getenv(point == 0 ? "KYTY_PROBE_VGPRS" : "KYTY_PROBE_VGPRS2");
+					if (pc == nullptr || regs == nullptr) {
+						continue;
 					}
-					reg    = static_cast<uint32_t>(value);
-					cursor = *end == ',' ? end + 1 : end;
+					result.pc[point]   = static_cast<uint32_t>(std::strtoul(pc, nullptr, 16));
+					const char* cursor = regs;
+					for (auto& reg: result.vgprs[point]) {
+						char* end = nullptr;
+						const auto value = std::strtoul(cursor, &end, 10);
+						if (end == cursor) {
+							break;
+						}
+						reg    = static_cast<uint32_t>(value);
+						cursor = *end == ',' ? end + 1 : end;
+					}
 				}
 				return result;
 			}();
-			if (probe.hash != 0 && probe.hash == options.shader_hash &&
-			    probe.pc == instruction.pc) {
-				translator.EmitDebugProbe(instruction.pc, probe.vgprs);
+			if (probe.hash != 0 && probe.hash == options.shader_hash) {
+				for (int point = 0; point < 2; point++) {
+					if (probe.pc[point] == instruction.pc) {
+						translator.EmitDebugProbe(instruction.pc, probe.vgprs[point]);
+					}
+				}
 			}
-			// KYTY_PROBE_STASH_PC=<hex> KYTY_PROBE_STASH_VGPRS=<n,n,n>: copied to v253..v255
-			// after that instruction, so the probe can record them as 253,254,255.
+			// KYTY_PROBE_STASH_PC=<hex> KYTY_PROBE_STASH_VGPRS=<n,n,n[,n,n]>: copied to v253, v254, v255
+			// (and v252, v251 for a 4th and 5th) after that instruction, so the probe can record them.
 			static const auto stash = [] {
-				std::pair<uint32_t, std::array<uint32_t, 3>> result {UINT32_MAX, {}};
+				std::pair<uint32_t, std::array<uint32_t, 5>> result {UINT32_MAX, {}};
 				result.second.fill(UINT32_MAX);
 				const char* pc   = std::getenv("KYTY_PROBE_STASH_PC");
 				const char* regs = std::getenv("KYTY_PROBE_STASH_VGPRS");

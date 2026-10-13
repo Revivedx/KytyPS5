@@ -77,22 +77,28 @@ void Translator::EmitDebugProbe(uint32_t pc, const std::array<uint32_t, 7>& vgpr
 	};
 	// KYTY_PROBE_EXEC=1 (research 2026-10-11): the last value is the lane's EXEC bit (1/0)
 	// instead of the 7th register, so inactive lanes (whose exports never happen) can be told apart.
-	static const bool with_exec = [] {
+	// KYTY_PROBE_EXEC=2 (research 2026-10-12): the probe point's pc instead of 1 (0 = inactive lane), for
+	// KYTY_PROBE_PC2.
+	static const int exec_mode = [] {
 		const char* value = std::getenv("KYTY_PROBE_EXEC");
-		return value != nullptr && value[0] == '1';
+		return value != nullptr ? std::atoi(value) : 0;
 	}();
 	const IR::Value last =
-	    with_exec ? IR::Value(ir.Select(ir.GetExec(), IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u))))
-	              : reg(6);
+	    exec_mode != 0 ? IR::Value(ir.Select(ir.GetExec(), IR::U32(IR::Value(exec_mode == 2 ? pc : 1u)),
+	                                         IR::U32(IR::Value(0u))))
+	                   : reg(6);
 	ir.Emit(IR::ValueOpcode::DebugProbe,
 	        {IR::Value(pc), reg(0), reg(1), reg(2), reg(3), reg(4), reg(5), last});
 }
 
-void Translator::StashDebugProbe(const std::array<uint32_t, 3>& vgprs) {
+void Translator::StashDebugProbe(const std::array<uint32_t, 5>& vgprs) {
 	for (uint32_t index = 0; index < vgprs.size(); index++) {
 		if (vgprs[index] != UINT32_MAX) {
-			ir.SetVectorReg(static_cast<IR::VectorReg>(253u + index),
-			                ir.GetVectorReg(static_cast<IR::VectorReg>(vgprs[index])));
+			// 1000 + n: scalar operand code n (an SGPR copied to every lane).
+			ir.SetVectorReg(static_cast<IR::VectorReg>(index < 3u ? 253u + index : 255u - index),
+			                vgprs[index] >= 1000u
+			                    ? ReadScalarCode(vgprs[index] - 1000u)
+			                    : ir.GetVectorReg(static_cast<IR::VectorReg>(vgprs[index])));
 		}
 	}
 }

@@ -52,6 +52,19 @@
 
 namespace Libs::Graphics {
 
+extern std::atomic<uint64_t>    g_cp_draw_serial;       // graphicsRun.cpp (research)
+extern std::array<uint64_t, 32> g_gs_user_data_written; // graphicsRun.cpp (research)
+struct GsUserDataPacket {
+	uint64_t                 serial = 0;
+	uint32_t                 slot   = 0;
+	uint32_t                 count  = 0;
+	std::array<uint32_t, 32> values {};
+};
+extern std::array<GsUserDataPacket, 16> g_gs_user_data_packets;     // graphicsRun.cpp (research)
+extern uint32_t                         g_gs_user_data_packet_head; // graphicsRun.cpp (research)
+extern std::array<uint32_t, 9>          g_last_draw_packet;         // graphicsRun.cpp (research)
+extern const bool                       g_trace_user_data;          // graphicsRun.cpp (research)
+
 namespace {
 
 constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
@@ -1154,8 +1167,20 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
+	if (g_trace_user_data) {
+		auto& packet  = g_gs_user_data_packets[g_gs_user_data_packet_head++ & 15u];
+		packet.serial = g_cp_draw_serial.load(std::memory_order_relaxed);
+		packet.slot   = slot;
+		packet.count  = write_num;
+		for (uint32_t i = 0; i < write_num && i < 32u; i++) {
+			packet.values[i] = buffer[i];
+		}
+	}
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		if (g_trace_user_data) {
+			g_gs_user_data_written[(slot + i) & 31u] = g_cp_draw_serial.load(std::memory_order_relaxed);
+		}
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
@@ -1625,6 +1650,13 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
 
 	if (cmd_id == 0xc0073a00) {
+		// Research 2026-10-12 (fog slabs): the packet's dwords, for KYTY_DRAW_PS_TRACE_UD.
+		if (g_trace_user_data) {
+			for (uint32_t i = 0; i < 8u; i++) {
+				g_last_draw_packet[i] = buffer[i];
+			}
+			g_last_draw_packet[8] = cmd_id;
+		}
 		uint32_t index_count = buffer[0];
 		auto*    index_addr =
 		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
@@ -1643,6 +1675,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	}
 
 	if (cmd_id == 0xc0042700) {
+		if (g_trace_user_data) {
+			for (uint32_t i = 0; i < 5u; i++) {
+				g_last_draw_packet[i] = buffer[i];
+			}
+			g_last_draw_packet[8] = cmd_id;
+		}
 		uint32_t max_index_count = buffer[0];
 		auto*    index_addr =
 		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));

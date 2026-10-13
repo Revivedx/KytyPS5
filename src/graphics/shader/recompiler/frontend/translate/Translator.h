@@ -21,7 +21,7 @@ public:
 	// KYTY_LOCAL_HACK (debug probe): records pc and up to seven VGPRs (UINT32_MAX = none).
 	void EmitDebugProbe(uint32_t pc, const std::array<uint32_t, 7>& vgprs);
 	// Copies up to three VGPRs (UINT32_MAX = none) to v253..v255 for a later probe.
-	void StashDebugProbe(const std::array<uint32_t, 3>& vgprs);
+	void StashDebugProbe(const std::array<uint32_t, 5>& vgprs);
 	void OverrideDebugVgpr(uint32_t vgpr, uint32_t value) {
 		ir.SetVectorReg(static_cast<IR::VectorReg>(vgpr), IR::U32(IR::Value(value)));
 	}

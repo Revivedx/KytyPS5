@@ -58,6 +58,18 @@
 
 namespace Libs::Graphics {
 
+extern std::atomic<uint64_t>    g_cp_draw_serial;       // graphicsRun.cpp (research)
+extern std::array<uint64_t, 32> g_gs_user_data_written; // graphicsRun.cpp (research)
+struct GsUserDataPacket {
+	uint64_t                 serial = 0;
+	uint32_t                 slot   = 0;
+	uint32_t                 count  = 0;
+	std::array<uint32_t, 32> values {};
+};
+extern std::array<GsUserDataPacket, 16> g_gs_user_data_packets;     // graphicsRun.cpp (research)
+extern uint32_t                         g_gs_user_data_packet_head; // graphicsRun.cpp (research)
+extern std::array<uint32_t, 9>          g_last_draw_packet;         // graphicsRun.cpp (research)
+
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -1458,6 +1470,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				         state.vertex_info[0].stage.program->shader_hash, mesh ? 1 : 0, quad ? 1 : 0,
 				         emit.indirect_args, draw.Name(), draw.index_count, draw.instance_count,
 				         draw.first_instance);
+				// KYTY_DRAW_PS_TRACE_UD=1 (env, research 2026-10-12 fog slabs): the vertex stage's user
+				// data (GS slots) with how many guest draws ago each slot was last written.
+				static const bool ud = std::getenv("KYTY_DRAW_PS_TRACE_UD") != nullptr;
+				if (ud && state.vertex_info[0].stage.resources != nullptr) {
+					const auto& data   = state.vertex_info[0].stage.resources->user_data;
+					const auto  serial = g_cp_draw_serial.load(std::memory_order_relaxed);
+					std::string text;
+					for (size_t slot = 0; slot < data.size() && slot < 32; slot++) {
+						text += fmt::format(" {}={:x}/{}", slot, data[slot], serial - g_gs_user_data_written[slot]);
+					}
+					::printf("  ud(%zu):%s\n", data.size(), text.c_str());
+					::printf("  draw packet %08x: %x %x %x %x %x %x %x %x\n", g_last_draw_packet[8], g_last_draw_packet[0],
+					         g_last_draw_packet[1], g_last_draw_packet[2], g_last_draw_packet[3], g_last_draw_packet[4],
+					         g_last_draw_packet[5], g_last_draw_packet[6], g_last_draw_packet[7]);
+					for (uint32_t k = 0; k < 16u; k++) {
+						const auto& packet = g_gs_user_data_packets[(g_gs_user_data_packet_head + k) & 15u];
+						if (packet.count == 0 || serial - packet.serial > 1u) continue;
+						std::string values;
+						for (uint32_t i = 0; i < packet.count && i < 32u; i++) values += fmt::format(" {:x}", packet.values[i]);
+						::printf("  gs-ud packet (draws ago %" PRIu64 "): slot %u count %u:%s\n", serial - packet.serial,
+						         packet.slot, packet.count, values.c_str());
+					}
+				}
+				// Research 2026-10-12 (fog slabs): the index buffer and whether the GPU last wrote it.
+				if (draw.IsIndexed() && index_source.address != 0) {
+					const auto bytes = static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size;
+					::printf("  ib addr=0x%010" PRIx64 " esize=%u gpu=%d\n", index_source.address,
+					         static_cast<uint32_t>(index_source.guest_element_size),
+					         bytes != 0 && m_context.GetBufferCache().IsRegionGpuModified(index_source.address, bytes)
+					             ? 1
+					             : 0);
+				}
 				// KYTY_DRAW_PS_TRACE_BUFFERS=1 (env): the vertex stage's buffers (V# base, size) and
 				// whether the GPU last wrote them.
 				static const bool images = std::getenv("KYTY_DRAW_PS_TRACE_IMAGES") != nullptr;
@@ -1482,6 +1526,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 						::printf("  vsbuf%zu base=0x%010" PRIx64 " size=0x%" PRIx64 " stride=%u gpu=%d\n", i,
 						         d.Base48(), size, static_cast<uint32_t>(d.Stride()),
 						         size != 0 && cache.IsRegionGpuModified(d.Base48(), size) ? 1 : 0);
+						// KYTY_DRAW_PS_TRACE_CB=1 (env, research 2026-10-12 fog slabs): the guest bytes of
+						// the small CPU buffers (<= 0x600 bytes): dwords 12-15 and 16-19 as floats.
+						static const bool cb_words = std::getenv("KYTY_DRAW_PS_TRACE_CB") != nullptr;
+						if (cb_words && size >= 80 && size <= 0x600) {
+							std::array<float, 8> w {};
+							if (Libs::LibKernel::Memory::TryReadBacking(d.Base48() + 48, w.data(), sizeof(w))) {
+								::printf("    cb%zu @48: %g %g %g %g | %g %g %g %g\n", i, w[0], w[1], w[2], w[3], w[4],
+								         w[5], w[6], w[7]);
+							}
+						}
 					}
 				}
 			}

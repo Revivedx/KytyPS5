@@ -44,6 +44,22 @@
 
 namespace Libs::Graphics {
 
+// Research 2026-10-12 (fog slabs): a serial of guest draws and, per GS user-data slot, the serial at its last
+// SET_SH_REG write (KYTY_DRAW_PS_TRACE_UD prints how many draws ago each slot was written).
+std::atomic<uint64_t>    g_cp_draw_serial {0};
+std::array<uint64_t, 32> g_gs_user_data_written {};
+// The last GS user-data SET_SH_REG packets: draw serial, first slot, count and values.
+struct GsUserDataPacket {
+	uint64_t                 serial = 0;
+	uint32_t                 slot   = 0;
+	uint32_t                 count  = 0;
+	std::array<uint32_t, 32> values {};
+};
+std::array<GsUserDataPacket, 16> g_gs_user_data_packets {};
+uint32_t                         g_gs_user_data_packet_head = 0;
+std::array<uint32_t, 9>          g_last_draw_packet {};
+extern const bool                g_trace_user_data = std::getenv("KYTY_DRAW_PS_TRACE_UD") != nullptr;
+
 // KYTY_OCCLUSION_STATS=1 (live): every 5 s, how the guest uses occlusion: counter dumps
 // (ZPASS_DONE), SET_PREDICATION by op, and the packets (draws/dispatches among them) that obey
 // predication, executed or skipped. Occlusion results are synthetic (always visible), so every
@@ -1780,6 +1796,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	if (g_trace_user_data) g_cp_draw_serial.fetch_add(1, std::memory_order_relaxed);
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
@@ -2041,6 +2058,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	if (g_trace_user_data) g_cp_draw_serial.fetch_add(1, std::memory_order_relaxed);
 	if (args.instance_count == 0) {
 		args.instance_count = m_num_instances;
 	}

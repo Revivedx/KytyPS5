@@ -1221,6 +1221,38 @@ void EmitDebugProbe(EmitterState& state, uint32_t pc, uint32_t v0, uint32_t v1, 
 		condition = Binary(state, spv::OpLogicalOr, TypeBool(state),
 		                   Binary(state, spv::OpLogicalOr, TypeBool(state), odd(v0), odd(v1)), odd(v2));
 	}
+	// KYTY_PROBE_FILTER=gt (research 2026-10-12): only records where v0 (as a float) is NaN, infinite or
+	// above KYTY_PROBE_BRIGHT (default 0.9), and the last value (EXEC with KYTY_PROBE_EXEC) is not 0.
+	// KYTY_PROBE_FILTER=absgt: the same with |v0|; lt: v0 below KYTY_PROBE_BRIGHT (and EXEC).
+	static const bool gt_filter = [] {
+		const char* filter = std::getenv("KYTY_PROBE_FILTER");
+		return filter != nullptr && (std::strcmp(filter, "gt") == 0 || std::strcmp(filter, "absgt") == 0 ||
+		                             std::strcmp(filter, "lt") == 0);
+	}();
+	static const bool lt_filter = [] {
+		const char* filter = std::getenv("KYTY_PROBE_FILTER");
+		return filter != nullptr && std::strcmp(filter, "lt") == 0;
+	}();
+	static const bool abs_filter = [] {
+		const char* filter = std::getenv("KYTY_PROBE_FILTER");
+		return filter != nullptr && std::strcmp(filter, "absgt") == 0;
+	}();
+	if (gt_filter) {
+		static const float limit = [] {
+			const char* value = std::getenv("KYTY_PROBE_BRIGHT");
+			return value != nullptr ? std::strtof(value, nullptr) : 0.9f;
+		}();
+		const auto raw = Unary(state, spv::OpBitcast, TypeF32(state), v0);
+		const auto x   = abs_filter ? EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(state, raw) : raw;
+		const auto odd =
+		    Binary(state, spv::OpLogicalOr, TypeBool(state),
+		           Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpIsNan, TypeBool(state), x),
+		                  Unary(state, spv::OpIsInf, TypeBool(state), x)),
+		           Binary(state, lt_filter ? spv::OpFOrdLessThan : spv::OpFOrdGreaterThan, TypeBool(state), x,
+		                  ConstantF32Value(state, limit)));
+		condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), odd,
+		                   Binary(state, spv::OpINotEqual, TypeBool(state), v6, ConstantU32(state, 0)));
+	}
 	EmitIfCondition(state, condition, [&]() {
 	const auto counter = pointer_at(ConstantDeviceAddress(state, base));
 	const auto record  = state.builder.AllocateId();
