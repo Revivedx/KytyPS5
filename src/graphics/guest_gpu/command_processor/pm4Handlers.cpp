@@ -1717,6 +1717,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0082c00 && cmd_id != 0xc0083800);
 
+	if (g_trace_user_data) {
+		for (uint32_t i = 0; i < 8u; i++) {
+			g_last_draw_packet[i] = buffer[i];
+		}
+		g_last_draw_packet[8] = cmd_id;
+	}
 	const auto data_offset        = buffer[0];
 	const auto count_indirect     = (buffer[3] >> 30u) & 0x1u;
 	const auto max_count_or_count = buffer[4];

@@ -29,6 +29,8 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <mutex>
+#include <set>
 #include <atomic>
 #include <chrono>
 #include <bit>
@@ -59,6 +61,8 @@ std::array<GsUserDataPacket, 16> g_gs_user_data_packets {};
 uint32_t                         g_gs_user_data_packet_head = 0;
 std::array<uint32_t, 9>          g_last_draw_packet {};
 extern const bool                g_trace_user_data = std::getenv("KYTY_DRAW_PS_TRACE_UD") != nullptr;
+std::array<std::array<uint32_t, 4>, 32> g_cp_packet_ring {};
+uint32_t                                g_cp_packet_ring_head = 0;
 
 // KYTY_OCCLUSION_STATS=1 (live): every 5 s, how the guest uses occlusion: counter dumps
 // (ZPASS_DONE), SET_PREDICATION by op, and the packets (draws/dispatches among them) that obey
@@ -1628,6 +1632,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		if (g_trace_user_data) {
+			auto& entry = g_cp_packet_ring[g_cp_packet_ring_head++ & 31u];
+			entry       = {packet_header, remaining_dw > 1 ? packet[1] : 0u, remaining_dw > 2 ? packet[2] : 0u,
+			               remaining_dw > 3 ? packet[3] : 0u};
+		}
 		auto handler = g_cp_op_func[opcode];
 		// KYTY_DISPATCH_CHAIN: register writes, IB calls and debug markers leave two direct
 		// dispatches unordered; anything else (waits, ACQUIRE_MEM, draws, copies, labels...) orders.
@@ -1928,6 +1937,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// Research 2026-10-12 (fog slabs, KYTY_DRAW_PS_TRACE_UD): which SH register multi-draws write DrawIndex to.
+	if (g_trace_user_data) {
+		static std::mutex             mutex;
+		static std::set<uint32_t>     seen;
+		std::lock_guard               lock(mutex);
+		if (seen.insert(draw_index_register).second) {
+			std::printf("DrawIndirectMulti draw_index_register=0x%x (GS user data 0 = 0x%x)\n", draw_index_register,
+			            Pm4::SPI_SHADER_USER_DATA_GS_0);
+		}
+	}
 	for (uint32_t i = 0; i < draw_count; i++) {
 		// DRAW_INDIRECT_MULTI writes DrawIndex before each draw, including draws
 		// with zero vertices/instances. It starts at zero for each packet.
@@ -1939,6 +1958,19 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
+		// Research 2026-10-12 (fog slabs, KYTY_DRAW_PS_TRACE_UD + live KYTY_MDI_ARGS_LOG=<n>): the args
+		// records of n multi-draws, including the bytes past the standard ones when the stride is larger.
+		if (g_trace_user_data) {
+			static auto& left = Common::LiveSwitches::Get("KYTY_MDI_ARGS_LOG", 0);
+			if (left.load(std::memory_order_relaxed) > 0) {
+				left.fetch_sub(1, std::memory_order_relaxed);
+				const auto* w = reinterpret_cast<const uint32_t*>(args_addr);
+				std::string text;
+				for (uint32_t k = 0; k < stride_in_bytes / 4u && k < 16u; k++) text += fmt::format(" {:x}", w[k]);
+				std::printf("MDI args: draw %u/%u indexed=%d stride=%u:%s\n", i, draw_count, indexed ? 1 : 0,
+				            stride_in_bytes, text.c_str());
+			}
+		}
 
 		if (!indexed) {
 			auto* args      = reinterpret_cast<const DrawIndirectArgs*>(args_addr);

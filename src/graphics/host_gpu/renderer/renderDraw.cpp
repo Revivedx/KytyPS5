@@ -69,6 +69,8 @@ struct GsUserDataPacket {
 extern std::array<GsUserDataPacket, 16> g_gs_user_data_packets;     // graphicsRun.cpp (research)
 extern uint32_t                         g_gs_user_data_packet_head; // graphicsRun.cpp (research)
 extern std::array<uint32_t, 9>          g_last_draw_packet;         // graphicsRun.cpp (research)
+extern std::array<std::array<uint32_t, 4>, 32> g_cp_packet_ring;      // graphicsRun.cpp (research)
+extern uint32_t                                g_cp_packet_ring_head; // graphicsRun.cpp (research)
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
@@ -1481,6 +1483,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 						text += fmt::format(" {}={:x}/{}", slot, data[slot], serial - g_gs_user_data_written[slot]);
 					}
 					::printf("  ud(%zu):%s\n", data.size(), text.c_str());
+					{
+						std::string ring;
+						for (uint32_t k = 12; k > 0; k--) {
+							const auto& e = g_cp_packet_ring[(g_cp_packet_ring_head - k) & 31u];
+							ring += fmt::format(" [{:08x} {:x} {:x} {:x}]", e[0], e[1], e[2], e[3]);
+						}
+						::printf("  last packets:%s\n", ring.c_str());
+					}
 					::printf("  draw packet %08x: %x %x %x %x %x %x %x %x\n", g_last_draw_packet[8], g_last_draw_packet[0],
 					         g_last_draw_packet[1], g_last_draw_packet[2], g_last_draw_packet[3], g_last_draw_packet[4],
 					         g_last_draw_packet[5], g_last_draw_packet[6], g_last_draw_packet[7]);
