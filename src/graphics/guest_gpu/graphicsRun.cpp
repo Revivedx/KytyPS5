@@ -77,6 +77,41 @@ std::array<CpWriteRecord, 256> g_cp_write_ring {};
 uint32_t                       g_cp_write_head  = 0;
 extern const bool              g_ud_patch_check = std::getenv("KYTY_UD_PATCH_CHECK") != nullptr;
 
+// Research 2026-10-13 (KYTY_TIMELINE_N=<n>, live): the next n events with a microsecond time, printed together once n
+// are recorded: S guest submission (queue), I / W CP idle start / wake, L a priority operation run after its GPU tick
+// completed (EOP labels, readback publishes; arg = tick; only with env KYTY_TIMELINE_L, ~1300 per frame), F a flip
+// request (arg = source: 0 CPU, 1 GPU).
+void TimelineEvent(char kind, uint64_t arg) {
+	static auto& budget = Common::LiveSwitches::Get("KYTY_TIMELINE_N", 0);
+	if (budget.load(std::memory_order_relaxed) <= 0) {
+		return;
+	}
+	struct Event {
+		int64_t  us;
+		char     kind;
+		uint64_t arg;
+	};
+	static std::mutex         mutex;
+	static std::vector<Event> events;
+	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+	                    std::chrono::steady_clock::now().time_since_epoch())
+	                    .count();
+	std::lock_guard lock(mutex);
+	const auto      wanted = budget.load(std::memory_order_relaxed);
+	if (wanted <= 0) {
+		return;
+	}
+	events.push_back({us, kind, arg});
+	if (static_cast<int64_t>(events.size()) >= wanted) {
+		budget.store(0, std::memory_order_relaxed);
+		for (const auto& e: events) {
+			::printf("TL %" PRId64 " %c %" PRIx64 "\n", e.us, e.kind, e.arg);
+		}
+		std::fflush(stdout);
+		events.clear();
+	}
+}
+
 static void RecordCpWrite(uint64_t dst, uint64_t src, uint32_t bytes, uint32_t kind) {
 	if (g_ud_patch_check) {
 		g_cp_write_ring[g_cp_write_head++ & 255u] = {dst, src, bytes, kind};
@@ -910,6 +945,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	TimelineEvent('S', submission.queue_id);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	if (m_draw_prep != nullptr) {
@@ -1030,10 +1066,12 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_idle.Signal();
 				const auto idle_start = CpIdleStatsOn() ? std::chrono::steady_clock::now()
 				                                        : std::chrono::steady_clock::time_point {};
+				TimelineEvent('I', 0);
 				{
 					Common::WaitStats::Scope wait(Common::WaitStats::NoWork);
 					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 				}
+				TimelineEvent('W', 0);
 				NoteCpIdle(0, idle_start);
 			}
 			if (flush_pending) {

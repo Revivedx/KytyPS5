@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include <cstdlib>
 #include "common/waitStats.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
@@ -27,6 +28,8 @@
 #include <optional>
 
 namespace Libs::Graphics {
+
+void TimelineEvent(char kind, uint64_t arg); // graphicsRun.cpp (research, KYTY_TIMELINE_N)
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
@@ -658,6 +661,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
+		static const bool timeline_l = std::getenv("KYTY_TIMELINE_L") != nullptr; // L events are ~1300 per frame
+		if (timeline_l) {
+			TimelineEvent('L', operation.tick);
+		}
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
