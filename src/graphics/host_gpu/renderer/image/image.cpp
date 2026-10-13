@@ -16,7 +16,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -103,6 +106,64 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 		     static_cast<unsigned long long>(range.address),
 		     static_cast<unsigned long long>(range.size));
 	}
+}
+
+// KYTY_TRANSIT_STATS=1 (live, research 2026-10-13): the image barriers Transit records, by old/new layout, source and
+// destination access and whether they cover one subresource, per s; the top 12 every 5 s (every recorded image
+// barrier also ends the current render pass).
+void TransitStats(const std::vector<vk::ImageMemoryBarrier2>& barriers) {
+	static auto& on = Common::LiveSwitches::Get("KYTY_TRANSIT_STATS", 0);
+	if (on.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	struct Key {
+		uint32_t old_layout = 0;
+		uint32_t new_layout = 0;
+		uint64_t src        = 0;
+		uint64_t dst        = 0;
+		bool     sub        = false;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& k) const {
+			return std::hash<uint64_t> {}((static_cast<uint64_t>(k.old_layout) << 40u) ^
+			                              (static_cast<uint64_t>(k.new_layout) << 32u) ^ (k.src * 31u) ^
+			                              (k.dst * 131u) ^ (k.sub ? 1u : 0u));
+		}
+	};
+	static std::mutex                                 mutex;
+	static std::unordered_map<Key, uint64_t, KeyHash> counts;
+	static auto                                       report = std::chrono::steady_clock::now();
+	std::lock_guard                                   lock(mutex);
+	for (const auto& b: barriers) {
+		counts[{static_cast<uint32_t>(b.oldLayout), static_cast<uint32_t>(b.newLayout),
+		        static_cast<uint64_t>(b.srcAccessMask), static_cast<uint64_t>(b.dstAccessMask),
+		        b.subresourceRange.levelCount != VK_REMAINING_MIP_LEVELS}]++;
+	}
+	const auto   now     = std::chrono::steady_clock::now();
+	const double elapsed = std::chrono::duration<double>(now - report).count();
+	if (elapsed < 5.0) {
+		return;
+	}
+	std::vector<std::pair<Key, uint64_t>> sorted(counts.begin(), counts.end());
+	std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	uint64_t total = 0;
+	for (const auto& entry: sorted) {
+		total += entry.second;
+	}
+	::printf("Transit (%.1f s): %.0f image barriers/s\n", elapsed, static_cast<double>(total) / elapsed);
+	for (size_t i = 0; i < sorted.size() && i < 12; i++) {
+		const auto& k = sorted[i].first;
+		::printf("  %8.0f/s %s -> %s src 0x%llx dst 0x%llx%s\n",
+		         static_cast<double>(sorted[i].second) / elapsed,
+		         vk::to_string(static_cast<vk::ImageLayout>(k.old_layout)).c_str(),
+		         vk::to_string(static_cast<vk::ImageLayout>(k.new_layout)).c_str(),
+		         static_cast<unsigned long long>(k.src), static_cast<unsigned long long>(k.dst),
+		         k.sub ? " (subresource)" : "");
+	}
+	std::fflush(stdout);
+	counts.clear();
+	report = now;
 }
 
 } // namespace
@@ -243,6 +304,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	TransitStats(barriers);
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
