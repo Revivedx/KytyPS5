@@ -1472,6 +1472,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				         state.vertex_info[0].stage.program->shader_hash, mesh ? 1 : 0, quad ? 1 : 0,
 				         emit.indirect_args, draw.Name(), draw.index_count, draw.instance_count,
 				         draw.first_instance);
+				// Research 2026-10-14 (black smoke, the particle lighting atlas): viewport 0, the scissors
+				// and the indirect arguments as the CPU sees them.
+				{
+					const auto& vp = buffer.GetRegisters().GetScreenViewport();
+					const auto& v0 = vp.viewports[0];
+					::printf("  vp0 x=%.0f y=%.0f w=%.0f h=%.0f clip_disable=%d screen %d,%d-%d,%d window %d,%d-%d,%d "
+					         "generic %d,%d-%d,%d\n",
+					         v0.xoffset - v0.xscale, v0.yoffset - v0.yscale, v0.xscale * 2.0f, v0.yscale * 2.0f,
+					         buffer.GetRegisters().GetClipControl().clip_disable ? 1 : 0, vp.screen_scissor_left,
+					         vp.screen_scissor_top, vp.screen_scissor_right, vp.screen_scissor_bottom,
+					         vp.window_scissor_left, vp.window_scissor_top, vp.window_scissor_right,
+					         vp.window_scissor_bottom, vp.generic_scissor_left, vp.generic_scissor_top,
+					         vp.generic_scissor_right, vp.generic_scissor_bottom);
+					if (emit.indirect_args != 0) {
+						std::array<uint32_t, 5> words {};
+						std::memcpy(words.data(), reinterpret_cast<const void*>(emit.indirect_args),
+						            sizeof(words));
+						::printf("  indirect (cpu view) %u %u %u %u %u gpu=%d\n", words[0], words[1], words[2],
+						         words[3], words[4],
+						         m_context.GetBufferCache().IsRegionGpuModified(emit.indirect_args, 20) ? 1 : 0);
+					}
+				}
 				// KYTY_DRAW_PS_TRACE_UD=1 (env, research 2026-10-12 fog slabs): the vertex stage's user
 				// data (GS slots) with how many guest draws ago each slot was last written.
 				static const bool ud = std::getenv("KYTY_DRAW_PS_TRACE_UD") != nullptr;

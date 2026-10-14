@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/liveSwitches.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -15,6 +16,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
+#include <vector>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -55,6 +59,41 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 	r             = {};
 	r.target_slot = rt_slot;
+
+	// KYTY_WATCH_RANGES=<addr>:<size>[,...] (env) + KYTY_WATCH_LOG=<n> (live), research 2026-10-14
+	// (black smoke: who renders into the particle lighting atlas): also the color targets of draws.
+	{
+		static const std::vector<std::pair<uint64_t, uint64_t>> ranges = [] {
+			std::vector<std::pair<uint64_t, uint64_t>> list;
+			for (const char* p = std::getenv("KYTY_WATCH_RANGES"); p != nullptr && *p != 0;) {
+				char*      end = nullptr;
+				const auto a   = std::strtoull(p, &end, 16);
+				if (end == p || *end != ':') break;
+				p              = end + 1;
+				const auto n   = std::strtoull(p, &end, 16);
+				list.emplace_back(a, n);
+				if (end == p) break;
+				p = *end == ',' ? end + 1 : end;
+			}
+			return list;
+		}();
+		static auto& left = Common::LiveSwitches::Get("KYTY_WATCH_LOG", 0);
+		if (!ranges.empty() && rt.base.addr != 0 && mask != 0 && left.load(std::memory_order_relaxed) > 0) {
+			for (const auto& [a, n]: ranges) {
+				if (rt.base.addr >= a && rt.base.addr < a + n) {
+					left.fetch_sub(1, std::memory_order_relaxed);
+					::printf("Watch: frame=%" PRIu64 " color target slot=%u base=0x%010" PRIx64 " %ux%u fmt=%u/%u "
+					         "mask=0x%x range=0x%010" PRIx64 "\n",
+					         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed), rt_slot,
+					         rt.base.addr, rt.attrib2.width + 1u, rt.attrib2.height + 1u,
+					         static_cast<uint32_t>(rt.info.format), static_cast<uint32_t>(rt.info.channel_type),
+					         mask, a);
+					std::fflush(stdout);
+					break;
+				}
+			}
+		}
+	}
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {

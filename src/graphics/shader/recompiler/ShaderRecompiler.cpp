@@ -860,9 +860,22 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	// <dir>/<hash>.txt (from KYTY_IR_DUMP_DIR) goes to <dir>/<hash>.rdna.txt, with the original
 	// address arithmetic the tracking passes rewrite.
 	if (static const char* rdna_dir = std::getenv("KYTY_DECODED_DUMP_DIR"); rdna_dir != nullptr) {
+		// KYTY_DECODED_LOW=<hex dword,...> (research, 2026-10-14): also the programs whose hash ends
+		// in one of these dwords (a pixel-history record only names the low dword).
+		static const std::string low_dwords = [] {
+			const char* value = std::getenv("KYTY_DECODED_LOW");
+			return std::string(value != nullptr ? value : "");
+		}();
+		const bool listed_low =
+		    !low_dwords.empty() &&
+		    low_dwords.find(fmt::format("{:08x}", static_cast<uint32_t>(options.shader_hash))) !=
+		        std::string::npos;
 		const auto ir_path = fmt::format("{}/{:016x}.txt", rdna_dir, options.shader_hash);
-		if (auto* existing = std::fopen(ir_path.c_str(), "rb"); existing != nullptr) {
-			std::fclose(existing);
+		auto*      existing = listed_low ? nullptr : std::fopen(ir_path.c_str(), "rb");
+		if (listed_low || existing != nullptr) {
+			if (existing != nullptr) {
+				std::fclose(existing);
+			}
 			const auto text = Decoder::ProgramToString(decoded);
 			const auto path = fmt::format("{}/{:016x}.rdna.txt", rdna_dir, options.shader_hash);
 			if (auto* file = std::fopen(path.c_str(), "wb"); file != nullptr) {

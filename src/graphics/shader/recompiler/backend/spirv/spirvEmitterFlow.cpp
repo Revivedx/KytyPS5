@@ -740,10 +740,28 @@ void EmitPixelHistory(ValueEmitContext& ctx, uint32_t data, uint32_t mrt) {
 	const auto dx = Unary(state, spv::OpBitcast, TypeU32(state), offset(0, x));
 	const auto dy = Unary(state, spv::OpBitcast, TypeU32(state), offset(1, y));
 	// Unsigned compares also reject negative offsets.
-	const auto inside = Binary(
+	auto inside = Binary(
 	    state, spv::OpLogicalAnd, TypeBool(state),
 	    Binary(state, spv::OpULessThan, TypeBool(state), dx, ConstantU32(state, w)),
 	    Binary(state, spv::OpULessThan, TypeBool(state), dy, ConstantU32(state, h)));
+	// KYTY_PIXEL_HISTORY_STRIDE=<power of two> (research, 2026-10-14): only every n-th pixel of the
+	// rectangle in x and y, so a sparse grid over the whole screen fits the ring (where an effect
+	// shows varies per run).
+	static const uint32_t stride = [] {
+		const char* value = std::getenv("KYTY_PIXEL_HISTORY_STRIDE");
+		const auto  n     = value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 1u;
+		return n != 0 && (n & (n - 1)) == 0 ? n : 1u;
+	}();
+	if (stride > 1) {
+		const auto mask    = ConstantU32(state, stride - 1);
+		const auto on_grid = Binary(
+		    state, spv::OpLogicalAnd, TypeBool(state),
+		    Binary(state, spv::OpIEqual, TypeBool(state),
+		           Binary(state, spv::OpBitwiseAnd, TypeU32(state), dx, mask), ConstantU32(state, 0)),
+		    Binary(state, spv::OpIEqual, TypeBool(state),
+		           Binary(state, spv::OpBitwiseAnd, TypeU32(state), dy, mask), ConstantU32(state, 0)));
+		inside = Binary(state, spv::OpLogicalAnd, TypeBool(state), inside, on_grid);
+	}
 	EmitIfCondition(state, inside, [&]() {
 		const auto packed = Binary(
 		    state, spv::OpBitwiseOr, TypeU32(state), ConstantU32(state, mrt << 24u),

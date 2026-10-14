@@ -1489,12 +1489,54 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = {};
 			}
 		}
+		const bool inserted_new = !result;
 		if (!result) {
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
+			}
+		}
+		// KYTY_WATCH_RANGES (env) + KYTY_WATCH_LOG (live), research 2026-10-14 (black smoke): image
+		// lookups of the watched ranges: the request, the candidates and what they resolved to.
+		{
+			static const std::vector<std::pair<uint64_t, uint64_t>> ranges = [] {
+				std::vector<std::pair<uint64_t, uint64_t>> list;
+				for (const char* p = std::getenv("KYTY_WATCH_RANGES"); p != nullptr && *p != 0;) {
+					char*      end = nullptr;
+					const auto a   = std::strtoull(p, &end, 16);
+					if (end == p || *end != ':') break;
+					p            = end + 1;
+					const auto n = std::strtoull(p, &end, 16);
+					list.emplace_back(a, n);
+					if (end == p) break;
+					p = *end == ',' ? end + 1 : end;
+				}
+				return list;
+			}();
+			static auto& left = Common::LiveSwitches::Get("KYTY_WATCH_LOG", 0);
+			const auto   addr = desc.info.data.address;
+			if (!ranges.empty() && left.load(std::memory_order_relaxed) > 0 &&
+			    std::ranges::any_of(ranges, [&](const auto& r) { return addr >= r.first && addr < r.first + r.second; })) {
+				left.fetch_sub(1, std::memory_order_relaxed);
+				const auto& req = desc.info;
+				std::string cands;
+				for (const auto id: candidates) {
+					const auto& c = m_slot_images[id];
+					cands += fmt::format(" [{} {}x{} fmt {} tile {} lv {} ly {} target {} same {}]", id.index,
+					                     c.info.extent.width, c.info.extent.height,
+					                     static_cast<int>(c.info.pixel_format), static_cast<int>(c.info.tile_mode),
+					                     c.info.resources.levels, c.info.resources.layers, c.binding.is_target ? 1 : 0,
+					                     SameBacking(c.info, desc.info, exact_format) ? 1 : 0);
+				}
+				::printf("Watch: image lookup type=%d 0x%010" PRIx64 "+0x%" PRIx64 " %ux%u fmt %d tile %d lv %u ly %u "
+				         "-> image %u%s%s; candidates:%s\n",
+				         static_cast<int>(desc.type), addr, req.data.size, req.extent.width, req.extent.height,
+				         static_cast<int>(req.pixel_format), static_cast<int>(req.tile_mode), req.resources.levels,
+				         req.resources.layers, result.index, inserted_new ? " NEW" : "",
+				         memo_hit ? " (memo)" : "", cands.c_str());
+				std::fflush(stdout);
 			}
 		}
 		auto& image = m_slot_images[result];

@@ -58,6 +58,20 @@ Performance (GPU shaders), from the driver's own disassembly of the hottest pipe
   per frame 17.4 -> 13.6 ms), scripted jungle fight 13.7 -> 20.1 fps. The first run after updating
   recompiles the shaders in Mesa (a few stutters), later runs use Mesa's shader cache.
 
+Stability and visual fixes (2026-10-14):
+- No more crash a few seconds after loading a save (~8-10 % of loads before): the asynchronous guest-copy
+  queue could publish an older snapshot of a 4 MiB block over newer CPU writes; copies of overlapping
+  ranges now publish in order (`KYTY_GUEST_COPY_ORDER`, default on). 60 of 60 loads without a crash, no
+  fps cost.
+- Explosion smoke is lit by the fire instead of black: pixel shader inputs with 16-bit custom
+  interpolation get the raw per-vertex values the shader interpolates itself (`KYTY_CUSTOM_F16_INTERP`,
+  default on). The particle lighting pass got packed halves subtracted as 32-bit floats, projected its
+  positions off screen and found no lights.
+- 2D storage images read and written through bindless heap descriptors get their own storage descriptor
+  array (`KYTY_BINDLESS_STORAGE`, default on): the explosion shader's accumulation buffers read garbage and
+  lost their writes.
+- Fog workaround in `run-wolverine.sh` (`KYTY_PROBE_SET=...`): no red light rays over the whole screen.
+
 ## Build (Ubuntu 26.04 or a distrobox with clang 21 and Qt 6)
 
 ```
