@@ -63,10 +63,9 @@ Stability and visual fixes (2026-10-14):
   queue could publish an older snapshot of a 4 MiB block over newer CPU writes; copies of overlapping
   ranges now publish in order (`KYTY_GUEST_COPY_ORDER`, default on). 60 of 60 loads without a crash, no
   fps cost.
-- Explosion smoke is lit by the fire instead of black: pixel shader inputs with 16-bit custom
-  interpolation get the raw per-vertex values the shader interpolates itself (`KYTY_CUSTOM_F16_INTERP`,
-  default on). The particle lighting pass got packed halves subtracted as 32-bit floats, projected its
-  positions off screen and found no lights.
+- Explosion smoke: still black (work in progress). The particle lighting pass that lights it projects
+  its positions off screen and finds no lights; a fix first committed for it (`KYTY_CUSTOM_F16_INTERP`)
+  turned out to change nothing in this game.
 - 2D storage images read and written through bindless heap descriptors get their own storage descriptor
   array (`KYTY_BINDLESS_STORAGE`, default on): the explosion shader's accumulation buffers read garbage and
   lost their writes.

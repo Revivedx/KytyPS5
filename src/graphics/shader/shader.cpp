@@ -546,10 +546,11 @@ static void ShaderGetStaticInputInfoPS(
 		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
 	}
 	// KYTY_LOCAL_HACK KYTY_CUSTOM_F16_INTERP (env, default 1, 2026-10-14): 16-bit custom inputs are
-	// custom too. Their shaders interpolate the raw per-vertex halves themselves (V_INTERP_MOV P0 /
-	// P10 / P20 + V_FMA_MIX: P0 (1 - i - j) + P1 i + P2 j); as smooth inputs they got f32 deltas of
-	// the packed halves (garbage): Wolverine's particle lighting pass (PS 29290302144ad0c2) projected
-	// its world positions off screen, found no lights and lit the smoke black. 0 = the old exclusion.
+	// custom too: a shader interpolating raw per-vertex halves itself (V_INTERP_MOV P0 / P10 / P20 +
+	// V_FMA_MIX: P0 (1 - i - j) + P1 i + P2 j) would otherwise get f32 deltas of the packed halves.
+	// Untested: no Wolverine pixel shader declares a 16-bit custom input (KYTY_CUSTOM_F16_LOG=all, 357
+	// shaders); its particle shaders pack halves into 32-bit custom inputs, already raw. NOT the black
+	// smoke fix it was first taken for. 0 = the old exclusion.
 	static const bool custom_f16 = [] {
 		const char* value = std::getenv("KYTY_CUSTOM_F16_INTERP");
 		return value == nullptr || std::strcmp(value, "0") != 0;
@@ -898,6 +899,38 @@ ShaderParams PrepareProgram(
     ShaderPixelInputInfo&                               ps_info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	// KYTY_CUSTOM_F16_LOG (env, research 2026-10-14): once per pixel shader, its hash and the inputs with
+	// 16-bit custom interpolation (the ones KYTY_CUSTOM_F16_INTERP makes custom).
+	if (static const bool log_f16 = std::getenv("KYTY_CUSTOM_F16_LOG") != nullptr; log_f16) {
+		uint32_t f16_mask = 0;
+		for (uint32_t i = 0; i < data.num_input_semantics && i < ShaderMappedData::MaxInputSemantics; i++) {
+			const auto& semantic = data.input_semantics_snapshot[i];
+			if (semantic.is_custom != 0 && semantic.is_f16 != 0) {
+				f16_mask |= 1u << i;
+			}
+		}
+		// KYTY_CUSTOM_F16_LOG=all: every pixel shader with its input semantics (custom / f16 bits).
+		static const bool log_all = std::strcmp(std::getenv("KYTY_CUSTOM_F16_LOG"), "all") == 0;
+		static std::mutex                   seen_mutex;
+		static std::unordered_set<uint64_t> seen;
+		if (f16_mask != 0 || log_all) {
+			std::scoped_lock lock(seen_mutex);
+			if (seen.insert(hash).second) {
+				std::string text;
+				for (uint32_t i = 0; log_all && i < data.num_input_semantics && i < ShaderMappedData::MaxInputSemantics;
+				     i++) {
+					const auto& semantic = data.input_semantics_snapshot[i];
+					text += " " + std::to_string(i) + ":c" + std::to_string(semantic.is_custom) + "f" +
+					        std::to_string(semantic.is_f16) + "s" + std::to_string(semantic.size_in_elements);
+				}
+				std::printf("Custom f16 PS %016" PRIx64 " inputs 0x%08x (custom 0x%08x) n=%u%s input_ena 0x%x addr 0x%x "
+				            "system_base %u\n",
+				            hash, f16_mask, ps_info.custom_interpolation_mask, data.num_input_semantics, text.c_str(),
+				            sh.ps_input_ena, sh.ps_input_addr, ps_info.ps_system_input_base);
+				std::fflush(stdout);
+			}
+		}
+	}
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
