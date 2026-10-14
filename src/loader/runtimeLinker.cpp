@@ -903,6 +903,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		std::fflush(stdout);
+		{
+			const uint64_t values[] = {info->rax, info->rbx, info->rcx, info->rdx, info->rsi,
+			                           info->rdi, info->rbp, info->r8,  info->r9,  info->r10,
+			                           info->r11, info->r12, info->r13, info->r14, info->r15};
+			Libs::LibKernel::Memory::DumpBackingLogNear(values, std::size(values));
+		}
 		Libs::DumpAmmHistory(info->access_violation_vaddr);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64

@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -874,7 +875,86 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+// KYTY_LOCAL_HACK KYTY_BACKING_LOG=<lo hex>:<hi hex> (environment, research 2026-10-14): every write of
+// emulator data into guest memory (readback publishes, CPU-side copies) that overlaps [lo, hi) is kept
+// in a ring of the last 16384, printed by a guest crash around the registers that point into the
+// range (DumpBackingLogNear). Wolverine's crashes after load find NULL pointers / a vtable call to 0
+// in objects the render thread keeps in the 0x12c0000000 ring: was that memory just overwritten?
+namespace {
+struct BackingLogRecord {
+	uint64_t vaddr = 0;
+	uint64_t size  = 0;
+	uint64_t ns    = 0;
+	int      tid   = 0;
+};
+constexpr size_t                         BackingLogSize = 16384;
+std::array<BackingLogRecord, BackingLogSize> g_backing_log {};
+std::atomic<uint64_t>                    g_backing_log_next {0};
+struct BackingLogRange {
+	uint64_t lo = 0;
+	uint64_t hi = 0;
+};
+const BackingLogRange& BackingLogConfig() {
+	static const BackingLogRange range = [] {
+		BackingLogRange result;
+		if (const char* value = std::getenv("KYTY_BACKING_LOG"); value != nullptr) {
+			char* end = nullptr;
+			result.lo = std::strtoull(value, &end, 16);
+			if (end != nullptr && *end == ':') {
+				result.hi = std::strtoull(end + 1, nullptr, 16);
+			}
+		}
+		return result;
+	}();
+	return range;
+}
+uint64_t BackingLogNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+} // namespace
+
+void DumpBackingLogNear(const uint64_t* values, size_t count) {
+	const auto& range = BackingLogConfig();
+	if (range.hi <= range.lo) {
+		return;
+	}
+	const auto now  = BackingLogNowNs();
+	const auto next = g_backing_log_next.load(std::memory_order_acquire);
+	std::printf("backing log: %" PRIu64 " writes into 0x%" PRIx64 "..0x%" PRIx64 " logged\n", next,
+	            range.lo, range.hi);
+	for (size_t v = 0; v < count; v++) {
+		const auto value = values[v];
+		if (value < range.lo || value >= range.hi) {
+			continue;
+		}
+		const auto lo      = (value & ~uint64_t {0xfff}) - 0x1000;
+		const auto hi      = lo + 0x3000;
+		int        printed = 0;
+		std::printf("backing writes over 0x%" PRIx64 "..0x%" PRIx64 " (register value 0x%" PRIx64
+		            "), newest first:\n",
+		            lo, hi, value);
+		for (uint64_t n = next; n > 0 && next - n < BackingLogSize && printed < 48; n--) {
+			const auto& record = g_backing_log[(n - 1) % BackingLogSize];
+			if (record.vaddr < hi && record.vaddr + record.size > lo) {
+				std::printf("  %.3f ms ago: 0x%" PRIx64 " +0x%" PRIx64 " thread %d\n",
+				            static_cast<double>(now - record.ns) / 1e6, record.vaddr, record.size,
+				            record.tid);
+				printed++;
+			}
+		}
+	}
+	std::fflush(stdout);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	if (const auto& range = BackingLogConfig();
+	    range.hi > range.lo && vaddr < range.hi && vaddr + size > range.lo) {
+		const auto n = g_backing_log_next.fetch_add(1, std::memory_order_acq_rel);
+		g_backing_log[n % BackingLogSize] = {vaddr, size, BackingLogNowNs(),
+		                                     Common::Thread::GetThreadIdUnique()};
+	}
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }

@@ -116,6 +116,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// KYTY_BACKING_LOG (research): prints the logged backing writes near the values inside the range.
+void                   DumpBackingLogNear(const uint64_t* values, size_t count);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
