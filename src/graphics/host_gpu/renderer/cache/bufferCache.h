@@ -233,13 +233,14 @@ private:
 		uint64_t                    window_begin   = 0;
 		uint64_t                    window_end     = 0;
 		uint64_t                    generation     = 0;
+		uint64_t                    start_ns       = 0; // steady clock (KYTY_GUEST_COPY_CHECK)
 		bool                        busy           = false;
 		std::atomic<uint32_t>       waiters {0};
 		// 0 = not published, 1 = being copied into guest memory, 2 = published.
 		std::atomic<int>            publish_state {0};
 	};
 	// Any thread, after the slot's fence: copies the staging bytes into guest memory once.
-	static void PublishGuestCopy(GuestCopySlot& slot);
+	void PublishGuestCopy(GuestCopySlot& slot);
 	static constexpr size_t GuestCopySlots = 6;
 	std::array<GuestCopySlot, GuestCopySlots> m_guest_copy_slots;
 	vk::CommandPool                           m_guest_copy_pool = nullptr;
@@ -248,6 +249,12 @@ private:
 	// GPU thread: waits for the slot's copy and publishes it.
 	void CompleteGuestCopy(size_t slot);
 	void CompleteGuestCopies(uint64_t begin, uint64_t end);
+	// GPU thread, KYTY_GUEST_COPY_ORDER (see bufferCache.cpp): completes the busy slots whose
+	// copies touch [begin, end) before a path publishes, subtracts or unmarks those bytes; `site`
+	// names the path for KYTY_GUEST_COPY_CHECK. True when a slot was completed.
+	bool OrderGuestCopies(uint64_t begin, uint64_t end, int site);
+	[[nodiscard]] bool GuestCopyTouches(const GuestCopySlot& slot, uint64_t begin,
+	                                    uint64_t end) const;
 
 public:
 	// Game thread: waits for a guest copy started for it.

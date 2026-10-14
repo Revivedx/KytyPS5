@@ -7,6 +7,7 @@
 #include "common/liveSwitches.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/addressBindingReport.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -31,6 +32,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -402,6 +404,161 @@ uint64_t ReadbackWindowSize() {
 	}
 	return bytes;
 }
+
+// KYTY_LOCAL_HACK KYTY_GUEST_COPY_ORDER (live, default 1; 2026-10-14): since gc3 the faulting game
+// thread publishes its guest copy slot itself (WaitGuestCopy), whenever its fence wait returns, so
+// the GPU thread's other readback paths were no longer ordered with that publish: ReadMemoryOnGpu
+// (TryCopyQueueReadback, DownloadBufferMemory), the main-queue download after StartGuestCopy's
+// "writer running" return, WriteClean and the garbage collector could publish the same bytes,
+// subtract them from the GPU-dirty set and hand their pages to the CPU while a slot still held an
+// older snapshot of them. The late publish then wrote that snapshot over the CPU's newer bytes.
+// Wolverine's crashes after load (render-thread objects in the 0x12c0000000 ring with float bytes
+// in pointer fields; KYTY_BACKING_LOG ll4_1: their 4 MiB block published twice 0.6 ms apart just
+// before) started the day the queue became the default. Those paths now first complete the busy
+// slots whose copies touch their range: CompleteGuestCopy waits for the fence and, through the
+// publish_state CAS, for a publish already running, so no slot writes the bytes afterwards.
+bool GuestCopyOrderEnabled() {
+	static auto& enabled = Common::LiveSwitches::Get("KYTY_GUEST_COPY_ORDER", 1);
+	return enabled.load(std::memory_order_relaxed) != 0;
+}
+
+enum GuestCopyOrderSite : int {
+	OrderReadPage,
+	OrderReadWindow,
+	OrderDownload,
+	OrderWriteClean,
+	OrderGc,
+	OrderDirect,
+	OrderSites
+};
+
+// KYTY_GUEST_COPY_CHECK=1 (live, research, 2026-10-14): every 5 s, what the guest-copy publishes
+// found as they wrote: bytes no longer GPU-dirty (another path published or subtracted them
+// first: superseded), pages no longer GPU-owned before the copy (late) or released while it ran
+// (overlapped), the bytes of late pages that differed from guest memory (clobbered), and how many
+// busy slots each KYTY_GUEST_COPY_ORDER site had to complete. The first publishes that found
+// anything are printed one by one.
+namespace GuestCopyCheck {
+bool On() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_GUEST_COPY_CHECK", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+// KYTY_GUEST_COPY_CHECK=2 also compares every published byte with guest memory (changed = what the
+// publish really changes: the GPU's writes, or stale bytes); KYTY_GUEST_COPY_DIFF=<lo hex>:<hi hex>
+// prints the changed runs of the first publishes into that range.
+int Level() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_GUEST_COPY_CHECK", 0);
+	return static_cast<int>(on.load(std::memory_order_relaxed));
+}
+std::pair<uint64_t, uint64_t> DiffRange() {
+	static const std::pair<uint64_t, uint64_t> range = [] {
+		std::pair<uint64_t, uint64_t> result {0, 0};
+		if (const char* value = std::getenv("KYTY_GUEST_COPY_DIFF"); value != nullptr) {
+			char* end     = nullptr;
+			result.first  = std::strtoull(value, &end, 16);
+			result.second = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0;
+		}
+		return result;
+	}();
+	return range;
+}
+struct Counters {
+	uint64_t publishes = 0, cp_publishes = 0, bytes = 0, superseded = 0, pages = 0, late = 0;
+	uint64_t clobbered = 0, overlapped = 0, compared = 0, changed = 0, unchanged_publishes = 0;
+	std::array<uint64_t, OrderSites> ordered {};
+	std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+};
+std::mutex         g_mutex;
+Counters           g_counters;
+uint32_t           g_events = 0;
+std::set<uint64_t> g_described; // 4 MiB blocks whose aliases were printed
+uint32_t           g_diff_lines = 0;
+// The last publishes into KYTY_GUEST_COPY_DIFF's range, printed by a guest crash next to the
+// backing log (DumpDiffsNear): which of them changed the page a register points into.
+struct DiffRecord {
+	uint64_t                                      window_begin = 0;
+	uint64_t                                      window_end   = 0;
+	uint64_t                                      ns           = 0;
+	uint64_t                                      changed      = 0;
+	int                                           tid          = 0;
+	uint32_t                                      run_count    = 0;
+	std::array<uint64_t, 16>                      changed_pages {}; // bit per 4 KiB page of the window
+	std::array<std::pair<uint64_t, uint32_t>, 16> runs {};          // the first changed runs
+};
+constexpr size_t                    DiffRingSize = 1024;
+std::array<DiffRecord, DiffRingSize> g_diff_ring {};
+uint64_t                            g_diff_next = 0;
+uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+void DumpDiffsNear(const uint64_t* values, size_t count) {
+	// A crash: the lock may be held by a thread that will never release it.
+	const bool locked = g_mutex.try_lock();
+	const auto now    = NowNs();
+	for (size_t v = 0; v < count; v++) {
+		const auto value   = values[v];
+		int        printed = 0;
+		for (uint64_t n = g_diff_next; n > 0 && g_diff_next - n < DiffRingSize && printed < 24; n--) {
+			const auto& r = g_diff_ring[(n - 1) % DiffRingSize];
+			if (value < r.window_begin || value >= r.window_end) {
+				continue;
+			}
+			if (printed++ == 0) {
+				std::printf("guest copy publishes over 0x%" PRIx64 " (KYTY_GUEST_COPY_DIFF), newest first:\n",
+				            value);
+			}
+			const auto page    = (value - r.window_begin) / TRACKER_PAGE_SIZE;
+			const bool touched = page < 1024 && ((r.changed_pages[page / 64] >> (page % 64)) & 1u) != 0;
+			std::printf("  %.3f ms ago: 0x%" PRIx64 "..0x%" PRIx64 " thread %d, changed %" PRIu64
+			            " bytes in %u runs; this page %s",
+			            static_cast<double>(now - r.ns) / 1e6, r.window_begin, r.window_end, r.tid,
+			            r.changed, r.run_count, touched ? "CHANGED" : "unchanged");
+			for (uint32_t i = 0; i < std::min<uint32_t>(r.run_count, 16); i++) {
+				const auto [address, bytes] = r.runs[i];
+				if (address + bytes + 0x1000 > value && address < value + 0x1000) {
+					std::printf(" 0x%" PRIx64 "+0x%x", address, bytes);
+				}
+			}
+			std::printf("\n");
+		}
+	}
+	std::fflush(stdout);
+	if (locked) {
+		g_mutex.unlock();
+	}
+}
+// With g_mutex held.
+void Report() {
+	auto&      c   = g_counters;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - c.at < std::chrono::seconds(5)) {
+		return;
+	}
+	::printf("Guest copy check (5 s): publishes %" PRIu64 " (GPU thread %" PRIu64 "), %.1f MiB, "
+	         "superseded %" PRIu64 " bytes, pages %" PRIu64 ", late %" PRIu64 " (clobbered %" PRIu64
+	         " bytes), overlapped %" PRIu64 "; ordered: read-page %" PRIu64 ", read-window %" PRIu64
+	         ", download %" PRIu64 ", write-clean %" PRIu64 ", gc %" PRIu64 ", direct %" PRIu64
+	         "; compared %.1f MiB, changed %.2f MiB, unchanged publishes %" PRIu64 "\n",
+	         c.publishes, c.cp_publishes, static_cast<double>(c.bytes) / 1048576.0, c.superseded,
+	         c.pages, c.late, c.clobbered, c.overlapped, c.ordered[OrderReadPage],
+	         c.ordered[OrderReadWindow], c.ordered[OrderDownload], c.ordered[OrderWriteClean],
+	         c.ordered[OrderGc], c.ordered[OrderDirect], static_cast<double>(c.compared) / 1048576.0,
+	         static_cast<double>(c.changed) / 1048576.0, c.unchanged_publishes);
+	std::fflush(stdout);
+	c    = {};
+	c.at = now;
+}
+void NoteOrdered(int site) {
+	if (!On()) {
+		return;
+	}
+	std::lock_guard lock(g_mutex);
+	g_counters.ordered[static_cast<size_t>(site)]++;
+	Report();
+}
+} // namespace GuestCopyCheck
 
 } // namespace
 
@@ -784,6 +941,12 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
+	// KYTY_GUEST_COPY_ORDER: a busy guest copy of these bytes would publish the GPU's older value
+	// over them later; once completed, the page may no longer be GPU-owned.
+	if (OrderGuestCopies(vaddr, vaddr + size, OrderWriteClean) &&
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
 	{
 		// A download publishes the GPU's older value of these bytes when it lands.
 		std::shared_lock lock(m_dirty_ranges_mutex);
@@ -948,6 +1111,8 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	// Pages of an asynchronous write readback stay GPU-owned until its download is
 	// published.
 	CompletePendingWriteReadbacks(page_begin, page_end);
+	// KYTY_GUEST_COPY_ORDER: so do the bytes of a busy guest copy (its waiter may publish late).
+	OrderGuestCopies(page_begin, page_end, OrderReadPage);
 	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
 	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
@@ -980,6 +1145,8 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	const auto     buffer_end   = buffer_begin + buffer.Size();
 	const auto     window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+	// KYTY_GUEST_COPY_ORDER: the window's busy guest copies publish before this download does.
+	OrderGuestCopies(window_begin, window_end, OrderReadWindow);
 
 	if (stats.Enabled()) {
 		stats.FindWriter([this](uint64_t tick) { return m_scheduler.IsFree(tick); });
@@ -1347,6 +1514,9 @@ int BufferCache::StartGuestCopy(Buffer& buffer, uint64_t window_begin, uint64_t 
 	slot.window_begin   = window_begin;
 	slot.window_end     = window_end;
 	slot.generation++;
+	slot.start_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                          std::chrono::steady_clock::now().time_since_epoch())
+	                                          .count());
 	slot.publish_state.store(0, std::memory_order_release);
 	slot.busy = true;
 	slot.waiters.store(1, std::memory_order_release); // the faulting game thread
@@ -1395,6 +1565,31 @@ void BufferCache::CompleteGuestCopies(uint64_t begin, uint64_t end) {
 	}
 }
 
+bool BufferCache::GuestCopyTouches(const GuestCopySlot& slot, uint64_t begin, uint64_t end) const {
+	if (!slot.busy || slot.window_end <= begin || end <= slot.window_begin) {
+		return false;
+	}
+	return std::ranges::any_of(slot.copies, [&](const vk::BufferCopy& copy) {
+		const auto copy_begin = slot.buffer_address + copy.srcOffset;
+		return copy_begin < end && begin < copy_begin + copy.size;
+	});
+}
+
+bool BufferCache::OrderGuestCopies(uint64_t begin, uint64_t end, int site) {
+	if (!GuestCopyOrderEnabled()) {
+		return false;
+	}
+	bool completed = false;
+	for (size_t i = 0; i < GuestCopySlots; i++) {
+		if (GuestCopyTouches(m_guest_copy_slots[i], begin, end)) {
+			CompleteGuestCopy(i);
+			GuestCopyCheck::NoteOrdered(site);
+			completed = true;
+		}
+	}
+	return completed;
+}
+
 void BufferCache::PublishGuestCopy(GuestCopySlot& slot) {
 	int expected = 0;
 	if (!slot.publish_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
@@ -1405,9 +1600,188 @@ void BufferCache::PublishGuestCopy(GuestCopySlot& slot) {
 	}
 	slot.staging->Invalidate(0, slot.staging->Size());
 	const auto* mapped = slot.staging->Mapped().data();
+	// KYTY_GUEST_COPY_CHECK: the state of the copied bytes as they are published (see the switch).
+	const bool           check      = GuestCopyCheck::On();
+	uint64_t             bytes      = 0;
+	uint64_t             superseded = 0;
+	uint64_t             pages      = 0;
+	uint64_t             late       = 0;
+	uint64_t             clobbered  = 0;
+	uint64_t             first_late = 0;
+	uint64_t             compared   = 0; // KYTY_GUEST_COPY_CHECK=2
+	uint64_t             changed    = 0;
+	bool                 diff_watched = false;
+	GuestCopyCheck::DiffRecord diff;
+	std::vector<uint8_t> owned; // per page of the copies: GPU-owned before the publish
+	const auto           for_each_page = [&](auto&& func) {
+        for (const auto& copy: slot.copies) {
+            const auto begin = slot.buffer_address + copy.srcOffset;
+            const auto end   = begin + copy.size;
+            for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
+                 page += TRACKER_PAGE_SIZE) {
+                func(copy, begin, end, page);
+            }
+        }
+	};
+	if (check) {
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			for (const auto& copy: slot.copies) {
+				uint64_t dirty = 0;
+				m_gpu_modified_ranges.ForEachInRange(
+				    slot.buffer_address + copy.srcOffset, copy.size,
+				    [&](uint64_t start, uint64_t end) { dirty += end - start; });
+				superseded += copy.size - std::min(dirty, copy.size);
+				bytes += copy.size;
+			}
+		}
+		if (GuestCopyCheck::Level() >= 2) {
+			// Only the copies into KYTY_GUEST_COPY_DIFF's range when it is set (the compare of
+			// every publish costs ~20 % fps).
+			const auto [diff_lo, diff_hi] = GuestCopyCheck::DiffRange();
+			std::vector<uint8_t>          guest;
+			for (const auto& copy: slot.copies) {
+				const auto begin   = slot.buffer_address + copy.srcOffset;
+				const bool watched = begin < diff_hi && diff_lo < begin + copy.size;
+				if (diff_hi > diff_lo && !watched) {
+					continue;
+				}
+				guest.resize(copy.size);
+				if (!Libs::LibKernel::Memory::TryReadBacking(begin, guest.data(), copy.size)) {
+					continue;
+				}
+				const auto* snapshot = mapped + copy.dstOffset;
+				compared += copy.size;
+				for (uint64_t b = 0; b < copy.size;) {
+					if (guest[b] == snapshot[b]) {
+						b++;
+						continue;
+					}
+					uint64_t e = b;
+					while (e < copy.size && guest[e] != snapshot[e]) {
+						e++;
+					}
+					changed += e - b;
+					if (watched) {
+						for (auto page = (begin + b - slot.window_begin) / TRACKER_PAGE_SIZE;
+						     page <= (begin + e - 1 - slot.window_begin) / TRACKER_PAGE_SIZE && page < 1024;
+						     page++) {
+							diff.changed_pages[page / 64] |= uint64_t {1} << (page % 64);
+						}
+						if (diff.run_count < diff.runs.size()) {
+							diff.runs[diff.run_count] = {begin + b, static_cast<uint32_t>(e - b)};
+						}
+						diff.run_count++;
+					}
+					b = e;
+				}
+				if (watched) {
+					diff_watched = true;
+				}
+			}
+		}
+		std::vector<uint8_t> current;
+		for_each_page([&](const vk::BufferCopy& copy, uint64_t begin, uint64_t end, uint64_t page) {
+			const bool gpu = m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE);
+			owned.push_back(gpu ? 1 : 0);
+			pages++;
+			if (gpu) {
+				return;
+			}
+			late++;
+			first_late    = first_late == 0 ? page : first_late;
+			const auto lo = std::max(page, begin);
+			const auto hi = std::min(page + TRACKER_PAGE_SIZE, end);
+			current.resize(hi - lo);
+			if (Libs::LibKernel::Memory::TryReadBacking(lo, current.data(), hi - lo)) {
+				const auto* snapshot = mapped + copy.dstOffset + (lo - begin);
+				for (uint64_t b = 0; b < hi - lo; b++) {
+					clobbered += current[b] != snapshot[b] ? 1 : 0;
+				}
+			}
+		});
+	}
 	for (const auto& copy: slot.copies) {
 		Libs::LibKernel::Memory::WriteBacking(slot.buffer_address + copy.srcOffset,
 		                                      mapped + copy.dstOffset, copy.size);
+	}
+	if (check) {
+		uint64_t overlapped = 0;
+		size_t   index      = 0;
+		for_each_page([&](const vk::BufferCopy&, uint64_t, uint64_t, uint64_t page) {
+			if (owned[index++] != 0 && !m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+				overlapped++;
+			}
+		});
+		const bool gpu_thread = GuestGpu::IsGpuThread();
+		const auto now_ns     = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+		bool describe = false;
+		{
+			std::lock_guard lock(GuestCopyCheck::g_mutex);
+			auto&           c = GuestCopyCheck::g_counters;
+			// Once per published 4 MiB block: is its memory mapped at another address too?
+			describe = GuestCopyCheck::g_described.size() < 48 &&
+			           GuestCopyCheck::g_described.insert(slot.window_begin >> 22u).second;
+			c.publishes++;
+			c.cp_publishes += gpu_thread ? 1 : 0;
+			c.bytes += bytes;
+			c.superseded += superseded;
+			c.pages += pages;
+			c.late += late;
+			c.clobbered += clobbered;
+			c.overlapped += overlapped;
+			c.compared += compared;
+			c.changed += changed;
+			c.unchanged_publishes += compared != 0 && changed == 0 ? 1 : 0;
+			if (diff_watched) {
+				diff.window_begin = slot.window_begin;
+				diff.window_end   = slot.window_end;
+				diff.ns           = now_ns;
+				diff.changed      = changed;
+				diff.tid          = Common::Thread::GetThreadIdUnique();
+				GuestCopyCheck::g_diff_ring[GuestCopyCheck::g_diff_next++ % GuestCopyCheck::DiffRingSize] =
+				    diff;
+				static bool registered = false;
+				if (!registered) {
+					registered = true;
+					Libs::LibKernel::Memory::SetBackingDumpExtra(&GuestCopyCheck::DumpDiffsNear);
+				}
+			}
+			if (diff_watched && GuestCopyCheck::g_diff_lines < 200) {
+				GuestCopyCheck::g_diff_lines++;
+				std::string runs;
+				for (uint32_t i = 0; i < std::min<uint32_t>(diff.run_count, 12); i++) {
+					char text[48];
+					std::snprintf(text, sizeof(text), " 0x%" PRIx64 "+0x%x", diff.runs[i].first,
+					              diff.runs[i].second);
+					runs += text;
+				}
+				::printf("Guest copy diff: publish of 0x%" PRIx64 "..0x%" PRIx64 " by %s thread %d: changed %" PRIu64
+				         " of %" PRIu64 " bytes in %u runs:%s\n",
+				         slot.window_begin, slot.window_end, gpu_thread ? "the GPU" : "a game",
+				         diff.tid, changed, compared, diff.run_count, runs.c_str());
+			}
+			if ((superseded != 0 || late != 0 || overlapped != 0) && GuestCopyCheck::g_events < 32) {
+				GuestCopyCheck::g_events++;
+				::printf("Guest copy check: publish of 0x%" PRIx64 "..0x%" PRIx64 " (%zu copies, %.2f MiB) by "
+				         "%s thread %d, %.3f ms after the copy started: superseded %" PRIu64
+				         " bytes, late pages %" PRIu64 " (first 0x%" PRIx64 ", clobbered %" PRIu64
+				         " bytes), overlapped %" PRIu64 "\n",
+				         slot.window_begin, slot.window_end, slot.copies.size(),
+				         static_cast<double>(bytes) / 1048576.0, gpu_thread ? "the GPU" : "a game",
+				         Common::Thread::GetThreadIdUnique(),
+				         static_cast<double>(now_ns - slot.start_ns) / 1e6, superseded, late, first_late,
+				         clobbered, overlapped);
+			}
+			GuestCopyCheck::Report();
+		}
+		if (describe) {
+			Libs::LibKernel::Memory::DescribeAliases(slot.window_begin,
+			                                         slot.window_end - slot.window_begin);
+		}
 	}
 	slot.publish_state.store(2, std::memory_order_release);
 }
@@ -1486,6 +1860,10 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	// As in ReadMemoryOnGpu: a GPU-owned page without bytes to download only needs unprotecting.
 	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
 	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+		// KYTY_GUEST_COPY_ORDER: a busy guest copy holding bytes of the page publishes them first.
+		// With the ordering on, those bytes stay GPU-dirty until the copy completes, so this only
+		// finds copies started while the switch was off; completing one never adds dirty bytes.
+		OrderGuestCopies(page_begin, page_end, OrderReadPage);
 		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -1505,6 +1883,7 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 	if (direct_guest.load(std::memory_order_relaxed) != 0) {
 		static uint64_t direct_ok = 0, direct_fallback = 0;
 		static auto     direct_at = std::chrono::steady_clock::now();
+		OrderGuestCopies(page_begin, page_end, OrderDirect);
 		const bool      done      = TryDirectReadback(buffer, vaddr, size, is_write, 1);
 		(done ? direct_ok : direct_fallback)++;
 		if (const auto now = std::chrono::steady_clock::now();
@@ -1573,6 +1952,9 @@ uint64_t BufferCache::BeginWriteReadback(uint64_t vaddr, uint64_t size, bool is_
 			return 0;
 		}
 	}
+	// KYTY_GUEST_COPY_ORDER: StartGuestCopy returns before completing the window's busy copies
+	// when the writer is running (or the queue is off): they publish before this download.
+	OrderGuestCopies(window_begin, window_end, OrderDownload);
 	if (!DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 		stats.SetOutcome(ReadbackStats::NothingToDownload);
 		if (is_write) {
@@ -3024,6 +3406,9 @@ void BufferCache::RunGarbageCollector() {
 			// bytes, which the download below would reject. Collect the buffer later.
 			return false;
 		}
+		// KYTY_GUEST_COPY_ORDER: busy guest copies of the buffer publish before its download (or
+		// before UntrackMemory hands the pages to the CPU).
+		OrderGuestCopies(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size(), OrderGc);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		// An aged GPU-dirty buffer is downloaded and dropped under either policy. Retaining it

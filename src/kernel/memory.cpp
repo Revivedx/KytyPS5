@@ -915,7 +915,16 @@ uint64_t BackingLogNowNs() {
 }
 } // namespace
 
+static std::atomic<BackingDumpExtra> g_backing_dump_extra {nullptr};
+
+void SetBackingDumpExtra(BackingDumpExtra dumper) {
+	g_backing_dump_extra.store(dumper, std::memory_order_release);
+}
+
 void DumpBackingLogNear(const uint64_t* values, size_t count) {
+	if (const auto extra = g_backing_dump_extra.load(std::memory_order_acquire); extra != nullptr) {
+		extra(values, count);
+	}
 	const auto& range = BackingLogConfig();
 	if (range.hi <= range.lo) {
 		return;
@@ -932,6 +941,7 @@ void DumpBackingLogNear(const uint64_t* values, size_t count) {
 		const auto lo      = (value & ~uint64_t {0xfff}) - 0x1000;
 		const auto hi      = lo + 0x3000;
 		int        printed = 0;
+		DescribeAliases(value & ~uint64_t {0xfff}, 0x1000);
 		std::printf("backing writes over 0x%" PRIx64 "..0x%" PRIx64 " (register value 0x%" PRIx64
 		            "), newest first:\n",
 		            lo, hi, value);
@@ -944,6 +954,44 @@ void DumpBackingLogNear(const uint64_t* values, size_t count) {
 				printed++;
 			}
 		}
+	}
+	std::fflush(stdout);
+}
+
+// KYTY_LOCAL_HACK (research, 2026-10-14): the direct-memory mappings of [vaddr, vaddr + size) and every
+// other virtual mapping of the same physical bytes. The buffer cache tracks guest writes per virtual
+// page, so a CPU write through an alias never reaches the copy cached for the other address
+// (KYTY_GUEST_COPY_CHECK prints this once per published block).
+void DescribeAliases(uint64_t vaddr, uint64_t size) {
+	if (g_physical_memory == nullptr || size == 0) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> physical; // (phys, len) of the range's own mappings
+	g_physical_memory->GetMutex().Lock();
+	for (const auto& m: g_physical_memory->GetMappings()) {
+		if (m.map_vaddr == 0 || m.map_size == 0 || m.map_vaddr >= vaddr + size ||
+		    vaddr >= m.map_vaddr + m.map_size) {
+			continue;
+		}
+		const auto lo = std::max(vaddr, m.map_vaddr);
+		const auto hi = std::min(vaddr + size, m.map_vaddr + m.map_size);
+		physical.emplace_back(m.start_addr + (lo - m.map_vaddr), hi - lo);
+	}
+	g_physical_memory->GetMutex().Unlock();
+	if (physical.empty()) {
+		std::printf("aliases of 0x%" PRIx64 " +0x%" PRIx64 ": no direct-memory mapping (flexible / pooled?)\n",
+		            vaddr, size);
+	}
+	for (const auto& [phys, len]: physical) {
+		const auto mappings = g_physical_memory->FindMappings(phys, len);
+		std::printf("aliases of 0x%" PRIx64 " +0x%" PRIx64 ": physical 0x%" PRIx64 " +0x%" PRIx64
+		            ", %zu mapping(s):",
+		            vaddr, size, phys, len, mappings.size());
+		for (const auto& m: mappings) {
+			std::printf(" [va 0x%" PRIx64 " +0x%" PRIx64 " prot %d type %d '%.32s']", m.map_vaddr, m.map_size,
+			            m.prot, m.memory_type, m.name);
+		}
+		std::printf("\n");
 	}
 	std::fflush(stdout);
 }
