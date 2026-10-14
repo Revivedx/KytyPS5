@@ -55,6 +55,8 @@ struct GraphicContext {
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
 	bool                               calibrated_timestamps_enabled         = false;
+	// KYTY_LOCAL_HACK KYTY_EXEC_STATS (research): VK_KHR_pipeline_executable_properties enabled.
+	bool                               pipeline_exec_stats_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -202,6 +204,9 @@ struct VulkanImage {
 	vk::Image                     image       = nullptr;
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
+	// KYTY_LOCAL_HACK KYTY_SKIP_COVERED_BARRIERS (image.cpp): the compute barrier epoch of the last
+	// access when a guest dispatch bound the whole image, UINT64_MAX otherwise.
+	uint64_t                      compute_access_epoch = UINT64_MAX;
 	VmaAllocation                allocation = nullptr;
 	// The rest of the create info, for KYTY_IMAGE_RECYCLE_MB: only an image created without a
 	// pNext chain may be parked and handed to an identical CreateImage.

@@ -1034,6 +1034,116 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	return result;
 }
 
+// KYTY_LOCAL_HACK research (2026-10-13), KYTY_SELECT_STATS=<hex hash,...|all> (environment): every
+// VGPR write is Select(EXEC, new, old) (frontend Translate.cpp), so under a divergent EXEC each
+// VALU result costs an extra v_cndmask. Counts, without changing anything, the selects that two
+// rewrites would leave dead: Select(c, x, Select(c, a, b)) -> Select(c, x, b), and an operand
+// Select(c, a, b) of a lane-wise value used only in c's lanes (true operands of Select(c, ...),
+// memory operations enabled by c, recursively) -> a. Cross-lane, image, address and phi users
+// are never treated as such.
+namespace {
+
+bool CrossLaneOrOpaque(const IR::Inst& inst) {
+	switch (inst.GetOpcode()) {
+		case IR::ValueOpcode::Phi:
+		case IR::ValueOpcode::Ballot:
+		case IR::ValueOpcode::BpermuteU32:
+		case IR::ValueOpcode::DppMoveU32:
+		case IR::ValueOpcode::DppUpdateU32:
+		case IR::ValueOpcode::Permlane16U32:
+		case IR::ValueOpcode::ReadFirstLane:
+		case IR::ValueOpcode::ReadLane:
+		case IR::ValueOpcode::SwizzleU32:
+		case IR::ValueOpcode::WriteLane:
+		case IR::ValueOpcode::Barrier: return true;
+		default: break;
+	}
+	return IR::ImageOpcodeInfoOf(inst.GetOpcode()).access != IR::ImageAccess::None ||
+	       IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None ||
+	       IR::SharedAccessOf(inst.GetOpcode()) != IR::SharedAccess::None;
+}
+
+bool IsSelect(IR::ValueOpcode op) {
+	return op == IR::ValueOpcode::SelectU32 || op == IR::ValueOpcode::SelectF32 ||
+	       op == IR::ValueOpcode::SelectU1;
+}
+
+struct MaskedQuery {
+	std::map<std::pair<const IR::Inst*, const IR::Inst*>, bool> memo;
+
+	bool Use(const IR::Use& use, const IR::Inst* cond, uint32_t depth) {
+		const auto& user = *use.user;
+		const auto  op   = user.GetOpcode();
+		if (IsSelect(op)) {
+			return user.Arg(0).Resolve().TryInstruction() == cond && use.operand != 0;
+		}
+		if (IR::BufferAccessOf(op) != IR::BufferAccess::None) {
+			return user.NumArgs() != 0 && use.operand + 1 != user.NumArgs() &&
+			       user.Arg(user.NumArgs() - 1).Resolve().TryInstruction() == cond;
+		}
+		if (CrossLaneOrOpaque(user) || user.MayHaveSideEffects()) {
+			return false;
+		}
+		return Value(user, cond, depth + 1);
+	}
+
+	bool Value(const IR::Inst& inst, const IR::Inst* cond, uint32_t depth) {
+		if (depth > 48 || !inst.HasUses()) {
+			return false;
+		}
+		const auto key = std::make_pair(&inst, cond);
+		if (const auto found = memo.find(key); found != memo.end()) {
+			return found->second;
+		}
+		memo[key] = false; // cycles: not masked
+		bool masked = true;
+		for (const auto& use: inst.Uses()) {
+			if (!Use(use, cond, depth)) {
+				masked = false;
+				break;
+			}
+		}
+		memo[key] = masked;
+		return masked;
+	}
+};
+
+void ReportSelectStats(const IR::Program& ir) {
+	static const std::string list = [] {
+		const char* value = std::getenv("KYTY_SELECT_STATS");
+		return std::string(value != nullptr ? value : "");
+	}();
+	if (list.empty() || (list != "all" && list.find(fmt::format("{:016x}", ir.shader_hash)) ==
+	                                          std::string::npos)) {
+		return;
+	}
+	uint32_t    insts = 0, selects = 0, removable = 0;
+	MaskedQuery query;
+	for (const auto* block: ir.blocks) {
+		for (const auto& inst: *block) {
+			insts++;
+			if (!IsSelect(inst.GetOpcode())) continue;
+			const auto* cond = inst.Arg(0).Resolve().TryInstruction();
+			if (cond == nullptr) continue;
+			selects++;
+			bool dead = inst.HasUses();
+			for (const auto& use: inst.Uses()) {
+				if (!query.Use(use, cond, 0)) {
+					dead = false;
+					break;
+				}
+			}
+			removable += dead ? 1u : 0u;
+		}
+	}
+	std::printf("Select stats 0x%016" PRIx64 " (%s): %u values, %u lane selects, %u removable (%.0f%%)\n",
+	            ir.shader_hash, StageName(ir.stage), insts, selects, removable,
+	            selects != 0 ? 100.0 * removable / selects : 0.0);
+	std::fflush(stdout);
+}
+
+} // namespace
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
@@ -1089,6 +1199,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 
+	ReportSelectStats(ir);
 	IR::CollectShaderInfo(ir, options.input_info);
 	ir.info.watchdog_reports = ir.bindless_images && ir.info.uses_dma;
 	// KYTY_DMA_FOOTPRINT_LOG=1 (environment): the DMA footprint of every DMA program as compiled.

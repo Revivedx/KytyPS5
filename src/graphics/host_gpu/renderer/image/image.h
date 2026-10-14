@@ -48,6 +48,11 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+// KYTY_LOCAL_HACK KYTY_SKIP_COVERED_BARRIERS (image.cpp): set while a guest dispatch binds its
+// images, and bumped after the ShaderAccessBarrier each guest dispatch records (renderCompute.cpp).
+extern thread_local bool g_compute_image_binding;
+extern uint64_t          g_compute_barrier_epoch;
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);

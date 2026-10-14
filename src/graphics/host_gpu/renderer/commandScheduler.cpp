@@ -259,14 +259,30 @@ static void ReportRecorderCallers(double elapsed) {
 // Regions regions of the query pool, reset when it begins; a timestamp at its start and after
 // every profiled draw or dispatch (all earlier work complete) gives each operation the GPU time
 // since the previous mark, its barriers included. Collected when the tick completes.
+// Research 2026-10-13 (KYTY_GPU_PROFILE): the time of the last flip request (the CP reaching a
+// frame's flip), so each profiled op knows where in the frame the CP recorded it.
+static std::atomic<int64_t> g_last_flip_us {0};
+
+static int64_t SteadyUs() {
+	return std::chrono::duration_cast<std::chrono::microseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+void NoteFlipRequest() {
+	g_last_flip_us.store(SteadyUs(), std::memory_order_relaxed);
+}
+
 struct CommandScheduler::GpuProfiler {
 	static constexpr uint32_t Regions     = 8;
 	static constexpr uint32_t RegionSlots = 4096;
+	static constexpr uint32_t PosBuckets  = 8; // 5 ms each after the last flip, the last open
 
 	struct Mark {
 		uint32_t kind   = 0;
 		uint64_t shader = 0;
 		uint64_t pixel  = 0;
+		uint32_t pos_us = 0; // CP record time after the last flip request
 	};
 	struct Key {
 		uint32_t kind;
@@ -364,6 +380,14 @@ struct CommandScheduler::GpuProfiler {
 				stats.ns += ns;
 				stats.count++;
 				total_ns += ns;
+				const auto bucket = std::min<uint32_t>(mark.pos_us / 5000u, PosBuckets - 1);
+				pos_ns[bucket] += ns;
+				pos_count[bucket]++;
+				if (mark.pos_us >= 20000u) {
+					auto& tail = by_key_tail[{mark.kind, mark.shader, mark.pixel}];
+					tail.ns += ns;
+					tail.count++;
+				}
 			}
 			buffers++;
 		}
@@ -404,7 +428,26 @@ struct CommandScheduler::GpuProfiler {
 			         i, key.kind, key.shader, key.pixel, stats.ns / 1e6 / elapsed, stats.count,
 			         stats.ns / 1e3 / static_cast<double>(stats.count));
 		}
+		::printf("GPU profile by CP record position (ms after the last flip request): ms/s (ops)");
+		for (uint32_t b = 0; b < PosBuckets; b++) {
+			::printf(" %u-%s: %.1f (%" PRIu64 ")", b * 5u,
+			         b + 1 == PosBuckets ? "" : std::to_string((b + 1) * 5u).c_str(),
+			         pos_ns[b] / 1e6 / elapsed, pos_count[b]);
+		}
+		::printf("\n");
+		std::vector<std::pair<Key, Stats>> tail(by_key_tail.begin(), by_key_tail.end());
+		std::ranges::sort(tail, [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+		for (size_t i = 0; i < std::min<size_t>(tail.size(), 20); i++) {
+			const auto& [key, stats] = tail[i];
+			::printf("  GPU profile tail %2zu (recorded >= 20 ms after the flip): kind %u shader %016" PRIx64
+			         " ps %016" PRIx64 " %.2f ms/s, %" PRIu64 " ops, %.1f us each\n",
+			         i, key.kind, key.shader, key.pixel, stats.ns / 1e6 / elapsed, stats.count,
+			         stats.ns / 1e3 / static_cast<double>(stats.count));
+		}
 		std::fflush(stdout);
+		by_key_tail.clear();
+		pos_ns    = {};
+		pos_count = {};
 		by_key.clear();
 		total_ns = 0;
 		buffers  = 0;
@@ -421,6 +464,9 @@ struct CommandScheduler::GpuProfiler {
 	std::deque<Pending>                                     pending;
 	std::vector<uint64_t>                                   stamps;
 	std::unordered_map<Key, Stats, KeyHash>                 by_key;
+	std::unordered_map<Key, Stats, KeyHash>                 by_key_tail;
+	std::array<double, PosBuckets>                          pos_ns {};
+	std::array<uint64_t, PosBuckets>                        pos_count {};
 	double                                                  total_ns = 0;
 	uint64_t                                                buffers  = 0;
 	std::chrono::steady_clock::time_point                   report   = std::chrono::steady_clock::now();
@@ -430,7 +476,10 @@ void CommandScheduler::ProfileMark(uint32_t kind, uint64_t shader, uint64_t pixe
 	if (!GpuProfiler::Enabled()) {
 		return;
 	}
-	const GpuProfiler::Mark mark {kind, shader, pixel_shader};
+	const auto              last_flip = g_last_flip_us.load(std::memory_order_relaxed);
+	const auto              since     = last_flip != 0 ? SteadyUs() - last_flip : 0;
+	const GpuProfiler::Mark mark {kind, shader, pixel_shader,
+	                              static_cast<uint32_t>(std::clamp<int64_t>(since, 0, 1000000))};
 	if (m_threaded) {
 		Record([this, mark](vk::CommandBuffer command) { m_gpu_profiler->Write(command, mark); });
 	} else if (m_command.m_buffer) {
@@ -797,6 +846,11 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		                  debug.arg1, debug.arg2, debug.arg3, debug.arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// Research (KYTY_TIMELINE_N with env KYTY_TIMELINE_L): U = the vkQueueSubmit of a tick.
+	static const bool timeline_u = std::getenv("KYTY_TIMELINE_L") != nullptr;
+	if (timeline_u) {
+		TimelineEvent('U', tick);
+	}
 	m_gpu_timer->Submitted(tick);
 	m_gpu_profiler->Submitted(tick);
 }

@@ -34,6 +34,7 @@
 namespace Libs::Graphics {
 struct GraphicContext;
 void TimelineEvent(char kind, uint64_t arg); // graphicsRun.cpp (research, KYTY_TIMELINE_N)
+void NoteFlipRequest();                       // commandScheduler.cpp (research, KYTY_GPU_PROFILE)
 } // namespace Libs::Graphics
 
 namespace Libs::VideoOut {
@@ -517,6 +518,7 @@ static bool IsValidFlipMode(int mode) {
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
                               int64_t flip_arg, FlipRequestSource source, uint64_t& request_id) {
 	Graphics::TimelineEvent('F', source == FlipRequestSource::Cpu ? 0u : 1u);
+	Graphics::NoteFlipRequest();
 	auto* video_out = driver.Get(handle);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;

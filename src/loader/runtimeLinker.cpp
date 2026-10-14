@@ -860,6 +860,48 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		// KYTY_LOCAL_HACK KYTY_CRASH_DUMP=<what>:<bytes>[,...] (environment, research 2026-10-13): guest
+		// memory to print with the context; <what> is a hex address or a register name (rax..r15).
+		// Wolverine's load crash (memcpy from NULL at pc 0x930003e00): KYTY_CRASH_DUMP=0x90beae700:0x40,r14:0x80
+		// shows whether the game's global was NULL or the pointer array it had just filled changed.
+		if (const char* spec = std::getenv("KYTY_CRASH_DUMP"); spec != nullptr) {
+			const std::pair<const char*, uint64_t> regs[] = {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+			    {"rsi", info->rsi}, {"rdi", info->rdi}, {"rbp", info->rbp}, {"rsp", info->rsp},
+			    {"r8", info->r8},   {"r9", info->r9},   {"r10", info->r10}, {"r11", info->r11},
+			    {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+			std::string text(spec);
+			size_t      pos = 0;
+			while (pos < text.size()) {
+				const auto end   = text.find(',', pos);
+				const auto token = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+				pos              = end == std::string::npos ? text.size() : end + 1;
+				const auto colon = token.find(':');
+				if (colon == std::string::npos) continue;
+				const auto what  = token.substr(0, colon);
+				const auto bytes = std::min<uint64_t>(std::strtoull(token.c_str() + colon + 1, nullptr, 0), 1024);
+				uint64_t   addr  = 0;
+				bool       found = false;
+				for (const auto& [name, value]: regs) {
+					if (what == name) {
+						addr  = value;
+						found = true;
+					}
+				}
+				if (!found) addr = std::strtoull(what.c_str(), nullptr, 16);
+				const auto count = static_cast<int>(bytes / 8u);
+				if (count <= 0 || !IsReadableRange(addr, bytes)) {
+					std::printf("dump %s (0x%016" PRIx64 "): not readable\n", what.c_str(), addr);
+					continue;
+				}
+				const auto* words = reinterpret_cast<const uint64_t*>(addr);
+				std::printf("dump %s (0x%016" PRIx64 "):", what.c_str(), addr);
+				for (int i = 0; i < count; i++) {
+					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", words[i]);
+				}
+				std::printf("\n");
+			}
+		}
 		std::fflush(stdout);
 		Libs::DumpAmmHistory(info->access_violation_vaddr);
 	}

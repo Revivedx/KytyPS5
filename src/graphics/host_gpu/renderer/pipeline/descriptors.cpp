@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -2066,6 +2067,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			heap->checked_generation = g_bindless_state_generation.load(std::memory_order_relaxed);
 			heap->checked_count      = resolved.size();
 		}
+		// KYTY_SKIP_COVERED_BARRIERS (image.cpp): the accesses a guest dispatch declares here.
+		struct ComputeBindingScope {
+			explicit ComputeBindingScope(bool on) { g_compute_image_binding = on; }
+			~ComputeBindingScope() { g_compute_image_binding = false; }
+		} compute_binding_scope(pipeline_bind_point == vk::PipelineBindPoint::eCompute);
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];

@@ -112,6 +112,12 @@ void TimelineEvent(char kind, uint64_t arg) {
 	}
 }
 
+// The game threads' waits join the timeline (Common::WaitStats::g_timeline_hook).
+static const bool g_timeline_hook_set = [] {
+	Common::WaitStats::g_timeline_hook = &TimelineEvent;
+	return true;
+}();
+
 static void RecordCpWrite(uint64_t dst, uint64_t src, uint32_t bytes, uint32_t kind) {
 	if (g_ud_patch_check) {
 		g_cp_write_ring[g_cp_write_head++ & 255u] = {dst, src, bytes, kind};
@@ -945,7 +951,12 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
-	TimelineEvent('S', submission.queue_id);
+	TimelineEvent('S', submission.queue_id | (static_cast<uint64_t>(gettid()) << 8u));
+	if (Common::WaitStats::On()) {
+		if (auto* slot = Common::WaitStats::Slot(); slot != nullptr) {
+			slot->submits.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	if (m_draw_prep != nullptr) {

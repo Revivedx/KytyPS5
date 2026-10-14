@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -738,6 +739,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			buffer.DeferDispatchBarrier(m_chain_queue);
 		} else {
 			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			g_compute_barrier_epoch++; // KYTY_SKIP_COVERED_BARRIERS
 		}
 		m_context.GetCommandScheduler().ProfileMark(0, program.shader_hash, 0);
 	} while (recovery.Retry());
@@ -857,6 +859,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		FlushShadowWritebacks(vk_buffer);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		g_compute_barrier_epoch++; // KYTY_SKIP_COVERED_BARRIERS
 		m_context.GetCommandScheduler().ProfileMark(1, program.shader_hash, 0);
 	} while (recovery.Retry());
 	ResetBindings();

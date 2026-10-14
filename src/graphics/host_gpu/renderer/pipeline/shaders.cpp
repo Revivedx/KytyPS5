@@ -22,11 +22,13 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -244,6 +246,66 @@ GraphicsPipelineBuild::~GraphicsPipelineBuild() {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// KYTY_LOCAL_HACK KYTY_EXEC_STATS=<hex hash,...> (environment, research 2026-10-13): pipelines of
+// these guest programs are created with VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR and the
+// driver's per-executable statistics are printed ("Exec stats").
+static bool ExecStatsWanted(const GraphicContext& graphics, uint64_t hash) {
+	static const std::string list = [] {
+		const char* value = std::getenv("KYTY_EXEC_STATS");
+		return std::string(value != nullptr ? value : "");
+	}();
+	if (!graphics.pipeline_exec_stats_enabled || list.empty() || hash == 0) {
+		return false;
+	}
+	char text[17];
+	std::snprintf(text, sizeof(text), "%016" PRIx64, hash);
+	return list == "all" || list.find(text) != std::string::npos;
+}
+
+static void PrintExecStats(vk::Device device, vk::Pipeline pipeline, const char* kind, uint64_t a,
+                           uint64_t b) {
+	vk::PipelineInfoKHR info {};
+	info.pipeline  = pipeline;
+	uint32_t count = 0;
+	if (device.getPipelineExecutablePropertiesKHR(&info, &count, nullptr) != vk::Result::eSuccess) {
+		return;
+	}
+	std::vector<vk::PipelineExecutablePropertiesKHR> props(count);
+	if (device.getPipelineExecutablePropertiesKHR(&info, &count, props.data()) != vk::Result::eSuccess) {
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		vk::PipelineExecutableInfoKHR exec {};
+		exec.pipeline        = pipeline;
+		exec.executableIndex = i;
+		uint32_t n           = 0;
+		if (device.getPipelineExecutableStatisticsKHR(&exec, &n, nullptr) != vk::Result::eSuccess) {
+			continue;
+		}
+		std::vector<vk::PipelineExecutableStatisticKHR> stats(n);
+		if (device.getPipelineExecutableStatisticsKHR(&exec, &n, stats.data()) != vk::Result::eSuccess) {
+			continue;
+		}
+		std::string line;
+		for (const auto& stat: stats) {
+			line += " ";
+			line += stat.name.data();
+			line += "=";
+			switch (stat.format) {
+				case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+					line += stat.value.b32 != 0 ? "1" : "0";
+					break;
+				case vk::PipelineExecutableStatisticFormatKHR::eInt64: line += std::to_string(stat.value.i64); break;
+				case vk::PipelineExecutableStatisticFormatKHR::eUint64: line += std::to_string(stat.value.u64); break;
+				case vk::PipelineExecutableStatisticFormatKHR::eFloat64: line += std::to_string(stat.value.f64); break;
+			}
+		}
+		std::printf("Exec stats %s %016" PRIx64 "/%016" PRIx64 " [%s]:%s\n", kind, a, b,
+		            props[i].name.data(), line.c_str());
+	}
+	std::fflush(stdout);
+}
+
 std::unique_ptr<GraphicsPipelineBuild>
 PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                         const PipelineRenderingState&          rendering,
@@ -583,6 +645,9 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	                             : 0;
 	build.vs_hash = vs_input_info.stage.program->shader_hash;
 	build.ps_hash = ps_hash;
+	if (ExecStatsWanted(graphics, build.vs_hash) || ExecStatsWanted(graphics, build.ps_hash)) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
@@ -613,6 +678,10 @@ vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::Pipeli
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(*pipeline));
+	}
+	if (result == vk::Result::eSuccess &&
+	    (build.pipeline_info.flags & vk::PipelineCreateFlagBits::eCaptureStatisticsKHR)) {
+		PrintExecStats(build.device, *pipeline, "graphics", build.vs_hash, build.ps_hash);
 	}
 	return result;
 }
@@ -685,6 +754,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	const auto cs_hash     = input_info.stage.program->shader_hash;
+	const bool exec_stats  = ExecStatsWanted(graphics, cs_hash);
+	if (exec_stats) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -697,6 +771,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (exec_stats) {
+		PrintExecStats(graphics.device, pipeline.pipeline, "compute", cs_hash, 0);
+	}
 }
 
 } // namespace Libs::Graphics

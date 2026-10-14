@@ -721,6 +721,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	graphics.calibrated_timestamps_enabled =
 	    HasExtension(device_extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR exec_properties {};
+	if (HasExtension(device_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+		exec_properties.pipelineExecutableInfo = VK_TRUE;
+		exec_properties.pNext                  = const_cast<void*>(create_info.pNext);
+		create_info.pNext                      = &exec_properties;
+		graphics.pipeline_exec_stats_enabled   = true;
+	}
 	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
 	if (HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
 		vk::PhysicalDeviceShaderClockFeaturesKHR supported_clock {};
@@ -1197,6 +1204,12 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+		}
+		// KYTY_LOCAL_HACK KYTY_EXEC_STATS=<hex hash,...> (environment, research 2026-10-13): the
+		// driver's statistics (registers, waves, instructions, spills) of these programs' pipelines.
+		if (std::getenv("KYTY_EXEC_STATS") != nullptr &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,

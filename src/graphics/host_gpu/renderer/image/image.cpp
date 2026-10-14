@@ -168,6 +168,38 @@ void TransitStats(const std::vector<vk::ImageMemoryBarrier2>& barriers) {
 
 } // namespace
 
+thread_local bool g_compute_image_binding = false;
+uint64_t          g_compute_barrier_epoch = 0;
+
+namespace {
+
+// KYTY_LOCAL_HACK KYTY_SKIP_COVERED_BARRIERS (live, default 0): a whole-image barrier that keeps
+// GENERAL layout is skipped when the image's previous access was declared for a guest dispatch
+// that has since been followed by its ShaderAccessBarrier (compute shader reads and writes ->
+// all commands, memory reads and writes): that barrier already orders and makes visible
+// whatever the dispatch did, for any later access. Wolverine records ~1100 image barriers per
+// frame, about half GENERAL -> GENERAL hazard barriers after storage-image dispatches (ts1).
+bool SkipCoveredBarriers() {
+	static auto& on = Common::LiveSwitches::Get("KYTY_SKIP_COVERED_BARRIERS", 0);
+	return on.load(std::memory_order_relaxed) != 0;
+}
+
+void NoteCoveredSkip(bool skipped) {
+	static uint64_t skips = 0, kept = 0;
+	static auto     report = std::chrono::steady_clock::now();
+	(skipped ? skips : kept)++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - report >= std::chrono::seconds(5)) {
+		::printf("Covered image barriers (5 s): %llu skipped, %llu recorded (whole image)\n",
+		         static_cast<unsigned long long>(skips), static_cast<unsigned long long>(kept));
+		std::fflush(stdout);
+		skips = kept = 0;
+		report = now;
+	}
+}
+
+} // namespace
+
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	switch (format) {
 		case vk::Format::eD16Unorm:
@@ -245,13 +277,29 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		if (!partial) {
 			subresource_states.clear();
 		}
+		backing.compute_access_epoch = UINT64_MAX;
 	} else {
 		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
 		                                vk::AccessFlagBits2::eShaderWrite |
 		                                vk::AccessFlagBits2::eMemoryWrite;
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
+		const bool     covered        = state.layout == destination_layout &&
+		                     destination_layout == vk::ImageLayout::eGeneral &&
+		                     backing.compute_access_epoch < g_compute_barrier_epoch;
+		// The access declared now: a later barrier may be skipped only after this guest
+		// dispatch's own ShaderAccessBarrier.
+		backing.compute_access_epoch =
+		    g_compute_image_binding ? g_compute_barrier_epoch : UINT64_MAX;
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
+			return {};
+		}
+		const bool skip_on = SkipCoveredBarriers();
+		if (skip_on) {
+			NoteCoveredSkip(covered);
+		}
+		if (covered && skip_on) {
+			state = {destination_stage, destination_access, destination_layout};
 			return {};
 		}
 

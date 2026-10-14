@@ -3,6 +3,7 @@
 
 #include "common/liveSwitches.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <unistd.h>
 
 // KYTY_LOCAL_HACK research: KYTY_WAIT_STATS=1 (live). Where the command processor (the GPU thread)
 // spends its wall time: each blocking point it can reach is a Scope; only the outermost scope on
@@ -55,6 +57,40 @@ inline thread_local uint32_t t_depth     = 0;
 // Other threads (the game's): wall time in the same scopes, summed over threads.
 inline std::array<std::atomic<uint64_t>, Count> g_other_ns {};
 inline std::array<std::atomic<uint64_t>, Count> g_other_calls {};
+
+// Research 2026-10-13: the same scopes per game thread (outer scopes and inner parts), plus the
+// guest submissions each thread enqueued: which thread's waits are on the frame's path.
+struct ThreadSlot {
+	std::atomic<uint32_t>                       tid {0};
+	std::array<std::atomic<uint64_t>, Count>    ns {};
+	std::atomic<uint64_t>                       submits {0};
+};
+inline std::array<ThreadSlot, 128> g_thread_slots {};
+inline thread_local ThreadSlot*     t_slot = nullptr;
+
+inline ThreadSlot* Slot() {
+	if (t_slot != nullptr) return t_slot;
+	const auto tid = static_cast<uint32_t>(gettid());
+	for (auto& slot: g_thread_slots) {
+		uint32_t expected = 0;
+		if (slot.tid.load(std::memory_order_relaxed) == tid ||
+		    slot.tid.compare_exchange_strong(expected, tid, std::memory_order_relaxed)) {
+			t_slot = &slot;
+			return t_slot;
+		}
+	}
+	return nullptr;
+}
+
+// Research 2026-10-13: KYTY_TIMELINE_N also records the game threads' outer waits ('X': arg = kind |
+// microseconds << 8 | tid << 32, stamped at the end of the wait); set by graphicsRun.cpp.
+inline void (*g_timeline_hook)(char, uint64_t) = nullptr;
+
+inline void NoteThread(uint32_t kind, uint64_t ns) {
+	if (auto* slot = Slot(); slot != nullptr) {
+		slot->ns[kind].fetch_add(ns, std::memory_order_relaxed);
+	}
+}
 
 struct State {
 	std::array<uint64_t, Count> ns {};
@@ -113,6 +149,50 @@ inline void Report() {
 		}
 	}
 	std::printf("\n");
+	// Per game thread: the 6 with the most outer-scope wait, their submissions and top kinds.
+	struct Row {
+		uint32_t                    tid;
+		uint64_t                    total;
+		uint64_t                    submits;
+		std::array<uint64_t, Count> ns;
+	};
+	std::array<Row, 128> rows {};
+	size_t               count = 0;
+	for (auto& slot: g_thread_slots) {
+		const auto tid = slot.tid.load(std::memory_order_relaxed);
+		if (tid == 0) continue;
+		Row row {tid, 0, slot.submits.exchange(0, std::memory_order_relaxed), {}};
+		for (uint32_t k = 0; k < Count; k++) {
+			row.ns[k] = slot.ns[k].exchange(0, std::memory_order_relaxed);
+			// Outer kinds only in the total (inner parts are a breakdown of them).
+			if (k <= CommandSync) row.total += row.ns[k];
+		}
+		if (row.total != 0 || row.submits != 0) rows[count++] = row;
+	}
+	std::sort(rows.begin(), rows.begin() + count, [](const Row& a, const Row& b) {
+		return a.total + a.submits * 1000000ull > b.total + b.submits * 1000000ull;
+	});
+	for (size_t i = 0; i < count && i < 6; i++) {
+		char  comm[32] = "?";
+		char  path[64];
+		std::snprintf(path, sizeof(path), "/proc/self/task/%u/comm", rows[i].tid);
+		if (FILE* f = std::fopen(path, "r"); f != nullptr) {
+			if (std::fgets(comm, sizeof(comm), f) != nullptr) {
+				for (char* c = comm; *c != 0; c++) {
+					if (*c == '\n') *c = 0;
+				}
+			}
+			std::fclose(f);
+		}
+		std::printf("  thread %u (%s): submits %" PRIu64 ", waits %.0f ms:", rows[i].tid, comm,
+		            rows[i].submits, static_cast<double>(rows[i].total) / 1e6);
+		for (uint32_t k = 0; k < Count; k++) {
+			if (rows[i].ns[k] >= 20000000ull) {
+				std::printf(" %s %.0f", names[k], static_cast<double>(rows[i].ns[k]) / 1e6);
+			}
+		}
+		std::printf("\n");
+	}
 	std::fflush(stdout);
 	s.ns     = {};
 	s.calls  = {};
@@ -134,12 +214,16 @@ public:
 			return;
 		}
 		if (!t_cp_thread) {
-			g_other_ns[m_kind].fetch_add(static_cast<uint64_t>(
-			                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-			                                     std::chrono::steady_clock::now() - m_start)
-			                                     .count()),
-			                             std::memory_order_relaxed);
+			const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                          std::chrono::steady_clock::now() - m_start)
+			                                          .count());
+			g_other_ns[m_kind].fetch_add(ns, std::memory_order_relaxed);
 			g_other_calls[m_kind].fetch_add(1, std::memory_order_relaxed);
+			NoteThread(m_kind, ns);
+			if (g_timeline_hook != nullptr) {
+				g_timeline_hook('X', m_kind | (std::min<uint64_t>(ns / 1000u, 0xffffffu) << 8u) |
+				                         (static_cast<uint64_t>(gettid()) << 32u));
+			}
 			return;
 		}
 		auto& s = GetState();
@@ -169,12 +253,12 @@ public:
 	}
 	~Inner() {
 		if (m_on) {
-			g_other_ns[m_kind].fetch_add(static_cast<uint64_t>(
-			                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-			                                     std::chrono::steady_clock::now() - m_start)
-			                                     .count()),
-			                             std::memory_order_relaxed);
+			const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                          std::chrono::steady_clock::now() - m_start)
+			                                          .count());
+			g_other_ns[m_kind].fetch_add(ns, std::memory_order_relaxed);
 			g_other_calls[m_kind].fetch_add(1, std::memory_order_relaxed);
+			NoteThread(m_kind, ns);
 		}
 	}
 	Inner(const Inner&)            = delete;
