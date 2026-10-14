@@ -21,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -544,11 +545,20 @@ static void ShaderGetStaticInputInfoPS(
 	if ((active_inputs & 0x00000004u) != 0) {
 		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
 	}
+	// KYTY_LOCAL_HACK KYTY_CUSTOM_F16_INTERP (env, default 1, 2026-10-14): 16-bit custom inputs are
+	// custom too. Their shaders interpolate the raw per-vertex halves themselves (V_INTERP_MOV P0 /
+	// P10 / P20 + V_FMA_MIX: P0 (1 - i - j) + P1 i + P2 j); as smooth inputs they got f32 deltas of
+	// the packed halves (garbage): Wolverine's particle lighting pass (PS 29290302144ad0c2) projected
+	// its world positions off screen, found no lights and lit the smoke black. 0 = the old exclusion.
+	static const bool custom_f16 = [] {
+		const char* value = std::getenv("KYTY_CUSTOM_F16_INTERP");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
 	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num &&
 	                     i < ShaderMappedData::MaxInputSemantics;
 	     i++) {
 		const auto& semantic = data.input_semantics_snapshot[i];
-		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
+		if (semantic.is_custom != 0 && (semantic.is_f16 == 0 || custom_f16)) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
 	}
