@@ -252,6 +252,15 @@ void DefineBindlessImages(EmitterState& state) {
 		           image.dimension == ImageDimension::Dim2DMsaaArray) {
 			binding = IR::BindlessImages2DArray;
 		}
+		// A 2D storage image (IMAGE_LOAD / IMAGE_STORE through a heap T#) gets the storage array: a
+		// storage-typed variable aliasing the sampled array's binding read garbage and lost its
+		// stores (the explosion PS's accumulation buffers). Other storage shapes keep the old
+		// aliasing for now. KYTY_BINDLESS_STORAGE=0 restores it for all (BindlessBindings.h).
+		if (IR::BindlessStorageEnabled() && image.resource_class == IR::ImageResourceClass::Storage &&
+		    !image.cube && image.dimension == ImageDimension::Dim2D) {
+			binding = IR::BindlessStorageImages2D;
+			state.builder.RequireCapability(spv::CapabilityStorageImageArrayNonUniformIndexing);
+		}
 		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray, type);
 		const auto variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassUniformConstant, array),

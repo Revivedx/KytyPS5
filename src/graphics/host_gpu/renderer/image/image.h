@@ -173,6 +173,9 @@ public:
 	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
 	// table (TextureCache::on_bindless_unregister) to repoint the slot.
 	bool             bindless_pinned = false;
+	// A bindless storage slot writes it (BindlessTable::StorageImages2D): it lives in the general
+	// layout, and its sampled bindless slots are written with that layout too.
+	bool             bindless_general = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

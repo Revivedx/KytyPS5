@@ -48,6 +48,8 @@
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <set>
+#include <tuple>
 #include <span>
 #include <vector>
 
@@ -949,6 +951,12 @@ static uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& re
 	    resource.dimension == ImageDimension::Dim2DMsaaArray) {
 		return ShaderRecompiler::IR::BindlessImages2DArray;
 	}
+	// The emitter's choice (spirvEmitterModule.cpp DefineBindlessImages).
+	if (ShaderRecompiler::IR::BindlessStorageEnabled() &&
+	    resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage &&
+	    resource.dimension == ImageDimension::Dim2D) {
+		return ShaderRecompiler::IR::BindlessStorageImages2D;
+	}
 	return ShaderRecompiler::IR::BindlessImages2D;
 }
 
@@ -964,7 +972,8 @@ static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t
 	switch (descriptor.Type()) {
 		case Prospero::ImageType::kColor2D:
 			return binding == ShaderRecompiler::IR::BindlessImages2D ||
-			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray ||
+			       binding == ShaderRecompiler::IR::BindlessStorageImages2D;
 		case Prospero::ImageType::kColor2DArray:
 			return binding == ShaderRecompiler::IR::BindlessImages2D ||
 			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
@@ -1003,7 +1012,33 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 	static uint64_t        outcome[7] {}; // ok, read, compat, image, view, slot, replaced
 	static auto            stats_at = std::chrono::steady_clock::now();
 	int                    reason   = 0;
-	const auto             report   = [&] {
+	// KYTY_BINDLESS_KEY_LOG=<key>[,<key>...] | all (hex, env; research 2026-10-12 fog slabs,
+	// 2026-10-14 black smoke): logs every resolve of those keys (any heap) with the T# it read,
+	// and its outcome.
+	static const std::pair<bool, std::vector<uint32_t>> key_log = [] {
+		std::pair<bool, std::vector<uint32_t>> result {false, {}};
+		const char* text = std::getenv("KYTY_BINDLESS_KEY_LOG");
+		if (text != nullptr && std::strcmp(text, "all") == 0) {
+			result.first = true;
+			return result;
+		}
+		for (const char* p = text; p != nullptr && *p != 0;) {
+			char* end = nullptr;
+			result.second.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+			if (end == p) break;
+			p = *end == ',' ? end + 1 : end;
+		}
+		return result;
+	}();
+	const bool logged = key_log.first || std::find(key_log.second.begin(), key_log.second.end(),
+	                                               key) != key_log.second.end();
+	const auto report = [&] {
+		if (logged) {
+			::printf("Bindless key result: frame=%" PRIu64 " heap=0x%" PRIx64 " binding=%u key=0x%x "
+			         "outcome=%d (0 ok, 1 read, 2 compat, 3 image, 4 view, 5 slot, 6 replaced)\n",
+			         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed), heap.base,
+			         heap.binding, key, reason);
+		}
         if (stats_on.load(std::memory_order_relaxed) == 0) {
             return;
         }
@@ -1041,23 +1076,9 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 		std::copy_n(value.dwords.data(), 8, heap.descriptors[key].begin());
 	}
 	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	// KYTY_BINDLESS_KEY_LOG=<key>[,<key>...] (hex, env; research 2026-10-12 fog slabs): logs every
-	// resolve of those keys (any heap) with the T# it read.
+	// KYTY_BINDLESS_KEY_LOG (see key_log above): the T# this resolve read.
 	{
-		static const std::vector<uint32_t> keys = [] {
-			std::vector<uint32_t> list;
-			if (const char* text = std::getenv("KYTY_BINDLESS_KEY_LOG"); text != nullptr) {
-				const char* p = text;
-				while (*p != 0) {
-					char* end = nullptr;
-					list.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
-					if (end == p) break;
-					p = *end == ',' ? end + 1 : end;
-				}
-			}
-			return list;
-		}();
-		if (!keys.empty() && std::find(keys.begin(), keys.end(), key) != keys.end()) {
+		if (logged) {
 			::printf("Bindless key: frame=%" PRIu64 " path=%d replace=%d heap=0x%" PRIx64 " binding=%u key=0x%x "
 			         "base=0x%" PRIx64 " type=%u fmt=%u %ux%u words=%08x %08x %08x %08x %08x %08x %08x %08x\n",
 			         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
@@ -1098,6 +1119,25 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 			         value.dwords[3], value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
 		}
 		reason = 2;
+		// KYTY_BINDLESS_FE_PENDING (live, default 1, 2026-10-14): a T# that still holds the title's
+		// 0xfe fill of not-yet-loaded memory names a texture not streamed in yet, not an
+		// incompatible one. The key stays pending (shaders sample the pending placeholder and flag
+		// the key, so shader feedback resolves it again) instead of settling on the placeholder
+		// until a watched write of its entry. Settled, Wolverine's effect sprites (explosion smoke,
+		// tracers: keys filled at load) stayed on the placeholder: black smoke squares.
+		static auto& fe_pending = Common::LiveSwitches::Get("KYTY_BINDLESS_FE_PENDING", 1);
+		const bool   unloaded   = std::all_of(value.dwords.begin(), value.dwords.begin() + 8,
+		                                      [](uint32_t word) { return word == 0xfefefefeu; });
+		if (unloaded && fe_pending.load(std::memory_order_relaxed) != 0) {
+			if (replace) {
+				release_old();
+			}
+			heap.settled[key]     = 0;
+			heap.descriptors[key] = {};
+			table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+			report();
+			return false;
+		}
 		if (replace) {
 			release_old();
 			table.SetTranslation(heap, key, 0u);
@@ -1120,8 +1160,11 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 		reason = slot == 0 ? 5 : 4;
 		return fail();
 	}
-	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
+	// A storage slot, and every slot of an image a storage slot writes, uses the general layout.
+	const bool storage_slot = heap.binding == ShaderRecompiler::IR::BindlessStorageImages2D;
+	const auto layout       = storage_slot || image->bindless_general ? vk::ImageLayout::eGeneral
+	                          : image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                                                  : vk::ImageLayout::eShaderReadOnlyOptimal;
 	// KYTY_BINDLESS_FE_CHECK=<n> (live, research 2026-10-11 white/flat textures): logs n resolved
 	// keys whose accessible mips (from base level + min LOD on) start with the title's 0xfe fill
 	// of not-yet-loaded memory in guest memory.
@@ -1177,6 +1220,36 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 	heap.resolved.push_back(binding.image_id);
 	table.AddImageReference(binding.image_id, heap, key);
 	table.SetTranslation(heap, key, slot);
+	if (storage_slot && !image->bindless_general) {
+		// From now on the image stays in the general layout: its sampled slots move to new slots
+		// written with that layout (the old ones are freed by tick, as a replaced key's).
+		image->bindless_general = true;
+		for (const auto& [other, other_key]: table.ImageReferences(binding.image_id)) {
+			if (other->binding == ShaderRecompiler::IR::BindlessStorageImages2D ||
+			    other->slots[other_key] == 0) {
+				continue;
+			}
+			const auto old_slot = other->slots[other_key];
+			const auto old_view = table.SlotView(other->binding, old_slot);
+			const auto new_slot = old_view != nullptr ? table.AllocateSlot(other->binding) : 0u;
+			if (new_slot == 0) {
+				continue;
+			}
+			table.WriteSlot(other->binding, new_slot, old_view, vk::ImageLayout::eGeneral);
+			table.FreeSlot(other->binding, old_slot, false);
+			other->slots[other_key] = new_slot;
+			table.SetTranslation(*other, other_key, new_slot);
+		}
+		NoteBindlessStateChange(*image);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 32) {
+			::printf("Bindless storage: image 0x%" PRIx64 " %ux%u fmt %d now general (heap 0x%" PRIx64
+			         " key %u slot %u)\n",
+			         image->info.data.address, image->info.extent.width, image->info.extent.height,
+			         static_cast<int>(image->info.pixel_format), heap.base, key, slot);
+			std::fflush(stdout);
+		}
+	}
 	reason = replace ? 6 : 0;
 	report();
 	return true;
@@ -1594,6 +1667,22 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 				         heap->base, heap->table_offset);
 			} else {
 				table.WatchHeap(*heap);
+			}
+		}
+		// KYTY_BINDLESS_PATCH_LOG=<n> (live, research 2026-10-14 black smoke): logs the first n
+		// distinct (heap, binding, region, patched count, shader) a draw binds.
+		static auto& patch_log = Common::LiveSwitches::Get("KYTY_BINDLESS_PATCH_LOG", 0);
+		if (patch_log.load(std::memory_order_relaxed) > 0) {
+			static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint64_t>> seen;
+			const auto count = std::min(entries, heap->entries);
+			if (seen.emplace(heap->base + heap->table_offset, heap->binding, heap->region, count,
+			                 program.shader_hash)
+			        .second) {
+				patch_log.store(patch_log.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+				::printf("Bindless patch: shader=0x%016" PRIx64 " heap=0x%" PRIx64 "+0x%x binding=%u region=%u "
+				         "count=%u (draw entries %u, heap entries %u, guest %u)\n",
+				         program.shader_hash, heap->base, heap->table_offset, heap->binding, heap->region,
+				         count, entries, heap->entries, heap->guest_entries);
 			}
 		}
 		prepared.bindless_patches.push_back(
@@ -2045,10 +2134,28 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			            heap->checked_count <= resolved.size()
 			        ? heap->checked_count
 			        : 0;
+			// A storage heap's images are written by this draw: general layout, read and write
+			// access every draw (the barrier after the previous writer), and the sampled heaps check
+			// their images again at the next draw (the barrier before the next reader).
+			const bool storage_heap = heap->binding == ShaderRecompiler::IR::BindlessStorageImages2D;
+			if (storage_heap) {
+				begin = 0;
+			}
 			for (size_t i = begin; i < resolved.size(); i++) {
 				auto* image = m_context.GetTextureCache().m_slot_images.try_get(resolved[i]);
 				if (image == nullptr || !image->registered || image->binding.is_target ||
 				    image->info.data.Empty()) {
+					continue;
+				}
+				if (storage_heap || image->bindless_general) {
+					image->Transit(vk::ImageLayout::eGeneral,
+					               storage_heap ? vk::AccessFlagBits2::eShaderRead |
+					                                  vk::AccessFlagBits2::eShaderWrite
+					                            : vk::AccessFlagBits2::eShaderRead,
+					               {}, vk_buffer);
+					if (storage_heap) {
+						NoteBindlessStateChange(*image);
+					}
 					continue;
 				}
 				const auto layout = image->info.IsDepth()

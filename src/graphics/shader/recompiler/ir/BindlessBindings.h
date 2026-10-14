@@ -20,6 +20,19 @@ inline constexpr uint32_t BindlessTranslation    = 4;
 inline constexpr uint32_t BindlessFeedback       = 5;
 // Samplers mirrored from guest sampler heaps (16-byte S# records); slot 0 is the default sampler.
 inline constexpr uint32_t BindlessSamplers       = 6;
+// KYTY_LOCAL_HACK (2026-10-14): 2D storage images a shader reads and writes through a heap T# (IMAGE_LOAD /
+// IMAGE_STORE with a dynamic key; Wolverine's explosion PS 2464e975d88b7f15 accumulates into one inside a POPS
+// section). Their own heaps and slots: a storage view, in the general layout.
+inline constexpr uint32_t BindlessStorageImages2D = 7;
+// KYTY_BINDLESS_STORAGE (live, default 1; environment, read once): 0 = the old aliasing, a storage image
+// through a heap T# uses the sampled 2D array's binding (A/B and safety switch).
+inline bool BindlessStorageEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_STORAGE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 // A translation entry for a key whose texture is not resident yet; the shader samples slot 0.
 inline constexpr uint32_t BindlessPending        = 0xffffffffu;
 // Feedback flags a shader stores per key it samples: the texture is pending, or resident and used.

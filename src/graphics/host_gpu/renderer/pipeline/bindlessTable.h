@@ -49,6 +49,9 @@ public:
 		Translation   = 4,
 		Feedback      = 5,
 		Samplers      = 6,
+		// Storage views of 2D images written through a heap T# (BindlessBindings.h); slots 0-3 hold
+		// a storage placeholder, its own slot list, the general layout.
+		StorageImages2D = 7,
 	};
 	static_assert(Images2D == ShaderRecompiler::IR::BindlessImages2D &&
 	              Images2DArray == ShaderRecompiler::IR::BindlessImages2DArray &&
@@ -56,7 +59,9 @@ public:
 	              Images3D == ShaderRecompiler::IR::BindlessImages3D &&
 	              Translation == ShaderRecompiler::IR::BindlessTranslation &&
 	              Feedback == ShaderRecompiler::IR::BindlessFeedback &&
-	              Samplers == ShaderRecompiler::IR::BindlessSamplers);
+	              Samplers == ShaderRecompiler::IR::BindlessSamplers &&
+	              StorageImages2D == ShaderRecompiler::IR::BindlessStorageImages2D);
+	static constexpr uint32_t MaxStorageImages = 1024;
 	static constexpr uint32_t ImageArrays        = 4;
 	// Slots 0-2: not resident (grey), outside the heap (red), pending (blue); slot 3 (green): what a
 	// slot of an image the texture cache dropped is repointed to (KYTY_BINDLESS_DEBUG_COLORS).
@@ -118,8 +123,20 @@ public:
 	// 0 when the array is full. Slots of dropped images are reused once the GPU is past them.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
 	// Slots handed out so far and slots waiting in the free list, per image array.
-	[[nodiscard]] uint32_t SlotsUsed(uint32_t binding) const noexcept { return m_next_slot[binding]; }
-	[[nodiscard]] size_t   SlotsFree(uint32_t binding) const noexcept { return m_free_slots[binding].size(); }
+	[[nodiscard]] uint32_t SlotsUsed(uint32_t binding) const noexcept {
+		return binding == StorageImages2D ? m_storage_next_slot : m_next_slot[binding];
+	}
+	[[nodiscard]] size_t SlotsFree(uint32_t binding) const noexcept { return FreeList(binding).size(); }
+	// The view the slot was last written with (sampled arrays only; null otherwise).
+	[[nodiscard]] vk::ImageView SlotView(uint32_t binding, uint32_t slot) const noexcept {
+		return binding < ImageArrays && slot < m_slot_views[binding].size() ? m_slot_views[binding][slot]
+		                                                                    : nullptr;
+	}
+	// The sampled keys of an image (heap, key), for moving their slots to another layout.
+	[[nodiscard]] std::vector<std::pair<Heap*, uint32_t>> ImageReferences(ImageId id) const {
+		const auto it = m_image_refs.find(ImageKey(id));
+		return it != m_image_refs.end() ? it->second : std::vector<std::pair<Heap*, uint32_t>> {};
+	}
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
 	void SetTranslation(const Heap& heap, uint32_t key, uint32_t slot);
@@ -260,7 +277,22 @@ private:
 		bool     placeholder = false; // a dropped image's slot: repoint it before reuse
 	};
 	std::vector<QueuedFree> m_queued_frees; // released with the next FlushTranslations
+public:
 	void FreeSlot(uint32_t binding, uint32_t slot, bool placeholder);
+private:
+	// StorageImages2D: slots handed out, free list, and the 1x1 storage placeholder of slots 0-3.
+	uint32_t                                     m_storage_images    = 0;
+	uint32_t                                     m_storage_next_slot = PlaceholderColors;
+	std::deque<std::pair<uint64_t, uint32_t>>    m_storage_free_slots;
+	VulkanImage                                  m_storage_placeholder;
+	vk::ImageView                                m_storage_placeholder_view = nullptr;
+	[[nodiscard]] std::deque<std::pair<uint64_t, uint32_t>>& FreeList(uint32_t binding) {
+		return binding == StorageImages2D ? m_storage_free_slots : m_free_slots[binding];
+	}
+	[[nodiscard]] const std::deque<std::pair<uint64_t, uint32_t>>& FreeList(uint32_t binding) const {
+		return binding == StorageImages2D ? m_storage_free_slots : m_free_slots[binding];
+	}
+	void CreateStoragePlaceholder();
 	void ReleaseQueuedSlots();
 	std::vector<std::pair<Heap*, uint32_t>>    m_eager_keys;
 	std::unique_ptr<Buffer> m_feedback;

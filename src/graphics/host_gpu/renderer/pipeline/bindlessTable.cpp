@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 #include <string>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <tuple>
 
@@ -58,7 +59,8 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	// A device without update-after-bind samplers still gets a one-entry array, holding the
 	// default sampler, so every bindless pipeline sees the same layout.
 	m_samplers_per_array = std::min(MaxSamplers, graphics.bindless_max_samplers);
-	const std::array<vk::DescriptorSetLayoutBinding, 7> bindings {{
+	m_storage_images     = MaxStorageImages;
+	const std::array<vk::DescriptorSetLayoutBinding, 8> bindings {{
 	    {Images2D, vk::DescriptorType::eSampledImage, m_images_per_array, vk::ShaderStageFlagBits::eAll,
 	     nullptr},
 	    {Images2DArray, vk::DescriptorType::eSampledImage, m_images_per_array,
@@ -71,9 +73,12 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	    {Feedback, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll, nullptr},
 	    {Samplers, vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u),
 	     vk::ShaderStageFlagBits::eAll, nullptr},
+	    {StorageImages2D, vk::DescriptorType::eStorageImage, m_storage_images,
+	     vk::ShaderStageFlagBits::eAll, nullptr},
 	}};
-	const std::array<vk::DescriptorBindingFlags, 7> binding_flags {
-	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags, image_flags};
+	const std::array<vk::DescriptorBindingFlags, 8> binding_flags {
+	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags, image_flags,
+	    image_flags};
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
 	flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
 	flags_info.pBindingFlags = binding_flags.data();
@@ -85,10 +90,11 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout),
 	                     "create bindless descriptor layout");
 
-	const std::array<vk::DescriptorPoolSize, 3> sizes {{
+	const std::array<vk::DescriptorPoolSize, 4> sizes {{
 	    {vk::DescriptorType::eSampledImage, m_images_per_array * ImageArrays},
 	    {vk::DescriptorType::eStorageBuffer, 2},
 	    {vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u)},
+	    {vk::DescriptorType::eStorageImage, m_storage_images},
 	}};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
@@ -378,9 +384,18 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 	const std::array<vk::ClearColorValue, PlaceholderColors> colors {
 	    color(1.0f, 0.0f, 1.0f), color(0.8f, 0.1f, 0.1f), color(0.1f, 0.2f, 0.8f),
 	    color(0.1f, 0.8f, 0.1f)};
+	// KYTY_BINDLESS_DEBUG_COLORS=2 (research 2026-10-14): one colour per array instead, whatever the
+	// slot: 2D magenta, 2D array yellow, cube cyan, 3D white (the storage placeholder is orange), to
+	// tell which of a shader's bindless textures is missing.
+	const char* debug_mode = std::getenv("KYTY_BINDLESS_DEBUG_COLORS");
+	const bool  per_array  = debug_mode != nullptr && std::strcmp(debug_mode, "2") == 0;
+	const std::array<vk::ClearColorValue, ImageArrays> array_colors {
+	    color(1.0f, 0.0f, 1.0f), color(1.0f, 1.0f, 0.0f), color(0.0f, 1.0f, 1.0f),
+	    color(1.0f, 1.0f, 1.0f)};
 	for (uint32_t i = 0; i < Placeholders; i++) {
 		command.clearColorImage(m_placeholders[i].image, vk::ImageLayout::eTransferDstOptimal,
-		                        &colors[i / ImageArrays], 1, &to_transfer[i].subresourceRange);
+		                        per_array ? &array_colors[i % ImageArrays] : &colors[i / ImageArrays], 1,
+		                        &to_transfer[i].subresourceRange);
 	}
 	// translation[0], the entry of keys outside their heap, is the red slot.
 	command.fillBuffer(m_translation->Handle(), 4, VK_WHOLE_SIZE, 0u);
@@ -436,6 +451,102 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 		writes[i].pImageInfo      = &infos[i];
 	}
 	m_graphics.device.updateDescriptorSets(Placeholders, writes.data(), 0, nullptr);
+	CreateStoragePlaceholder();
+}
+
+// Slots 0-3 of StorageImages2D: one 1x1 RGBA16F storage image in the general layout, transparent
+// black (magenta with KYTY_BINDLESS_DEBUG_COLORS). Loads of a key without a resident image read it,
+// stores to it are lost, as on the sampled arrays' placeholders.
+void BindlessTable::CreateStoragePlaceholder() {
+	vk::ImageCreateInfo info {};
+	info.imageType     = vk::ImageType::e2D;
+	info.format        = vk::Format::eR16G16B16A16Sfloat;
+	info.extent        = vk::Extent3D {1, 1, 1};
+	info.mipLevels     = 1;
+	info.arrayLayers   = 1;
+	info.samples       = vk::SampleCountFlagBits::e1;
+	info.tiling        = vk::ImageTiling::eOptimal;
+	info.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst;
+	info.initialLayout = vk::ImageLayout::eUndefined;
+	EXIT_IF(!m_graphics.CreateImage(info, m_storage_placeholder));
+	vk::ImageViewCreateInfo view {};
+	view.image            = m_storage_placeholder.image;
+	view.viewType         = vk::ImageViewType::e2D;
+	view.format           = info.format;
+	view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	RequireVulkanSuccess(m_graphics.device.createImageView(&view, nullptr, &m_storage_placeholder_view),
+	                     "create bindless storage placeholder view");
+
+	vk::CommandPoolCreateInfo pool_info {};
+	pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient;
+	pool_info.queueFamilyIndex = m_graphics.queue_family;
+	vk::CommandPool pool       = nullptr;
+	RequireVulkanSuccess(m_graphics.device.createCommandPool(&pool_info, nullptr, &pool),
+	                     "create bindless storage init pool");
+	vk::CommandBufferAllocateInfo allocate {};
+	allocate.commandPool        = pool;
+	allocate.level              = vk::CommandBufferLevel::ePrimary;
+	allocate.commandBufferCount = 1;
+	vk::CommandBuffer command   = nullptr;
+	RequireVulkanSuccess(m_graphics.device.allocateCommandBuffers(&allocate, &command),
+	                     "allocate bindless storage init command buffer");
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(command.begin(&begin), "begin bindless storage init command buffer");
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::ImageMemoryBarrier to_general {};
+	to_general.srcAccessMask       = {};
+	to_general.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	to_general.oldLayout           = vk::ImageLayout::eUndefined;
+	to_general.newLayout           = vk::ImageLayout::eGeneral;
+	to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_general.image               = m_storage_placeholder.image;
+	to_general.subresourceRange    = range;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer,
+	                        {}, 0, nullptr, 0, nullptr, 1, &to_general);
+	const char* debug_mode   = std::getenv("KYTY_BINDLESS_DEBUG_COLORS");
+	const bool  debug_colors = debug_mode != nullptr;
+	const bool  per_array    = debug_colors && std::strcmp(debug_mode, "2") == 0; // orange
+	const vk::ClearColorValue color {
+	    std::array<float, 4> {debug_colors ? 1.0f : 0.0f, per_array ? 0.5f : 0.0f,
+	                          debug_colors && !per_array ? 1.0f : 0.0f, debug_colors ? 1.0f : 0.0f}};
+	command.clearColorImage(m_storage_placeholder.image, vk::ImageLayout::eGeneral, &color, 1, &range);
+	auto ready          = to_general;
+	ready.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	ready.oldLayout     = vk::ImageLayout::eGeneral;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                        {}, 0, nullptr, 0, nullptr, 1, &ready);
+	RequireVulkanSuccess(command.end(), "end bindless storage init command buffer");
+	vk::FenceCreateInfo fence_info {};
+	vk::Fence           fence = nullptr;
+	RequireVulkanSuccess(m_graphics.device.createFence(&fence_info, nullptr, &fence),
+	                     "create bindless storage init fence");
+	vk::SubmitInfo submit {};
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &command;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		RequireVulkanSuccess(m_graphics.queue.submit(1, &submit, fence), "submit bindless storage init");
+	}
+	RequireVulkanSuccess(m_graphics.device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX),
+	                     "wait for bindless storage init");
+	m_graphics.device.destroyFence(fence, nullptr);
+	m_graphics.device.destroyCommandPool(pool, nullptr);
+
+	std::array<vk::DescriptorImageInfo, PlaceholderColors> infos {};
+	std::array<vk::WriteDescriptorSet, PlaceholderColors> writes {};
+	for (uint32_t i = 0; i < PlaceholderColors; i++) {
+		infos[i]                  = {nullptr, m_storage_placeholder_view, vk::ImageLayout::eGeneral};
+		writes[i].dstSet          = m_set;
+		writes[i].dstBinding      = StorageImages2D;
+		writes[i].dstArrayElement = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo      = &infos[i];
+	}
+	m_graphics.device.updateDescriptorSets(PlaceholderColors, writes.data(), 0, nullptr);
 }
 
 BindlessTable::~BindlessTable() {
@@ -446,6 +557,12 @@ BindlessTable::~BindlessTable() {
 		if (m_placeholders[i].image != nullptr) {
 			m_graphics.DeleteImage(m_placeholders[i]);
 		}
+	}
+	if (m_storage_placeholder_view != nullptr) {
+		m_graphics.device.destroyImageView(m_storage_placeholder_view, nullptr);
+	}
+	if (m_storage_placeholder.image != nullptr) {
+		m_graphics.DeleteImage(m_storage_placeholder);
 	}
 	m_translation.reset();
 	m_feedback.reset();
@@ -633,6 +750,15 @@ void BindlessTable::TakeWrittenRanges(std::vector<std::pair<uint64_t, uint64_t>>
 }
 
 uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
+	if (binding == StorageImages2D) {
+		auto& free = m_storage_free_slots;
+		if (!free.empty() && m_scheduler.IsFree(free.front().first)) {
+			const auto slot = free.front().second;
+			free.pop_front();
+			return slot;
+		}
+		return m_storage_next_slot < m_storage_images ? m_storage_next_slot++ : 0u;
+	}
 	if (binding >= ImageArrays) {
 		return 0;
 	}
@@ -728,7 +854,8 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 	write.dstBinding      = binding;
 	write.dstArrayElement = slot;
 	write.descriptorCount = 1;
-	write.descriptorType  = vk::DescriptorType::eSampledImage;
+	write.descriptorType  = binding == StorageImages2D ? vk::DescriptorType::eStorageImage
+	                                                   : vk::DescriptorType::eSampledImage;
 	write.pImageInfo      = &info;
 	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
 }
@@ -811,10 +938,14 @@ void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot, bool placeholder) 
 	if (placeholder) {
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.DeferOperation([this, binding, slot, tick, queue] {
-			WriteSlot(binding, slot, m_placeholder_views[DroppedPlaceholder * ImageArrays + binding],
-			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			if (binding == StorageImages2D) {
+				WriteSlot(binding, slot, m_storage_placeholder_view, vk::ImageLayout::eGeneral);
+			} else {
+				WriteSlot(binding, slot, m_placeholder_views[DroppedPlaceholder * ImageArrays + binding],
+				          vk::ImageLayout::eShaderReadOnlyOptimal);
+			}
 			if (!queue) {
-				m_free_slots[binding].emplace_back(tick, slot);
+				FreeList(binding).emplace_back(tick, slot);
 			}
 		});
 	}
@@ -823,7 +954,7 @@ void BindlessTable::FreeSlot(uint32_t binding, uint32_t slot, bool placeholder) 
 		return;
 	}
 	if (!placeholder) {
-		m_free_slots[binding].emplace_back(m_scheduler.CurrentTick(), slot);
+		FreeList(binding).emplace_back(m_scheduler.CurrentTick(), slot);
 	}
 }
 
@@ -831,14 +962,14 @@ void BindlessTable::ReleaseQueuedSlots() {
 	const auto tick = m_scheduler.CurrentTick();
 	for (const auto& free: m_queued_frees) {
 		if (!free.placeholder) {
-			m_free_slots[free.binding].emplace_back(tick, free.slot);
+			FreeList(free.binding).emplace_back(tick, free.slot);
 			continue;
 		}
 		// After the placeholder write queued at the release (deferred operations run in order).
 		const auto binding = free.binding;
 		const auto slot    = free.slot;
 		m_scheduler.DeferOperation(
-		    [this, binding, slot, tick] { m_free_slots[binding].emplace_back(tick, slot); });
+		    [this, binding, slot, tick] { FreeList(binding).emplace_back(tick, slot); });
 	}
 	m_queued_frees.clear();
 }
@@ -894,6 +1025,42 @@ void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys,
 	m_feedback_snapshot->Invalidate(heap.region * sizeof(uint32_t),
 	                                heap.entries * sizeof(uint32_t));
 	bool cleared = false;
+	// Research (2026-10-14, black smoke): KYTY_BINDLESS_KEY_LOG keys (hex) also log the feedback
+	// flags shaders left for them and the translation entry the shaders read.
+	// "all": every pending flag (requests), not the used ones.
+	static const char*                 log_text = std::getenv("KYTY_BINDLESS_KEY_LOG");
+	static const bool                  log_all  = log_text != nullptr && std::strcmp(log_text, "all") == 0;
+	static const std::vector<uint32_t> logged   = [] {
+		std::vector<uint32_t> list;
+		for (const char* p = log_all ? nullptr : log_text; p != nullptr && *p != 0;) {
+			char* end = nullptr;
+			list.push_back(static_cast<uint32_t>(std::strtoul(p, &end, 16)));
+			if (end == p) break;
+			p = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	if (log_all) {
+		for (uint32_t key = 0; key < heap.entries; key++) {
+			if (snapshot[heap.region + key] == ShaderRecompiler::IR::BindlessFlagPending) {
+				::printf("Bindless request: heap=0x%" PRIx64 "+0x%x binding=%u key=0x%x settled=%u\n",
+				         heap.base, heap.table_offset, heap.binding, key, heap.settled[key]);
+			}
+		}
+	}
+	for (const auto key: logged) {
+		if (key < heap.entries && snapshot[heap.region + key] != 0) {
+			static std::atomic<uint32_t> lines {0};
+			if (lines.fetch_add(1) < 400) {
+				const auto* translation = reinterpret_cast<const uint32_t*>(m_translation->Mapped().data());
+				::printf("Bindless feedback: heap=0x%" PRIx64 "+0x%x binding=%u region=%u key=0x%x flag=%u "
+				         "settled=%u slot=%u translation=0x%x\n",
+				         heap.base, heap.table_offset, heap.binding, heap.region, key,
+				         snapshot[heap.region + key], heap.settled[key], heap.slots[key],
+				         translation[heap.region + key]);
+			}
+		}
+	}
 	for (uint32_t key = 0; key < heap.entries; key++) {
 		const auto flag = snapshot[heap.region + key];
 		if (flag != 0) {
@@ -1041,11 +1208,16 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		if (heap->slots[key] != 0 && late_placeholder) {
 			FreeSlot(heap->binding, heap->slots[key], true);
 		} else if (heap->slots[key] != 0) {
-			WriteSlot(heap->binding, heap->slots[key],
-			          m_placeholder_views[DroppedPlaceholder * ImageArrays + heap->binding],
-			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			if (heap->binding == StorageImages2D) {
+				WriteSlot(heap->binding, heap->slots[key], m_storage_placeholder_view,
+				          vk::ImageLayout::eGeneral);
+			} else {
+				WriteSlot(heap->binding, heap->slots[key],
+				          m_placeholder_views[DroppedPlaceholder * ImageArrays + heap->binding],
+				          vk::ImageLayout::eShaderReadOnlyOptimal);
+			}
 			// Command buffers recorded so far may still sample the slot.
-			m_free_slots[heap->binding].emplace_back(m_scheduler.CurrentTick(), heap->slots[key]);
+			FreeList(heap->binding).emplace_back(m_scheduler.CurrentTick(), heap->slots[key]);
 		}
 		heap->images[key]  = {};
 		heap->slots[key]   = 0;
