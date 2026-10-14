@@ -592,6 +592,8 @@ struct ResourceBlock {
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
 	std::vector<uint32_t> srt_reads;
+	// KYTY_LOCAL_HACK: the condition cannot change the walk's result (MarkIrrelevantConditions).
+	bool                  irrelevant = false;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.

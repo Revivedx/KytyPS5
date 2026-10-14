@@ -1826,10 +1826,15 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	flat.assign(m_program.srt_reads.size(), 0u);
 	// Branch conditions read memory the shader may write, so the clean evaluator decides them.
 	auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	// KYTY_LOCAL_HACK KYTY_PRUNE_LIVE (live, default 0): conditions that cannot change the walk
+	// (ResourceBlock::irrelevant) are not evaluated: no CP read of the memory they test.
+	static auto& prune_live_switch = Common::LiveSwitches::Get("KYTY_PRUNE_LIVE", 0);
+	const bool   prune_live        = prune_live_switch.load(std::memory_order_relaxed) != 0;
 	// 0 false, 1 true, 2 not evaluated (no condition, no strict reader, or unreadable).
 	const auto outcome_of = [&](uint32_t index) -> uint8_t {
 		const auto& block = m_program.control_flow[index];
-		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr) {
+		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr ||
+		    (prune_live && block.irrelevant)) {
 			return 2u;
 		}
 		uint32_t condition = 0;
