@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -262,6 +263,57 @@ static bool ExecStatsWanted(const GraphicContext& graphics, uint64_t hash) {
 	return list == "all" || list.find(text) != std::string::npos;
 }
 
+// KYTY_LOCAL_HACK KYTY_EXEC_DISASM_DIR=<dir> (environment, research 2026-10-14; with KYTY_EXEC_STATS):
+// the same pipelines also capture the driver's internal representations (RADV: NIR, ACO IR, the
+// final assembly), written to <dir>/<kind>_<hash a>_<hash b>_<executable>_<representation>.txt.
+static const char* ExecDisasmDir() {
+	static const char* dir = std::getenv("KYTY_EXEC_DISASM_DIR");
+	return dir;
+}
+
+static void WriteExecDisasm(vk::Device device, vk::Pipeline pipeline, uint32_t index, const char* kind,
+                            uint64_t a, uint64_t b) {
+	vk::PipelineExecutableInfoKHR exec {};
+	exec.pipeline        = pipeline;
+	exec.executableIndex = index;
+	uint32_t count       = 0;
+	if (device.getPipelineExecutableInternalRepresentationsKHR(&exec, &count, nullptr) !=
+	    vk::Result::eSuccess) {
+		return;
+	}
+	std::vector<vk::PipelineExecutableInternalRepresentationKHR> reps(count);
+	if (device.getPipelineExecutableInternalRepresentationsKHR(&exec, &count, reps.data()) !=
+	        vk::Result::eSuccess &&
+	    count == 0) {
+		return;
+	}
+	std::vector<std::vector<char>> data(count);
+	for (uint32_t r = 0; r < count; r++) {
+		data[r].resize(reps[r].dataSize + 1, 0);
+		reps[r].pData = data[r].data();
+	}
+	if (device.getPipelineExecutableInternalRepresentationsKHR(&exec, &count, reps.data()) !=
+	    vk::Result::eSuccess) {
+		return;
+	}
+	for (uint32_t r = 0; r < count; r++) {
+		if (reps[r].isText == 0) {
+			continue;
+		}
+		std::string name = reps[r].name.data();
+		for (auto& c: name) {
+			if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+		}
+		char path[1024];
+		std::snprintf(path, sizeof(path), "%s/%s_%016" PRIx64 "_%016" PRIx64 "_%u_%s.txt", ExecDisasmDir(),
+		              kind, a, b, index, name.c_str());
+		if (auto* file = std::fopen(path, "wb"); file != nullptr) {
+			std::fwrite(data[r].data(), 1, std::strlen(data[r].data()), file);
+			std::fclose(file);
+		}
+	}
+}
+
 static void PrintExecStats(vk::Device device, vk::Pipeline pipeline, const char* kind, uint64_t a,
                            uint64_t b) {
 	vk::PipelineInfoKHR info {};
@@ -302,6 +354,9 @@ static void PrintExecStats(vk::Device device, vk::Pipeline pipeline, const char*
 		}
 		std::printf("Exec stats %s %016" PRIx64 "/%016" PRIx64 " [%s]:%s\n", kind, a, b,
 		            props[i].name.data(), line.c_str());
+		if (ExecDisasmDir() != nullptr) {
+			WriteExecDisasm(device, pipeline, i, kind, a, b);
+		}
 	}
 	std::fflush(stdout);
 }
@@ -647,6 +702,9 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	build.ps_hash = ps_hash;
 	if (ExecStatsWanted(graphics, build.vs_hash) || ExecStatsWanted(graphics, build.ps_hash)) {
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+		if (ExecDisasmDir() != nullptr) {
+			pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -758,6 +816,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const bool exec_stats  = ExecStatsWanted(graphics, cs_hash);
 	if (exec_stats) {
 		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+		if (ExecDisasmDir() != nullptr) {
+			info.flags |= vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+		}
 	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);

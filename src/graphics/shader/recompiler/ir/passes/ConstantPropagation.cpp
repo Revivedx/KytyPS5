@@ -5,8 +5,11 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -685,12 +688,29 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 	}
 }
 
+} // namespace
+
+// KYTY_LOCAL_HACK KYTY_WAVE64_MASKS (environment, research 2026-10-14; default 0): the lane mask
+// projection below also runs in wave64. There, an invocation's bit index (lane & 31) reads ballot
+// word 0 only in the true arm of the guest's lane split Select(LaneId < 32, lo, hi) and word 1 only
+// in its false arm, so a ballot word is projected only inside the arm that reads it (a word used for
+// all 64 lanes, or the swapped word, is left alone). Without it every wave64 EXEC restored from a
+// saved mask (and s_mov exec, -1) stays a per-lane bit extraction, and each VGPR write under it keeps
+// its v_cndmask (c7c9148c: 463 of 536 selects under ThreadBit(0xffffffff)). Exact and unit-tested;
+// no measured gain in Wolverine (few wave64 programs have the pattern).
+bool g_wave64_mask_projection = [] {
+	const char* value = std::getenv("KYTY_WAVE64_MASKS");
+	return value != nullptr && value[0] == '1';
+}();
+
+namespace {
+
 // In wave32, extracting this invocation's bit from a ballot recovers its predicate.
 // Keep that identity through scalar EXEC operations and their loop-carried mask Phis.
 class LaneMaskProjection {
 public:
-	explicit LaneMaskProjection(std::unordered_set<Inst*>& lowered_ancillary)
-	    : m_lowered_ancillary(lowered_ancillary) {}
+	LaneMaskProjection(std::unordered_set<Inst*>& lowered_ancillary, uint32_t wave_size)
+	    : m_lowered_ancillary(lowered_ancillary), m_wave64(wave_size == 64u) {}
 
 	void Fold(Inst& inst) {
 		if (inst.GetOpcode() != ValueOpcode::INotEqual32 || !Immediate(Arg(inst, 1), 0u)) return;
@@ -706,23 +726,50 @@ public:
 		if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId) return;
 		m_visited.clear();
 		m_grounded = false;
-		if (CanProject(Arg(*shift, 0)) && m_grounded) Replace(inst, Project(Arg(*shift, 0)));
+		const auto half = m_wave64 ? Half::Unknown : Half::Lo;
+		if (CanProject(Arg(*shift, 0), half) && m_grounded)
+			Replace(inst, Project(Arg(*shift, 0), half));
 	}
 
 private:
+	// The ballot word this invocation's bit index reads: wave32 always word 0 (Lo); wave64 only
+	// inside the arms of the lane split (Unknown outside them).
+	enum class Half : uint32_t { Lo = 0, Hi = 1, Unknown = 2 };
+	using Key = std::pair<const Inst*, Half>;
+	struct KeyHash {
+		size_t operator()(const Key& key) const {
+			return std::hash<const Inst*> {}(key.first) ^ static_cast<size_t>(key.second);
+		}
+	};
+
 	static bool Immediate(Value value, uint32_t expected) {
 		return IsImmediate(value, Type::U32) && value.U32() == expected;
 	}
 
-	static Value BallotPredicate(const Inst& inst) {
-		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
-		    !Immediate(Arg(inst, 1), 0u)) return {};
+	// Select(LaneId < 32, lo, hi): ThreadBit's word choice for a wave64 mask pair.
+	static bool IsLaneHalfSplit(const Inst& inst) {
+		if (inst.GetOpcode() != ValueOpcode::SelectU32) return false;
+		const auto* condition = Arg(inst, 0).TryInstruction();
+		if (condition == nullptr || condition->GetOpcode() != ValueOpcode::ULessThan32 ||
+		    !Immediate(Arg(*condition, 1), 32u)) return false;
+		const auto* lane = Arg(*condition, 0).TryInstruction();
+		return lane != nullptr && lane->GetOpcode() == ValueOpcode::LaneId;
+	}
+
+	static Value BallotPredicate(const Inst& inst, Half half) {
+		if (half == Half::Unknown || inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
+		    !Immediate(Arg(inst, 1), static_cast<uint32_t>(half))) return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
 		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot
 		           ? Arg(*source, 0) : Value {};
 	}
 
-	bool CanProject(Value value) {
+	Half ArgHalf(const Inst& inst, size_t arg, Half half) const {
+		if (m_wave64 && IsLaneHalfSplit(inst)) return arg == 1 ? Half::Lo : Half::Hi;
+		return half;
+	}
+
+	bool CanProject(Value value, Half half) {
 		if (value.IsImmediate()) {
 			const bool supported = Immediate(value, 0u) || Immediate(value, UINT32_MAX);
 			m_grounded |= supported;
@@ -730,26 +777,27 @@ private:
 		}
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) return false;
-		if (m_values.contains(inst) || !BallotPredicate(*inst).IsEmpty()) {
+		if (m_values.contains(Key {inst, half}) || !BallotPredicate(*inst, half).IsEmpty()) {
 			m_grounded = true;
 			return true;
 		}
-		if (!m_visited.insert(inst).second) return true;
+		if (!m_visited.insert(Key {inst, half}).second) return true;
 		const auto op = inst->GetOpcode();
 		if (op != ValueOpcode::BitwiseAnd32 && op != ValueOpcode::BitwiseOr32 &&
 		    op != ValueOpcode::BitwiseNot32 && op != ValueOpcode::SelectU32 && op != ValueOpcode::Phi)
 			return false;
 		for (size_t arg = op == ValueOpcode::SelectU32 ? 1u : 0u; arg < inst->NumArgs(); ++arg) {
-			if (!CanProject(Arg(*inst, arg))) return false;
+			if (!CanProject(Arg(*inst, arg), ArgHalf(*inst, arg, half))) return false;
 		}
 		return inst->NumArgs() != 0;
 	}
 
-	Value Project(Value value) {
+	Value Project(Value value, Half half) {
 		if (value.IsImmediate()) return Value(value.U32() != 0u);
 		auto* source = value.TryInstruction();
-		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
-		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
+		if (const auto found = m_values.find(Key {source, half}); found != m_values.end())
+			return found->second.Resolve();
+		if (const auto predicate = BallotPredicate(*source, half); !predicate.IsEmpty()) return predicate;
 		auto* block = source->Parent();
 		const auto where = std::find_if(block->begin(), block->end(),
 		                               [source](const Inst& candidate) { return &candidate == source; });
@@ -764,10 +812,10 @@ private:
 		            : op == ValueOpcode::SelectU1
 		                ? block->PrependNewInst(where, op, {Arg(*source, 0), Value(false), Value(false)})
 		                : block->PrependNewInst(where, op, {Value(false), Value(false)});
-		m_values.emplace(source, Value(&*result));
+		m_values.emplace(Key {source, half}, Value(&*result));
 		if (op == ValueOpcode::Phi) result->SetFlags(Type::U1);
 		for (size_t arg = op == ValueOpcode::SelectU1 ? 1u : 0u; arg < source->NumArgs(); ++arg) {
-			const auto projected = Project(Arg(*source, arg));
+			const auto projected = Project(Arg(*source, arg), ArgHalf(*source, arg, half));
 			if (op == ValueOpcode::Phi) result->AddPhiOperand(source->PhiBlock(arg), projected);
 			else result->SetArg(arg, projected);
 		}
@@ -776,8 +824,9 @@ private:
 	}
 
 	std::unordered_set<Inst*>& m_lowered_ancillary;
-	std::unordered_set<const Inst*> m_visited;
-	std::unordered_map<const Inst*, Value> m_values;
+	bool m_wave64;
+	std::unordered_set<Key, KeyHash> m_visited;
+	std::unordered_map<Key, Value, KeyHash> m_values;
 	bool m_grounded = false;
 };
 
@@ -944,10 +993,11 @@ uint32_t SimplifyBoundedLoopRegisters(Program& program) {
 
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	std::unordered_set<Inst*> lowered_ancillary;
-	LaneMaskProjection mask_projection(lowered_ancillary);
+	LaneMaskProjection mask_projection(lowered_ancillary, wave_size);
+	const bool project = wave_size == 32u || (wave_size == 64u && g_wave64_mask_projection);
 	for (auto* block: blocks) {
 		for (auto inst = block->begin(); inst != block->end(); ++inst) {
-			if (wave_size == 32u) mask_projection.Fold(*inst);
+			if (project) mask_projection.Fold(*inst);
 			FoldInstruction(*block, inst, lowered_ancillary);
 		}
 	}

@@ -1070,11 +1070,19 @@ bool IsSelect(IR::ValueOpcode op) {
 
 struct MaskedQuery {
 	std::map<std::pair<const IR::Inst*, const IR::Inst*>, bool> memo;
+	// 2026-10-14: the 10-13 rule took a use as the FALSE arm of Select(c, x, .) as "read only in c's
+	// lanes" at any depth. Only a direct use there is rewritten exactly (-> b); through a lane-wise
+	// value it is read in the !c lanes, so strict = true counts it as unmasked (the likely cause of
+	// the KYTY_SELECT_REWRITE hang).
+	bool strict = false;
 
 	bool Use(const IR::Use& use, const IR::Inst* cond, uint32_t depth) {
 		const auto& user = *use.user;
 		const auto  op   = user.GetOpcode();
 		if (IsSelect(op)) {
+			if (strict && use.operand == 2 && depth > 0) {
+				return false;
+			}
 			return user.Arg(0).Resolve().TryInstruction() == cond && use.operand != 0;
 		}
 		if (IR::BufferAccessOf(op) != IR::BufferAccess::None) {
@@ -1117,8 +1125,10 @@ void ReportSelectStats(const IR::Program& ir) {
 	                                          std::string::npos)) {
 		return;
 	}
-	uint32_t    insts = 0, selects = 0, removable = 0;
+	uint32_t    insts = 0, selects = 0, removable = 0, removable_strict = 0;
 	MaskedQuery query;
+	MaskedQuery strict_query;
+	strict_query.strict = true;
 	for (const auto* block: ir.blocks) {
 		for (const auto& inst: *block) {
 			insts++;
@@ -1126,19 +1136,21 @@ void ReportSelectStats(const IR::Program& ir) {
 			const auto* cond = inst.Arg(0).Resolve().TryInstruction();
 			if (cond == nullptr) continue;
 			selects++;
-			bool dead = inst.HasUses();
-			for (const auto& use: inst.Uses()) {
-				if (!query.Use(use, cond, 0)) {
-					dead = false;
-					break;
+			for (auto* q: {&query, &strict_query}) {
+				bool dead = inst.HasUses();
+				for (const auto& use: inst.Uses()) {
+					if (!q->Use(use, cond, 0)) {
+						dead = false;
+						break;
+					}
 				}
+				(q == &query ? removable : removable_strict) += dead ? 1u : 0u;
 			}
-			removable += dead ? 1u : 0u;
 		}
 	}
-	std::printf("Select stats 0x%016" PRIx64 " (%s): %u values, %u lane selects, %u removable (%.0f%%)\n",
+	std::printf("Select stats 0x%016" PRIx64 " (%s): %u values, %u lane selects, %u removable (%.0f%%), strict %u\n",
 	            ir.shader_hash, StageName(ir.stage), insts, selects, removable,
-	            selects != 0 ? 100.0 * removable / selects : 0.0);
+	            selects != 0 ? 100.0 * removable / selects : 0.0, removable_strict);
 	std::fflush(stdout);
 }
 

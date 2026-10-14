@@ -12072,6 +12072,69 @@ void TestWave32MaskProjection() {
   }
 }
 
+// KYTY_WAVE64_MASKS (2026-10-14): in wave64 a ballot word is projected only inside the arm of the
+// lane split Select(LaneId < 32, lo, hi) that reads it.
+void TestWave64MaskProjection() {
+  using namespace ShaderRecompiler::IR;
+  const bool saved = g_wave64_mask_projection;
+  g_wave64_mask_projection = true;
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64u;
+  program.block_storage.push_back(std::make_unique<Block>());
+  program.blocks.push_back(program.block_storage.back().get());
+  program.block_info.push_back({.id = 0});
+  program.block_info[0].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+  auto *entry = program.blocks[0];
+  IREmitter e(entry);
+  const auto zero = U32(Value(0u));
+  const auto raw = e.GetUserData(static_cast<ScalarReg>(0));
+  const auto active = e.INotEqual(raw, zero);
+  const auto selected = e.IEqual(raw, U32(Value(7u)));
+  const auto ballot = [&](U1 predicate, uint32_t component) {
+    return U32(e.CompositeExtract(e.Emit(ValueOpcode::Ballot, {predicate}), component));
+  };
+  const auto bit_of = [&](U32 word) {
+    const auto lane = U32(e.Emit(ValueOpcode::LaneId));
+    const auto bit = e.BitwiseAnd(lane, U32(Value(31u)));
+    return e.INotEqual(e.BitwiseAnd(e.ShiftRightLogical(word, bit), U32(Value(1u))), zero);
+  };
+  // Translator::ThreadBit for a wave64 mask pair.
+  const auto thread_bit = [&](U32 lo, U32 hi) {
+    const auto lane = U32(e.Emit(ValueOpcode::LaneId));
+    return bit_of(e.Select(e.ULessThan(lane, U32(Value(32u))), lo, hi));
+  };
+  const auto split = thread_bit(ballot(active, 0u), ballot(active, 1u));
+  const auto restored = thread_bit(e.BitwiseOr(ballot(selected, 0u), ballot(active, 0u)),
+                                   e.BitwiseOr(ballot(selected, 1u), ballot(active, 1u)));
+  const auto all_ones = thread_bit(U32(Value(UINT32_MAX)), U32(Value(UINT32_MAX)));
+  const auto swapped = thread_bit(ballot(active, 1u), ballot(active, 0u));
+  const auto low_both = thread_bit(ballot(active, 0u), ballot(active, 0u));
+  const auto high_both = thread_bit(ballot(active, 1u), ballot(active, 1u));
+  const auto top_low = bit_of(ballot(active, 0u));
+  const auto top_high = bit_of(ballot(active, 1u));
+  const auto raw_word = thread_bit(raw, U32(Value(UINT32_MAX)));
+  ConstantPropagationPass(program.blocks, 64u);
+  Check(split.Resolve() == active.Resolve(), "wave64 split ballot round trip lost its predicate");
+  const auto expected_or = e.LogicalOr(selected, active);
+  const auto *restored_inst = restored.Resolve().TryInstruction();
+  Check(restored_inst != nullptr && restored_inst->GetOpcode() == ValueOpcode::SelectU1 &&
+            EquivalentValue(program, restored_inst->Arg(1), expected_or) &&
+            EquivalentValue(program, restored_inst->Arg(2), expected_or),
+        "wave64 restored mask projection changed a lane predicate");
+  Check(all_ones.Resolve().IsImmediate() && all_ones.Resolve().U1(),
+        "wave64 all-ones EXEC did not fold to true");
+  for (const auto value : {swapped, low_both, high_both, top_low, top_high, raw_word}) {
+    Check(value.Resolve().TryInstruction() != nullptr &&
+              value.Resolve().TryInstruction()->GetOpcode() == ValueOpcode::INotEqual32,
+          "wave64 mask projection used a ballot word outside the lanes that read it");
+  }
+  ResolveControlFlowIdentities(program);
+  RemoveIdentities(program.blocks);
+  ValidateProgram(program, true);
+  g_wave64_mask_projection = saved;
+}
+
 void TestU64ShiftConstantPropagation() {
   using namespace ShaderRecompiler::IR;
 
@@ -14663,6 +14726,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace Libs::Graphics
 
 int main() {
+  // KYTY_TEST_ONLY=masks (2026-10-14): only the lane mask projection tests (the fork's local hacks
+  // exceed some SPIR-V size baselines that run first).
+  if (const char *only = std::getenv("KYTY_TEST_ONLY"); only != nullptr && std::string(only) == "masks") {
+    Libs::Graphics::TestWave32MaskProjection();
+    Libs::Graphics::TestWave64MaskProjection();
+    std::printf("mask projection tests passed\n");
+    return 0;
+  }
   // The tests cover upstream's BVH translation; the emulator skips those programs by default.
 #ifdef _WIN32
   _putenv("KYTY_SKIP_BVH_DISPATCHES=0");
@@ -14801,6 +14872,7 @@ int main() {
 #endif
   TestValuePhiValidation();
   TestWave32MaskProjection();
+  TestWave64MaskProjection();
   TestU64ShiftConstantPropagation();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNativeWideValueValidation();
