@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -2608,6 +2609,11 @@ struct PipelineCache::ProgramCache {
 			}
 			return ShaderProgram {};
 		}
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (OwnCodeHasBvh(params)) {
+				return ShaderProgram {};
+			}
+		}
 		BufferCache::SetReadbackStatsShader(params.hash);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		{
@@ -3483,6 +3489,18 @@ struct PipelineCache::ProgramCache {
 			}
 			return true;
 		}
+		// KYTY_LOCAL_HACK: a record written while the plan had other resources (a research switch
+		// such as KYTY_GPU_RECORDS changes them) cannot be specialized: leave it to the GPU thread
+		// instead of failing ApplyResourceSpecialization.
+		if (translated.program.info.buffers.size() != record.specialization.buffers.size() ||
+		    translated.program.info.images.size() > record.specialization.images.size()) {
+			std::lock_guard lock(warm_mutex);
+			auto&           source = prepared[record.key];
+			if (plan != nullptr && source.plan == nullptr && !source.plan_taken) {
+				source.plan = std::move(plan);
+			}
+			return false;
+		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               record.specialization, record.push_start);
 		std::lock_guard lock(warm_mutex);
@@ -3753,6 +3771,39 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 	}
+
+	// KYTY_LOCAL_HACK KYTY_BVH_FAST_SKIP (live, default 1): while KYTY_SKIP_BVH_DISPATCHES skips them
+	// (the recompiler reports such programs unsupported), a compute program whose OWN code has BVH
+	// intersections is unsupported whatever its call targets: drop its dispatches before the key
+	// build, which expands its calls on every dispatch (Wolverine 29be8047c4e86afe and
+	// fc0537b7278db60c, the only programs with calls in rec5: ~14% of the CP, pf8 perf 2026-10-13).
+	bool OwnCodeHasBvh(const ShaderParams& params) {
+		static const bool skip_bvh = [] {
+			const char* value = std::getenv("KYTY_SKIP_BVH_DISPATCHES");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		static auto& fast = Common::LiveSwitches::Get("KYTY_BVH_FAST_SKIP", 1);
+		if (!skip_bvh || fast.load(std::memory_order_relaxed) == 0) {
+			return false;
+		}
+		if (const auto found = own_bvh.find(params.hash); found != own_bvh.end()) {
+			return found->second;
+		}
+		ShaderRecompiler::Decoder::Program decoded;
+		ShaderRecompiler::Decoder::DecodeProgram(params.code, decoded);
+		const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+			return inst.family == ShaderRecompiler::Decoder::Family::MIMG &&
+			       (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u);
+		});
+		own_bvh.emplace(params.hash, bvh);
+		if (bvh) {
+			::printf("BVH fast skip: compute 0x%016" PRIx64 " (own code has BVH intersections)\n",
+			         params.hash);
+			std::fflush(stdout);
+		}
+		return bvh;
+	}
+	std::unordered_map<uint64_t, bool> own_bvh;
 
 	// Shader function expansion decodes the shader and every callee, and a shader with table
 	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.

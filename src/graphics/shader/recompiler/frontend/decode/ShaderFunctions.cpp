@@ -6,7 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <map>
 #include <memory>
@@ -658,7 +662,66 @@ struct ShaderFunctionExpander::Impl {
 		ShaderAnalysis         analysis;
 		std::vector<Expansion> expansions; // most recent last
 	};
-	static constexpr size_t MaxExpansions = 8;
+	// KYTY_LOCAL_HACK KYTY_EXPAND_MAX (live, default 64; was 8): expansions kept per shader, least
+	// recently used evicted. A shader whose calls go to a per-object routine (Wolverine rec5: the
+	// indirect dispatches, ~14% of the CP in Expand, pf8 perf 2026-10-13) cycles through more
+	// call targets than 8 and rebuilt its expansion on every dispatch.
+	static size_t MaxExpansions() {
+		static auto& max = Common::LiveSwitches::Get("KYTY_EXPAND_MAX", 64);
+		const auto   value = max.load(std::memory_order_relaxed);
+		return value < 1 ? size_t {1} : static_cast<size_t>(value);
+	}
+
+	// KYTY_EXPAND_STATS (live, default 0): calls, hits and rebuilds per 5 s, by shader.
+	struct Stats {
+		uint64_t                               calls = 0, with_calls = 0, hits = 0, builds = 0;
+		std::unordered_map<uint64_t, uint64_t> builds_by_hash;
+		std::unordered_map<uint64_t, uint64_t> calls_by_hash;
+		std::chrono::steady_clock::time_point  last = std::chrono::steady_clock::now();
+	} stats;
+
+	static bool StatsOn() {
+		static auto& on = Common::LiveSwitches::Get("KYTY_EXPAND_STATS", 0);
+		return on.load(std::memory_order_relaxed) != 0;
+	}
+
+	void Note(uint64_t hash, bool with_calls, bool hit, bool built) {
+		auto& st = stats;
+		st.calls++;
+		if (with_calls) {
+			st.with_calls++;
+			st.calls_by_hash[hash]++;
+		}
+		if (hit) st.hits++;
+		if (built) {
+			st.builds++;
+			st.builds_by_hash[hash]++;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - st.last < std::chrono::seconds(5)) return;
+		std::printf("Shader expansion (5 s): calls %" PRIu64 ", with calls %" PRIu64 ", hits %" PRIu64
+		            ", builds %" PRIu64 ";",
+		            st.calls, st.with_calls, st.hits, st.builds);
+		std::vector<std::pair<uint64_t, uint64_t>> top(st.calls_by_hash.begin(), st.calls_by_hash.end());
+		std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second > b.second; });
+		for (size_t i = 0; i < top.size() && i < 6; i++) {
+			const auto built = st.builds_by_hash.find(top[i].first);
+			std::printf(" %016" PRIx64 " x%" PRIu64 " (built %" PRIu64 ", kept %zu)", top[i].first,
+			            top[i].second, built != st.builds_by_hash.end() ? built->second : 0u,
+			            KeptFor(top[i].first));
+		}
+		std::printf("\n");
+		std::fflush(stdout);
+		st = {};
+		st.last = now;
+	}
+
+	size_t KeptFor(uint64_t hash) const {
+		for (const auto& [address, shader]: shaders) {
+			if (shader.code_hash == hash) return shader.expansions.size();
+		}
+		return 0;
+	}
 
 	std::unordered_map<uint64_t, Shader> shaders; // by code address
 	std::vector<uint32_t>                scratch;
@@ -703,7 +766,11 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	}
 	shader.code_hash = code_hash;
 	const auto& analysis = shader.analysis;
-	if (!analysis.has_calls) return true;
+	const bool  stats_on = Impl::StatsOn();
+	if (!analysis.has_calls) {
+		if (stats_on) m_impl->Note(code_hash, false, false, false);
+		return true;
+	}
 	if (analysis.has_setpc) {
 		reason = "shader calls combined with indirect branches are unsupported";
 		return false;
@@ -713,13 +780,21 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
 		return false;
 	}
-	for (const auto& expansion: shader.expansions) {
+	// Most recent first; a hit moves to the back (least recently used evicted first).
+	for (auto it = shader.expansions.rbegin(); it != shader.expansions.rend(); ++it) {
+		const auto& expansion = *it;
 		if (expansion.base == base && expansion.wave_size == wave_size &&
 		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
 		    m_impl->StillReads(expansion, read)) {
 			expanded = expansion.code;
 			reason   = expansion.reason;
-			return expansion.ok;
+			const bool ok = expansion.ok;
+			if (it != shader.expansions.rbegin()) {
+				auto forward = std::prev(it.base());
+				std::rotate(forward, std::next(forward), shader.expansions.end());
+			}
+			if (stats_on) m_impl->Note(code_hash, true, true, false);
+			return ok;
 		}
 	}
 	Impl::Expansion expansion;
@@ -738,10 +813,12 @@ bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t bas
 	MergeReads(expansion.reads);
 	expanded = expansion.code;
 	reason   = expansion.reason;
-	if (shader.expansions.size() >= Impl::MaxExpansions) {
+	const auto max_expansions = Impl::MaxExpansions();
+	while (shader.expansions.size() >= max_expansions) {
 		shader.expansions.erase(shader.expansions.begin());
 	}
 	shader.expansions.push_back(std::move(expansion));
+	if (stats_on) m_impl->Note(code_hash, true, false, true);
 	return shader.expansions.back().ok;
 }
 
