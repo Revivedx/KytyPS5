@@ -301,6 +301,22 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = EmitMemoryElementIndex(ctx.state, resource, DwordIndex(ctx, inst, mem));
+	// KYTY_LOCAL_HACK KYTY_LOAD_SELECT=1 (environment, research 2026-10-14, default 0): the
+	// bounds-checked dword load without a branch, as KYTY_CONST_SELECT does for scalar reads:
+	// element 0 when out of bounds, then 0 selected. Each branch (v_cmpx + s_cbranch_execz) made
+	// RADV reload the descriptor per load (dec083415ec94cc6: 8000 such blocks, its SGPRs spilled).
+	static const bool load_select = [] {
+		const char* value = std::getenv("KYTY_LOAD_SELECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (load_select && resource.memory_access == spv::MemoryAccessMaskNone) {
+		const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+		const auto safe_index =
+		    Select(ctx.state, TypeU32(ctx.state), in_bounds, index, ConstantU32(ctx.state, 0));
+		const auto loaded = LoadWordInBounds(ctx, resource, safe_index);
+		return Select(ctx.state, TypeU32(ctx.state), in_bounds, loaded,
+		              ConstantU32(ctx.state, 0));
+	}
 	return EmitValueOrZeroIfCondition(ctx.state,
 	                                  EmitMemoryElementInBounds(ctx.state, resource, index),
 	                                  [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -1694,6 +1710,23 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
+	// KYTY_LOCAL_HACK KYTY_CONST_SELECT (environment, 2026-10-14, default 1; 0 = branch): the
+	// bounds-checked scalar read without a branch: element 0 when out of bounds, then 0 selected.
+	// Same values; the per-read branch kept the host compiler from hoisting the descriptor load
+	// (an s_load_b128 + s_waitcnt before every s_buffer_load in the draw shaders). An empty
+	// binding's element 0 is still covered by robustBufferAccess (always enabled).
+	static const bool const_select = [] {
+		const char* value = std::getenv("KYTY_CONST_SELECT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (const_select && !mem.coherent) {
+		const auto safe_element =
+		    Select(state, TypeU32(state), condition, element, ConstantU32(state, 0));
+		const auto pointer      = EmitMemoryElementPointer(state, access, safe_element);
+		const auto loaded       = EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+		ctx.Define(inst, Select(state, TypeU32(state), condition, loaded, ConstantU32(state, 0)));
+		return;
+	}
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
 		           const auto pointer = EmitMemoryElementPointer(state, access, element);
 		           if (!mem.coherent) {

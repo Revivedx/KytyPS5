@@ -49,6 +49,15 @@ Performance (command processor), each measured with same-process A/B switches:
 - Almost every change has a `KYTY_*` live switch (environment or `KYTY_LIVE_FILE`) and is marked
   `KYTY_LOCAL_HACK` in the source; research-only switches default to off.
 
+Performance (GPU shaders), from the driver's own disassembly of the hottest pipelines
+(`KYTY_EXEC_STATS` + `KYTY_EXEC_DISASM_DIR`):
+- Float min/max (V_MIN/MAX/MIN3/MAX3/MED3_F32) use GLSL NMin/NMax instead of a bit-exact emulation that
+  cost ~19 instructions each, up to half of the heavy compute shaders (`KYTY_NATIVE_FMINMAX`, exact on AMD,
+  whose min/max order -0 < +0 like the PS5). Branch-free bounds-checked constant reads
+  (`KYTY_CONST_SELECT`) and OpIsNan NaN tests (`KYTY_FAST_FNAN`). Static scene 35 -> 39-40 fps (GPU time
+  per frame 17.4 -> 13.6 ms), scripted jungle fight 13.7 -> 20.1 fps. The first run after updating
+  recompiles the shaders in Mesa (a few stutters), later runs use Mesa's shader cache.
+
 ## Build (Ubuntu 26.04 or a distrobox with clang 21 and Qt 6)
 
 ```

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -178,7 +179,28 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
 }
 
+// KYTY_LOCAL_HACK KYTY_NATIVE_FMINMAX (environment, 2026-10-14, default 1; 0 = emulation): float
+// min/max as GLSL.std.450 NMin/NMax instead of the bit-exact emulation below (two classifications,
+// a compare and four selects: ~20 host instructions per V_MIN/MAX_F32, ~40 per MIN3/MAX3, half of
+// the late-frame compute shaders' code). NMin/NMax keep the emulation's NaN rule (a NaN operand
+// yields the other one); for +0/-0 SPIR-V leaves the choice to the host, and AMD's v_min/max_f32
+// order -0 < +0 like the guest's RDNA2 (the emulation's OR/AND of the zero bits). Exact on an AMD
+// host only.
+static bool NativeFMinMax() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NATIVE_FMINMAX");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (NativeFMinMax()) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state),
+		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+		return result;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 

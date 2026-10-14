@@ -168,6 +168,21 @@ uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
 	return result;
 }
 
+// KYTY_LOCAL_HACK KYTY_FAST_FNAN (environment, 2026-10-14, default 1; 0 = classification): the
+// NaN tests of V_MED3_F32 and of the float-to-integer conversions as OpIsNan (one v_cmp_u_f32)
+// instead of the bit classification (two ands, two compares and an and). The same answer for
+// every input.
+uint32_t EmitIsNanF32(EmitterState& state, uint32_t value) {
+	static const bool fast = [] {
+		const char* env = std::getenv("KYTY_FAST_FNAN");
+		return env == nullptr || env[0] != '0';
+	}();
+	if (fast) {
+		return Unary(state, spv::OpIsNan, TypeBool(state), value);
+	}
+	return EmitClassifyF32(state, value).nan;
+}
+
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	const auto trunc         = EmitTruncF32Value(state, src);
 	const auto converted_raw = state.builder.AllocateId();
@@ -178,7 +193,7 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	} else {
 		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
 	}
-	const auto nan = EmitClassifyF32(state, src).nan;
+	const auto nan = EmitIsNanF32(state, src);
 	if (signed_value) {
 		const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src,
 		                          ConstantF32(state, 0xcf000000u));
@@ -207,10 +222,10 @@ uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c)
 	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
 	const auto high_min = EmitMinMaxF32Value(state, max_ab, c, false);
 	const auto median   = EmitMinMaxF32Value(state, min_ab, high_min, true);
-	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state),
-	                             EmitClassifyF32(state, a).nan, EmitClassifyF32(state, b).nan);
+	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state), EmitIsNanF32(state, a),
+	                             EmitIsNanF32(state, b));
 	const auto any_nan =
-	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitClassifyF32(state, c).nan);
+	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitIsNanF32(state, c));
 	return Select(state, TypeF32(state), any_nan, min3, median);
 }
 
