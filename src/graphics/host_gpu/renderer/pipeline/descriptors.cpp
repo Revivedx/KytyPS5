@@ -1155,6 +1155,32 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key,
 	BindImage(binding.image_id, false);
 	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
 	image           = texture_cache.m_slot_images.try_get(binding.image_id);
+	// KYTY_BINDLESS_VIEW_LOG=<guest format> (env) + KYTY_BINDLESS_VIEW_LOG_N (live), research 2026-10-14
+	// (black smoke BC7 sprite: G = B = 0): the view a resolved key of that format gets.
+	{
+		static const uint32_t view_fmt = [] {
+			const char* value = std::getenv("KYTY_BINDLESS_VIEW_LOG");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+		}();
+		static auto& left = Common::LiveSwitches::Get("KYTY_BINDLESS_VIEW_LOG_N", 0);
+		if (view_fmt != 0 && image != nullptr && static_cast<uint32_t>(descriptor.Format()) == view_fmt &&
+		    left.load(std::memory_order_relaxed) > 0) {
+			left.fetch_sub(1, std::memory_order_relaxed);
+			const auto& vi = binding.desc.view_info;
+			::printf("Bindless view: key=0x%x binding=%u base=0x%010" PRIx64 " T# fmt %u dst_sel 0x%03x %ux%u | image %u "
+			         "guest fmt %u vk %d %ux%u levels %u layers %u | view vk %d type %d levels %u+%u min_lod %u layers "
+			         "%u+%u map %d %d %d %d shader_swizzle 0x%x\n",
+			         key, heap.binding, descriptor.Base40(), static_cast<uint32_t>(descriptor.Format()),
+			         descriptor.DstSelXYZW(), descriptor.Width5() + 1u, descriptor.Height5() + 1u, binding.image_id.index,
+			         static_cast<uint32_t>(image->info.guest_format), static_cast<int>(image->info.pixel_format),
+			         image->info.extent.width, image->info.extent.height, image->info.resources.levels,
+			         image->info.resources.layers, static_cast<int>(vi.format), static_cast<int>(vi.type),
+			         vi.base_level, vi.level_count, vi.min_lod, vi.base_layer, vi.layer_count,
+			         static_cast<int>(vi.mapping.r), static_cast<int>(vi.mapping.g), static_cast<int>(vi.mapping.b),
+			         static_cast<int>(vi.mapping.a), heap.resource.shader_swizzle);
+			std::fflush(stdout);
+		}
+	}
 	const auto slot = table.AllocateSlot(heap.binding);
 	if (image == nullptr || view == nullptr || slot == 0) {
 		reason = slot == 0 ? 5 : 4;
@@ -1700,6 +1726,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
+	// Diagnostics (KYTY_WATCH_RANGES image lookups, 2026-10-14): the shader whose images are resolved.
+	DiagShaderScope diag(program.shader_hash);
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -1850,6 +1878,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
+	DiagShaderScope diag(program.shader_hash);
 	auto& texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);

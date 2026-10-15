@@ -1166,7 +1166,77 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 
 	if (binding != BindingType::DepthTarget) {
 		const auto& info = image.info;
+		// KYTY_DUMP_UPLOAD=<guest format>:<width>[:<max dumps>] (env, research 2026-10-14 black smoke): the
+		// guest bytes (tiled, as uploaded) of the first images of that format and width, to
+		// KYTY_DUMP_UPLOAD_DIR/<address>.bin (BC blocks are whole elements: their content survives tiling).
+		{
+			// KYTY_DUMP_UPLOAD_MIN=<hex address>: only images at or above that address.
+			static const std::array<uint32_t, 3> dump = [] {
+				std::array<uint32_t, 3> result {0, 0, 4};
+				if (const char* value = std::getenv("KYTY_DUMP_UPLOAD"); value != nullptr) {
+					std::sscanf(value, "%u:%u:%u", &result[0], &result[1], &result[2]);
+				}
+				return result;
+			}();
+			static const uint64_t dump_min = [] {
+				const char* value = std::getenv("KYTY_DUMP_UPLOAD_MIN");
+				return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+			}();
+			static std::atomic<uint32_t> dumped {0};
+			if (dump[0] != 0 && static_cast<uint32_t>(info.guest_format) == dump[0] &&
+			    info.extent.width == dump[1] && info.data.address >= dump_min &&
+			    dumped.load(std::memory_order_relaxed) < dump[2]) {
+				dumped.fetch_add(1, std::memory_order_relaxed);
+				const char* dir  = std::getenv("KYTY_DUMP_UPLOAD_DIR");
+				const auto  path = fmt::format("{}/{:010x}.bin", dir != nullptr ? dir : ".", info.data.address);
+				std::vector<uint8_t> bytes(info.data.size);
+				if (LibKernel::Memory::TryReadBacking(info.data.address, bytes.data(), bytes.size())) {
+					if (auto* file = std::fopen(path.c_str(), "wb"); file != nullptr) {
+						std::fwrite(bytes.data(), 1, bytes.size(), file);
+						std::fclose(file);
+					}
+				}
+				::printf("Upload dump: 0x%010" PRIx64 " size 0x%" PRIx64 " fmt %u %ux%u levels %u layers %u tile %u "
+				         "cpu_dirty %d buffer_modified %d -> %s\n",
+				         info.data.address, info.data.size, static_cast<uint32_t>(info.guest_format),
+				         info.extent.width, info.extent.height, info.resources.levels, info.resources.layers,
+				         static_cast<uint32_t>(info.tile_mode), image.IsCpuDirty() ? 1 : 0,
+				         image.IsBufferModified() ? 1 : 0, path.c_str());
+				std::fflush(stdout);
+			}
+		}
 		auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
+		// KYTY_DUMP_UPLOAD (research): the copy regions (mip, buffer offset in the linear data, extent) and
+		// the detile spans of the dumped images.
+		{
+			static const std::array<uint32_t, 2> dump_regions = [] {
+				std::array<uint32_t, 2> result {0, 0};
+				if (const char* value = std::getenv("KYTY_DUMP_UPLOAD"); value != nullptr) {
+					std::sscanf(value, "%u:%u", &result[0], &result[1]);
+				}
+				return result;
+			}();
+			static std::atomic<uint32_t> printed {0};
+			if (dump_regions[0] != 0 && static_cast<uint32_t>(info.guest_format) == dump_regions[0] &&
+			    info.extent.width == dump_regions[1] && printed.fetch_add(1, std::memory_order_relaxed) < 6) {
+				std::string text;
+				for (const auto& region: transfer.regions) {
+					text += fmt::format(" [mip {} off 0x{:x} {}x{}]", region.imageSubresource.mipLevel,
+					                    region.bufferOffset, region.imageExtent.width, region.imageExtent.height);
+				}
+				::printf("Upload regions 0x%010" PRIx64 " tiles %zu linear 0x%" PRIx64 ":%s\n", info.data.address,
+				         transfer.tiles.size(), static_cast<uint64_t>(transfer.LinearSize()), text.c_str());
+				for (size_t t = 0; t < transfer.tiles.size() && t < 12; t++) {
+					const auto& tile = transfer.tiles[t];
+					::printf("  tile %zu: family %u bpe %u linear 0x%" PRIx64 "+0x%" PRIx64 " tiled 0x%" PRIx64 "+0x%" PRIx64
+					         " %ux%u pitch %u tail %d (%u,%u)\n",
+					         t, static_cast<uint32_t>(tile.family), tile.bytes_per_element, tile.linear_offset,
+					         tile.linear_size, tile.tiled_offset, tile.tiled_size, tile.width, tile.height, tile.pitch,
+					         tile.tail ? 1 : 0, tile.tail_x, tile.tail_y);
+				}
+				std::fflush(stdout);
+			}
+		}
 		if (!transfer.valid) {
 			EXIT("TextureCache: invalid texture upload: binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " format=%u tile=%u family=%u extent=%ux%ux%u "
@@ -1531,11 +1601,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					                     SameBacking(c.info, desc.info, exact_format) ? 1 : 0);
 				}
 				::printf("Watch: image lookup type=%d 0x%010" PRIx64 "+0x%" PRIx64 " %ux%u fmt %d tile %d lv %u ly %u "
-				         "-> image %u%s%s; candidates:%s\n",
+				         "-> image %u%s%s shader %016" PRIx64 "; candidates:%s\n",
 				         static_cast<int>(desc.type), addr, req.data.size, req.extent.width, req.extent.height,
 				         static_cast<int>(req.pixel_format), static_cast<int>(req.tile_mode), req.resources.levels,
 				         req.resources.layers, result.index, inserted_new ? " NEW" : "",
-				         memo_hit ? " (memo)" : "", cands.c_str());
+				         memo_hit ? " (memo)" : "", BufferCache::s_diag_shader_hash, cands.c_str());
 				std::fflush(stdout);
 			}
 		}

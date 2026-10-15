@@ -1166,6 +1166,30 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	if (phases) DrawRecordCensus::Phase(1, phase_start);
 
+	// KYTY_DRAW_PREP_TRACE=<hex PS low dword> (env) + KYTY_DRAW_PREP_TRACE_N (live), research 2026-10-14
+	// (cluster light bitmask): the pixel-stage decision of that shader's draws, skipped ones included.
+	{
+		static const uint32_t traced = [] {
+			const char* value = std::getenv("KYTY_DRAW_PREP_TRACE");
+			return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 16)) : 0u;
+		}();
+		static auto& left = Common::LiveSwitches::Get("KYTY_DRAW_PREP_TRACE_N", 0);
+		const auto*  ps   = state.ps_input_info.stage.program;
+		if (traced != 0 && ps != nullptr && static_cast<uint32_t>(ps->shader_hash) == traced &&
+		    left.load(std::memory_order_relaxed) > 0) {
+			left.fetch_sub(1, std::memory_order_relaxed);
+			const auto& db = shader_regs.db_shader_control;
+			::printf("DrawPrep frame=%" PRIu64 " ps=%08x ps_active=%d color_mask=0x%x colors=%u depth=%d kill=%d "
+			         "zexp=%d maskexp=%d dual=%d noop=%d other=0x%x count=%u skip=%d\n",
+			         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed), traced,
+			         state.ps_active ? 1 : 0, color_output_mask, state.color_count,
+			         state.depth_info.image_id ? 1 : 0, db.shader_kill_enable ? 1 : 0,
+			         db.shader_z_export_enable ? 1 : 0, db.shader_mask_export_enable ? 1 : 0,
+			         db.shader_dual_export_enable ? 1 : 0, db.shader_execute_on_noop ? 1 : 0, db.other_bits,
+			         draw.index_count,
+			         state.color_count == 0 && !state.depth_info.image_id && !state.ps_active ? 1 : 0);
+		}
+	}
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
