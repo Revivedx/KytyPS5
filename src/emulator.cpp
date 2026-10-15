@@ -216,7 +216,10 @@ void Run(const RunOptions& options) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 
-	LoadElf(options.elf);
+	// KYTY_LOCAL_HACK KYTY_SAVE_ELF=<guest path> (env, research 2026-10-14): also write the main program
+	// rebuilt from its SELF as a plain ELF (for Ghidra / REA), e.g. /hostapp/eboot.elf.
+	const char* save_elf = std::getenv("KYTY_SAVE_ELF");
+	LoadElf(options.elf, false, save_elf != nullptr ? std::filesystem::path(save_elf) : std::filesystem::path {});
 
 	Execute(options.game_patch);
 }

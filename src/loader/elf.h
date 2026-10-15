@@ -265,6 +265,7 @@ public:
 	[[nodiscard]] bool IsNextGen() const;
 
 	void LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size);
+	bool TryLoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size);
 
 	uint64_t GetEntry();
 
